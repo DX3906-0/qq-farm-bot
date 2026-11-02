@@ -2,6 +2,31 @@ MIT License
 
 Copyright (c) 2026 qq-farm-bot contributors
 
+---
+
+## 授权范围说明（重要）
+
+本仓库不是从零开始的独立作品，代码来源分三部分，**MIT 授权仅覆盖第一部分**：
+
+1. **本项目自行编写** —— 网关/worker 分离架构、掉线自愈体系、
+   资源反解工具链、以及本项目新增的其它模块。**适用下方 MIT 条款。**
+
+2. **继承自上游 404**（https://github.com/muyuewang/qq-farm-bot-404）
+   —— 架构基线与核心业务逻辑。该上游**未声明开源许可证**，
+   其权利归原作者所有，**不在本 MIT 授权范围内**。
+
+3. **移植自上游 liyangpengs**（https://github.com/liyangpengs/qq-farm-bot）
+   —— 微信凭证保活、请求优先级闸门、活动适配等模块（源码内已标注「移植自」）。
+   该上游**未声明开源许可证**，权利归原作者，**不在本 MIT 授权范围内**。
+
+另：`core/src/gameConfig/deco_icons/` 等目录下的游戏美术资源，
+版权归腾讯及相关权利人所有，仅作为资源获取工具链的验证样本收录，
+不属于本许可证的授权范围。
+
+若你是上游作者并认为本仓库的使用方式不妥，请提 issue，会立即处理。
+
+---
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
