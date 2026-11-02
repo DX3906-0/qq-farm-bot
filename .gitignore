@@ -1,0 +1,51 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+web/dist/
+coverage/
+.cache/
+.vite/
+.turbo/
+
+# 运行时数据（含账号信息、cookie、CA 私钥等，绝不可提交）
+core/data/
+core/.local-capture-data/
+data/
+*.db
+*.db-shm
+*.db-wal
+store.json
+accounts.json
+
+# 日志
+*.log
+logs/
+log/
+
+# 本地配置与凭据（真实地址/口令写在本地，不进仓库）
+.env
+.env.*
+local_cfg.json
+CustomOpenAiSettings.json
+tools/capture-guard/.remote-capture-config.json
+tools/capture-guard/.napcat-guard-config.json
+tools/capture-guard/.napcat-guard-circuit.json*
+
+# 守护/抓包运行时产物
+tools/capture-guard/*.pid
+tools/capture-guard/_*.txt
+tools/capture-guard/_*.lock
+tools/capture-guard/_*.log
+tools/capture-guard/nul
+__pycache__/
+*.pyc
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,13 @@
+{
+  "skipAccountIds": [],
+  "releaseAfterFix": [],
+  "releaseTargetUin": 0,
+  "relayIdlePoll": 30,
+  "relayPoll": 3,
+  "hostHibernate": true,
+  "hostIdleStopMin": 10,
+  "hostWakeCooldown": 20,
+  "powerSaveOnBattery": true,
+  "batteryPoll": 1800,
+  "batteryProbe": 30
+}

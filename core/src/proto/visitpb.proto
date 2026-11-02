@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package gamepb.visitpb;
+
+import "plantpb.proto";
+import "userpb.proto";
+import "weatherpb.proto";
+
+// ============ 访问好友农场服务 ============
+ service VisitService {
+     rpc Enter(EnterRequest) returns (EnterReply);
+     rpc Leave(LeaveRequest) returns (LeaveReply);
+ }
+
+// 好友当前上场的狗摘要。
+// 对齐上游（liyangpengs/qq-farm-bot）的结构化定义：只有 dog_id 一个字段。
+// ⚠️ 此前 EnterReply 里把它声明成 `bytes`，导致只能靠「从原始字节里猜 varint
+// 再比对 DOG_NAMES 表」来识别狗 —— 只要狗 id 不在那张小表里（或被猜错），
+// 就会被判成「无狗」（2026-10-22 用户实测：除小果外 13 个好友全显示无狗）。
+message BriefDogInfo {
+  int64 dog_id = 1;      // 好友当前上场的狗 ID；缺省/0 表示没有上场狗
+}
+// ============ 进入原因枚举 ============
+enum EnterReason {
+    ENTER_REASON_UNKNOWN = 0;
+    ENTER_REASON_BUBBLE = 1;
+    ENTER_REASON_FRIEND = 2;
+    ENTER_REASON_INTERACT = 3;
+}
+
+// ============ 进入好友农场 ============
+message EnterRequest {
+    int64 host_gid = 1;      // 好友的GID
+    int32 reason = 2;        // EnterReason 进入原因
+}
+
+message EnterReply {
+    gamepb.userpb.BasicInfo basic = 1;              // 好友基本信息
+    repeated gamepb.plantpb.LandInfo lands = 2;     // 好友的所有土地
+    BriefDogInfo brief_dog_info = 3;                // 好友当前上场的狗（结构化，直接读 dog_id）
+    bytes nudge_info = 4;                           // 催熟信息(抓包: length-delimited)
+    gamepb.weatherpb.WeatherStatus weather = 13;    // 当前农场天气状态
+}
+
+// ============ 离开好友农场 ============
+message LeaveRequest {
+    int64 host_gid = 1;      // 好友的GID
+}
+
+message LeaveReply {
+    // 空消息
+}

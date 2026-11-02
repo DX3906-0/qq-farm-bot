@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package gamepb.skinpb;
+
+// 装扮/皮肤服务（字段号与上游 liyangpengs/qq-farm-bot core/src/proto/skinpb.proto 对齐，
+// 上游 tools/audit-capture-compatibility.js 记录 SkinsOwned / SkinsEquipped /
+// GetSkinEffectTypeParams 三个读接口有抓包实证）。
+//
+// 注意：上游只登记了类型，没有任何服务/UI 调用过；本项目的装扮面板是首个使用者，
+// 所以 slot_type 的具体枚举值、skin_id 是否等于 ItemInfo 的 item_id，
+// 都以**实跑回包**为准（见 core/src/services/skin.js 的注释）。
+
+// ============ 皮肤条目 ============
+message SkinItem {
+    int64 skin_id = 1;      // 皮肤/装扮 ID（实测等于 ItemInfo 的 item_id，如 210016=海贝桌椅）
+    int64 slot_type = 2;    // 装备槽位类型（实跑后按图标名归类落到部件名）
+    bool is_new = 3;        // 是否有未查看的红点
+}
+
+// ============ 已拥有 ============
+message SkinsOwnedRequest {}
+
+message SkinsOwnedReply {
+    repeated SkinItem skins = 1;
+}
+
+// ============ 已装备（当前外观）============
+message SkinsEquippedRequest {}
+
+message SkinsEquippedReply {
+    repeated SkinItem skins = 1;
+    SkinEffectSelection effect_selection = 2;
+}
+
+// 皮肤效果选择（部分皮肤带可开关的效果）
+message SkinEffectSelection {
+    int64 effect_type = 1;
+    int64 effect_value = 2;
+    bool enabled = 3;
+}
+
+message SkinEffectParams {
+    int64 value = 1;
+}
+
+message SkinEffectTypeParam {
+    int64 effect_type = 1;
+    SkinEffectParams params = 2;
+}
+
+message GetSkinEffectTypeParamsRequest {}
+
+message GetSkinEffectTypeParamsReply {
+    repeated SkinEffectTypeParam params = 1;
+}
+
+// ============ 装备 / 取消查看红点 ============
+message EquipRequest {
+    int64 skin_id = 1;
+    int64 slot_type = 2;
+}
+
+message EquipReply {
+    repeated SkinItem skins = 1;
+}
+
+message MarkAsViewedRequest {
+    repeated int64 skin_ids = 1;
+}
+
+message MarkAsViewedReply {}
+
+// ============ 服务器推送 ============
+message SkinChangeNotify {
+    repeated SkinItem skins = 1;
+}
