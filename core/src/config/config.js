@@ -1,6 +1,9 @@
 const process = require('node:process');
 
-const DEFAULT_CLIENT_VERSION = '1.14.2.15_20260922';
+// 对齐上游 2026-11-02 双端更新（QQ/微信统一 1.16.1.6_20261028）。
+// 注意：clientVersion 落后会被判"客户端过期"，加速 Code 回收 —— 这是 QQ 掉线的隐藏根因之一，
+// 每次官方更新都应跟进上游。
+const DEFAULT_CLIENT_VERSION = '1.16.1.6_20261028';
 
 function parseClientVersion(value) {
     const match = String(value || '').trim().match(/^(\d+(?:\.\d+){2,4})_(\d{8})$/);

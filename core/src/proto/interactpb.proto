@@ -28,3 +28,44 @@ message InteractRecordsRequest {}
 message InteractRecordsReply {
     repeated InteractRecord records = 1;
 }
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message InteractInfo {
+    int64 visitor_gid = 1;
+    string nick = 2;
+    string avatar_url = 3;
+    int32 action_type = 4;
+    int64 server_time = 5;
+    int32 crop_id = 6;
+    int32 crop_count = 7;
+    int32 level = 8;
+}
+
+message GetInteractInfoRequest {}
+
+message GetInteractInfoReply {
+    repeated InteractInfo infos = 1;
+    int64 server_time = 2;
+}
+
+message InteractSummary {
+    int64 total_water = 1;
+    int64 total_insecticide = 2;
+    int64 total_weed = 3;
+    int64 total_steal = 4;
+    int64 total_stolen = 5;
+    int64 visitor_count = 6;
+}
+
+message GetInteractSummaryRequest {}
+
+message GetInteractSummaryReply {
+    InteractSummary summary = 1;
+}
+
+message DismissInteractPopupRequest {}
+
+message DismissInteractPopupReply {}

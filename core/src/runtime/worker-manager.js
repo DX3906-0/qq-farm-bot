@@ -1,4 +1,39 @@
 const { createScheduler } = require('../services/scheduler');
+const { getRequestContext, requestError } = require('../utils/request-priority');
+
+// 只列顶层明确安全读；强制刷新好友、好友农场和可能 Visit 的活动不在此列。
+const SAFE_TOPLEVEL_READ = new Set([
+    'getLands', 'getSeeds', 'getBag', 'getBagSeeds',
+    'getPetOverview', 'getUnifiedHarvest', 'getFriends', 'getSchedulers',
+    'getTransportDiagnostics',
+]);
+const READ_RPC_TIMEOUT_MS = 65000;
+const COMPOSITE_READ_RPC_TIMEOUT_MS = 90000;
+const MAX_PENDING_RPC = 100;
+const MAX_LATE_RESULTS = 50;
+const WORKER_STOP_TIMEOUT_MS = 160000;
+const MAX_WORKER_DRAIN_MS = 155000;
+const MAX_RETIRED_DIAGNOSTICS = 100;
+
+function canonicalArgs(value) {
+    if (value === undefined) return 'undefined';
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(canonicalArgs).join(',')}]`;
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalArgs(value[key])}`).join(',')}}`;
+}
+
+function cloneJson(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function rpcError(message, details = {}) {
+    const error = requestError(String(message), details);
+    for (const key of ['errorCode', 'stage', 'retryAfterMs', 'sent', 'resultState', 'outcomeUnknown',
+        'holdUntilTransportEpochChanged', 'friendGid', 'processing']) {
+        if (details[key] !== undefined) error[key] = details[key];
+    }
+    return error;
+}
 
 /**
  * 下线提醒触发阈值（毫秒）。
@@ -34,6 +69,86 @@ function createWorkerManager(deps) {
     } = deps;
 
     const scheduler = createScheduler('worker_manager');
+    const rpcStates = new WeakMap();
+    let workerIdentity = 0;
+    let shuttingDown = false;
+    let shutdownComplete = false;
+    let drainPromise = null;
+    const retiredDiagnostics = new Map();
+
+    function rpcState(wrk) {
+        let state = rpcStates.get(wrk);
+        if (!state) {
+            state = { identity: ++workerIdentity, generation: 0, flights: new Map(), subscribers: 0, lateResults: [] };
+            rpcStates.set(wrk, state);
+        }
+        return state;
+    }
+
+    function invalidateReads(wrk) {
+        const state = rpcState(wrk);
+        state.generation += 1;
+        state.flights.clear();
+    }
+
+    function cleanupWorkerRequests(accountId, wrk, message = 'Worker exited') {
+        if (!wrk) return;
+        for (const pending of wrk.requests.values()) {
+            pending.settle(rpcError(message, {
+                errorCode: 'WORKER_EXITED', stage: 'worker_rpc', sent: pending.sent,
+                resultState: pending.sent && !pending.readOnly ? 'unknown' : 'not_completed',
+                outcomeUnknown: pending.sent && !pending.readOnly,
+            }));
+        }
+        wrk.requests.clear();
+        rpcState(wrk).flights.clear();
+    }
+
+    function pendingWriteCount(wrk) {
+        let count = 0;
+        for (const pending of wrk.requests.values()) {
+            if (pending.sent && !pending.readOnly) count += 1;
+        }
+        return count;
+    }
+
+    function retainDiagnostics(accountId, wrk) {
+        const state = rpcState(wrk);
+        retiredDiagnostics.delete(String(accountId));
+        retiredDiagnostics.set(String(accountId), cloneJson({ pending: 0, subscribers: 0, flights: 0,
+            writeCount: 0, mutationGeneration: state.generation, lateResults: state.lateResults,
+            quiesceAck: wrk.quiesceAck || null, stopOutcome: wrk.stopOutcome || null }));
+        if (retiredDiagnostics.size > MAX_RETIRED_DIAGNOSTICS) retiredDiagnostics.delete(retiredDiagnostics.keys().next().value);
+    }
+
+    function emergencyCleanup() {
+        if (shutdownComplete) return;
+        shutdownComplete = true;
+        shuttingDown = true;
+        for (const [accountId, wrk] of Object.entries(workers)) {
+            cleanupWorkerRequests(accountId, wrk);
+            retainDiagnostics(accountId, wrk);
+            wrk.restartCleanup?.();
+            wrk.detachProcessListeners?.();
+            wrk.finishStop?.();
+        }
+        scheduler.clearAll();
+        processRef.removeListener?.('exit', emergencyCleanup);
+        processRef.removeListener?.('disconnect', emergencyCleanup);
+    }
+
+    function shutdown(options = {}) {
+        if (options.drain !== true) { emergencyCleanup(); return; }
+        if (drainPromise) return drainPromise;
+        if (shutdownComplete) return Promise.resolve();
+        shuttingDown = true;
+        const stops = Object.keys(workers).map(id => stopWorker(id, { preserveSession: options.preserveSession === true }));
+        drainPromise = Promise.all(stops).then(outcomes => { emergencyCleanup(); return outcomes; });
+        return drainPromise;
+    }
+    // 进程已退出时无法异步等待，仅做兜底清理；正常关闭走 drain。
+    processRef.once?.('exit', emergencyCleanup);
+    processRef.once?.('disconnect', emergencyCleanup);
 
     // 活动自动化「过期压关」的持久化钩子。
     // 读取侧（getAutomation/getConfigSnapshot）只能骗过面板与运行时判断，
@@ -128,8 +243,25 @@ function createWorkerManager(deps) {
     /**
      * 创建 Thread Worker
      */
+    function workerEnvironment(account) {
+        const { resolveAccountGatewaySocket } = require('./gateway-routing');
+        const route = resolveAccountGatewaySocket(account.id, processRef.env);
+        if (route.blocked) throw new Error('微信网关凭据交接中，暂不启动账号');
+        return {
+            ...processRef.env,
+            FARM_ACCOUNT_ID: String(account.id || ''),
+            ...(route.delegated ? {
+                FARM_NETWORK_MODE: 'gateway',
+                FARM_GATEWAY_ACCOUNTS: String(account.id),
+                FARM_GATEWAY_EXTERNAL: '1',
+                FARM_GATEWAY_SOCK: route.socketPath,
+            } : {}),
+        };
+    }
+
     function createThreadWorker(account) {
         const worker = new WorkerThread(workerScriptPath, {
+            env: workerEnvironment(account),
             workerData: {
                 accountId: String(account.id || ''),
                 channel: 'thread'
@@ -151,18 +283,14 @@ function createWorkerManager(deps) {
                 execPath: processRef.execPath,
                 stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
                 env: {
-                    ...processRef.env,
+                    ...workerEnvironment(account),
                     FARM_WORKER: '1',
-                    FARM_ACCOUNT_ID: String(account.id || '')
                 }
             });
         }
         return fork(workerScriptPath, [], {
             stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
-            env: {
-                ...processRef.env,
-                FARM_ACCOUNT_ID: String(account.id || '')
-            }
+            env: workerEnvironment(account)
         });
     }
 
@@ -177,8 +305,8 @@ function createWorkerManager(deps) {
     /**
      * 启动账号 Worker
      */
-    function startWorker(account) {
-        if (!account || !account.id) return false;
+    function startWorker(account, options = {}) {
+        if (shuttingDown || !account || !account.id) return false;
         if (workers[account.id]) return false;
 
         log('系统', `正在启动账号: ${  account.name}`, {
@@ -204,12 +332,14 @@ function createWorkerManager(deps) {
         workers[account.id] = {
             process: proc,
             status: null,
+            resumeSession: options.resumeSession === true,
             logs: [],
             requests: new Map(),
             reqId: 1,
             name: account.name,
             username: account.username || '',
             platform: account.platform || 'qq',
+            loginCode: account.code,
             gid: account.gid || '',
             openId: account.openId || account.open_id || '',
             qq: account.qq || account.uin || '',
@@ -223,34 +353,34 @@ function createWorkerManager(deps) {
             wsError: null
         };
 
-        // 发送启动配置
-        proc.send({
-            type: 'start',
-            config: { code: account.code, platform: account.platform, loginType: account.loginType || 'manual' }
-        });
-
-        // 发送配置快照
-        proc.send({
-            type: 'config_sync',
-            config: buildConfigSnapshotForAccount(account.id)
-        });
-
-        // 监听 Worker 消息
-        proc.on('message', (msg) => {
+        const registeredWorker = workers[account.id];
+        const onMessage = (msg) => {
+            if (workers[account.id]?.process !== proc) return;
             handleWorkerMessage(account.id, msg);
-        });
+        };
 
-        // 监听 Worker 错误
-        proc.on('error', (err) => {
+        const onError = (err) => {
+            if (workers[account.id]?.process === proc) {
+                workers[account.id].rpcFailed = true;
+                if (!workers[account.id].stopping && !shuttingDown) cleanupWorkerRequests(account.id, workers[account.id]);
+            }
             log('系统', `账号 ${  account.name  } 子进程启动失败: ${ 
                 err && err.message ? err.message : err}`, {
                 accountId: String(account.id),
                 accountName: account.name
             });
-        });
+        };
 
-        // 监听 Worker 退出
-        proc.on('exit', (code, signal) => {
+        const onExit = (code, signal) => {
+            if (registeredWorker.stopping && !registeredWorker.stopOutcome) {
+                const graceful = code === 0 && !signal;
+                registeredWorker.stopOutcome = { graceful, resultState: graceful ? 'worker_exited' : 'unknown',
+                    outcomeUnknown: !graceful, at: Date.now() };
+            }
+            registeredWorker.detachProcessListeners();
+            cleanupWorkerRequests(account.id, registeredWorker);
+            retainDiagnostics(account.id, registeredWorker);
+            registeredWorker.finishStop?.();
             const wrk = workers[account.id];
             const displayName = wrk && wrk.name ? wrk.name : account.name;
 
@@ -261,17 +391,13 @@ function createWorkerManager(deps) {
                 runtimeMode: threadMode ? 'thread' : 'fork'
             });
 
+            // 超时强杀后旧进程的 exit 可能迟到，不能清掉新 worker 的计时器或请求。
+            if (wrk && wrk.process !== proc) return;
+
             scheduler.clear(`force_kill_${  account.id}`);
             scheduler.clear(`restart_fallback_${  account.id}`);
 
-            // 清理所有未完成的 API 请求
-            if (wrk && wrk.requests && wrk.requests.size > 0) {
-                for (const [reqId, pending] of wrk.requests.entries()) {
-                    scheduler.clear(`api_timeout_${  account.id  }_${  reqId}`);
-                    try { pending.reject(new Error('Worker exited')); } catch { }
-                }
-                wrk.requests.clear();
-            }
+            cleanupWorkerRequests(account.id, wrk);
 
             const wasStopping = !!(wrk && wrk.stopping);
             if (wrk && wrk.process === proc) {
@@ -280,10 +406,29 @@ function createWorkerManager(deps) {
 
             // 自动拉起：仅当非主动停止（非 stop/restart 触发）时重启 worker。
             // gateway 模式下 worker 重启由网关进程保活连接，不消耗新 Code，可安全自动拉起。
-            if (!wasStopping && !threadMode) {
+            if (!shuttingDown && !wasStopping && !threadMode) {
                 scheduleWorkerAutoRestart(account.id, displayName);
             }
-        });
+        };
+        registeredWorker.detachProcessListeners = () => {
+            proc.removeListener('message', onMessage);
+            proc.removeListener('error', onError);
+            proc.removeListener('exit', onExit);
+        };
+        proc.on('message', onMessage);
+        proc.on('error', onError);
+        proc.once('exit', onExit);
+        try {
+            proc.send({
+                type: 'start',
+                config: { code: account.code, platform: account.platform, loginType: account.loginType || 'manual', resumeSession: options.resumeSession === true },
+            }, error => { if (error) onError(error); });
+            proc.send({ type: 'config_sync', config: buildConfigSnapshotForAccount(account.id) }, error => { if (error) onError(error); });
+        } catch (error) {
+            onError(error);
+            stopWorker(account.id);
+            return false;
+        }
 
         return true;
     }
@@ -321,7 +466,10 @@ function createWorkerManager(deps) {
                     return;
                 }
                 log('系统', `账号 ${  displayName  } 已自动拉起（worker 崩溃恢复）`, { accountId: String(accountId) });
-                startWorker(acc);
+                const gatewayIds = String(processRef.env.FARM_GATEWAY_ACCOUNTS || '').trim();
+                const resumeSession = processRef.env.FARM_NETWORK_MODE === 'gateway'
+                    && (!gatewayIds || gatewayIds.split(',').map(s => s.trim()).includes(String(accountId)));
+                startWorker(acc, { resumeSession });
             } catch (e) {
                 log('错误', `自动拉起账号 ${  displayName  } 失败: ${  e.message  }`, { accountId: String(accountId) });
             }
@@ -331,76 +479,84 @@ function createWorkerManager(deps) {
     /**
      * 停止账号 Worker
      */
-    function stopWorker(accountId) {
+    function stopWorker(accountId, options = {}) {
         const wrk = workers[accountId];
-        if (!wrk) return;
-
+        if (!wrk) return Promise.resolve();
+        if (wrk.stopPromise) return wrk.stopPromise;
         const targetProc = wrk.process;
         wrk.stopping = true;
-
-        // 发送停止指令
-        wrk.process.send({ type: 'stop' });
-
-        // 1 秒后强制杀死
-        scheduler.setTimeoutTask(`force_kill_${  accountId}`, 1000, () => {
-            const current = workers[accountId];
-            if (current && current.process === targetProc) {
-                current.process.kill();
-                delete workers[accountId];
-            }
+        wrk.stopDeadline = Date.now() + WORKER_STOP_TIMEOUT_MS;
+        wrk.stopPromise = new Promise(resolve => {
+            wrk.finishStop = () => {
+                scheduler.clear(`force_kill_${accountId}`);
+                wrk.finishStop = null;
+                resolve({ accountId: String(accountId), ...(wrk.stopOutcome || {
+                    graceful: false, resultState: 'unknown', outcomeUnknown: true,
+                }) });
+            };
         });
+        const forceStop = () => {
+            if (workers[accountId]?.process !== targetProc) { wrk.finishStop?.(); return; }
+            // raw 自动化写不在 RPC Map 中，超时只记未知结果，不推断已排空。
+            wrk.stopOutcome = { graceful: false, sent: true, resultState: 'unknown', outcomeUnknown: true,
+                errorCode: 'WORKER_DRAIN_TIMEOUT', at: Date.now() };
+            log('系统', 'Worker 排空超时，结果未知', { accountId: String(accountId), ...wrk.stopOutcome });
+            cleanupWorkerRequests(accountId, wrk);
+            retainDiagnostics(accountId, wrk);
+            wrk.detachProcessListeners?.();
+            try { targetProc.kill(); } catch { }
+            if (workers[accountId]?.process === targetProc) delete workers[accountId];
+            wrk.finishStop?.();
+        };
+        // stop 必须等 worker 自身的 raw 传输排空，不按 RPC 计数或状态快照提前强杀。
+        scheduler.setTimeoutTask(`force_kill_${accountId}`, WORKER_STOP_TIMEOUT_MS, forceStop);
+        // 只取消明确安全读，保留消息监听和所有 pending，写由 worker stop 等待结算。
+        for (const pending of [...wrk.requests.values()]) if (pending.readOnly) pending.cancel();
+        try {
+            targetProc.send({ type: 'stop', preserveSession: options.preserveSession === true });
+        } catch { }
+        return wrk.stopPromise;
     }
 
     /**
      * 重启账号 Worker
      */
-    function restartWorker(account) {
+    function restartWorker(account, options = {}) {
         if (!account) return;
         const accountId = account.id;
         const wrk = workers[accountId];
 
         // 如果未运行，直接启动
-        if (!wrk) return startWorker(account);
+        if (!wrk) return startWorker(account, options);
 
         const targetProc = wrk.process;
-        let restarted = false;
-
+        const gatewayIds = String(processRef.env.FARM_GATEWAY_ACCOUNTS || '').trim();
+        const usesGateway = processRef.env.FARM_NETWORK_MODE === 'gateway'
+            && (!gatewayIds || gatewayIds.split(',').map(s => s.trim()).includes(String(accountId)));
+        const startOptions = {
+            ...options,
+            resumeSession: options.resumeSession === true
+                || (usesGateway && options.replaceSession !== true && account.code === wrk.loginCode),
+        };
+        if (wrk.restartPromise) return wrk.restartPromise;
         const doRestart = () => {
-            if (restarted) return;
-            restarted = true;
-            scheduler.clear(`restart_fallback_${  accountId}`);
-
+            if (shuttingDown) return false;
             const current = workers[accountId];
-            if (!current) return startWorker(account);
-            if (current.process !== targetProc) return;
-
-            delete workers[accountId];
-            startWorker(account);
+            if (current && current.process !== targetProc) return false;
+            if (current) {
+                cleanupWorkerRequests(accountId, current);
+                retainDiagnostics(accountId, current);
+                current.detachProcessListeners?.();
+                delete workers[accountId];
+            }
+            return startWorker(account, startOptions);
         };
-
-        const forceKill = () => {
-            const current = workers[accountId];
-            if (!current || current.process !== targetProc) return false;
-            try { current.process.kill(); } catch { }
-            delete workers[accountId];
-            return true;
-        };
-
-        // 如果进程已退出，直接重启
-        if (typeof targetProc.exitCode === 'number' || targetProc.signalCode) {
-            return doRestart();
-        }
-
-        // 先尝试正常停止，再等待退出事件
-        targetProc.once('exit', doRestart);
-        stopWorker(accountId);
-
-        // 1500ms 超时回退
-        scheduler.setTimeoutTask(`restart_fallback_${  accountId}`, 1500, () => {
-            if (restarted) return;
-            forceKill();
-            doRestart();
-        });
+        if (typeof targetProc.exitCode === 'number' || targetProc.signalCode) return doRestart();
+        // 重复重启复用同一排空 Promise；不再有独立 1500ms 强杀回退。
+        wrk.restartPromise = stopWorker(accountId, {
+            preserveSession: processRef.env.FARM_NETWORK_MODE === 'gateway',
+        }).then(doRestart);
+        return wrk.restartPromise;
     }
 
     /**
@@ -410,7 +566,16 @@ function createWorkerManager(deps) {
         const wrk = workers[accountId];
         if (!wrk) return;
 
-        if (msg.type === 'status_sync') {
+        if (msg.type === 'worker_quiescing') {
+            if (!wrk.stopping || wrk.quiesceAck) return;
+            if (!Number.isInteger(msg.pendingWrites) || msg.pendingWrites < 0
+                || !Number.isFinite(msg.maxDrainMs) || msg.maxDrainMs < 0) return;
+            const maxDrainMs = Math.min(MAX_WORKER_DRAIN_MS, msg.maxDrainMs);
+            wrk.quiesceAck = { pendingWrites: msg.pendingWrites, maxDrainMs,
+                at: Date.now(), deadline: Math.min(wrk.stopDeadline, Date.now() + maxDrainMs + 1000) };
+            // ack 是计数快照，不代表 raw 写已经排空；不能据此缩短统一退出保护。
+            log('系统', 'Worker 已进入传输排空', { accountId: String(accountId), ...wrk.quiesceAck });
+        } else if (msg.type === 'status_sync') {
             // 状态同步
             wrk.status = normalizeStatusForPanel(msg.data, accountId, wrk.name);
             if (typeof onStatusSync === 'function') {
@@ -647,15 +812,26 @@ function createWorkerManager(deps) {
                 }
             }
         } else if (msg.type === 'api_response') {
-            // API 响应
-            const { id, result, error } = msg;
-            scheduler.clear(`api_timeout_${  accountId  }_${  id}`);
-
+            const { id, result, error, errorMeta } = msg;
             const pending = wrk.requests.get(id);
             if (pending) {
-                if (error) pending.reject(new Error(error));
-                else pending.resolve(result);
-                wrk.requests.delete(id);
+                pending.settle(error ? rpcError(error, {
+                    stage: 'worker_rpc', sent: pending.sent,
+                    resultState: pending.readOnly ? 'not_completed' : 'unknown', outcomeUnknown: !pending.readOnly,
+                    ...(errorMeta || {}),
+                }) : null, result);
+            } else {
+                const record = rpcState(wrk).lateResults.find(item => item.id === id);
+                if (record && record.resultState === 'unknown') {
+                    record.completedAt = Date.now();
+                    record.resultState = error ? (errorMeta?.resultState || 'unknown') : 'completed';
+                    record.outcomeUnknown = error ? (errorMeta?.outcomeUnknown ?? record.resultState === 'unknown') : false;
+                    record.errorCode = errorMeta?.errorCode;
+                    // 只留状态，不保存结果、参数或可能含凭据的错误文本。
+                    log('系统', record.late !== false ? 'Worker 写请求迟到结果已结算' : 'Worker 写请求终态状态已更新', {
+                        accountId: String(accountId), ...record,
+                    });
+                }
             }
         } else if (msg.type === 'friend_blacklist_add') {
             // 好友黑名单添加
@@ -688,43 +864,208 @@ function createWorkerManager(deps) {
      */
     function callWorkerApi(accountId, method, ...args) {
         const wrk = workers[accountId];
-        if (!wrk) return Promise.reject(new Error('账号未运行'));
-
-        // 检查最后一个参数是否包含 _timeoutMs
+        const proc = wrk?.process;
+        if (shuttingDown || !wrk || wrk.stopping || wrk.rpcFailed || !proc
+            || proc.connected === false || typeof proc.exitCode === 'number' || proc.signalCode) {
+            return Promise.reject(rpcError('账号未运行', { errorCode: 'WORKER_NOT_RUNNING', stage: 'worker_rpc', sent: false, resultState: 'not_sent' }));
+        }
+        const context = getRequestContext();
         const lastArg = args.at(-1);
         const customTimeout = lastArg && typeof lastArg === 'object' && lastArg._timeoutMs;
-        const timeoutMs = customTimeout
-            ? Number(lastArg._timeoutMs) || 10000
-            : 10000;
-
-        const actualArgs = customTimeout ? args.slice(0, -1) : args;
-
+        const actualArgs = customTimeout ? args.slice(0, -1) : args.slice();
+        while (actualArgs.length && actualArgs.at(-1) === undefined) actualArgs.pop();
+        const readOnly = SAFE_TOPLEVEL_READ.has(method)
+            && (method === 'getFriends'
+                ? actualArgs.length <= 1 && (actualArgs.length === 0 || actualArgs[0] === false)
+                : actualArgs.length === 0);
+        const readBudget = ['getLands', 'getBagSeeds', 'getPetOverview'].includes(method)
+            ? COMPOSITE_READ_RPC_TIMEOUT_MS : READ_RPC_TIMEOUT_MS;
+        const timeoutMs = customTimeout ? Number(lastArg._timeoutMs) || 10000 : (readOnly ? readBudget : 10000);
+        const now = Date.now();
+        const contextDeadline = Number.isFinite(context.deadline) ? context.deadline : Infinity;
+        const subscriberDeadline = Math.min(now + Math.max(1, timeoutMs), contextDeadline);
+        // 短订阅者只限制自己的等待；共享安全读具有覆盖线端和排队的固定有界预算。
+        const deadline = readOnly ? now + readBudget : subscriberDeadline;
+        if (context.signal?.aborted || subscriberDeadline <= Date.now()) {
+            return Promise.reject(rpcError(context.signal?.aborted ? 'Request Cancelled' : 'API Timeout', {
+                errorCode: context.signal?.aborted ? 'CANCELLED' : 'DEADLINE', stage: 'worker_rpc', sent: false, resultState: 'not_sent',
+            }));
+        }
+        const state = rpcState(wrk);
+        const transport = wrk.status?.stats?.gatewayTransport || wrk.status?.gatewayTransport || {};
+        const diagnosticSession = transport.transport || transport;
+        const directSession = diagnosticSession.direct || {};
+        let key;
+        try {
+            key = readOnly ? canonicalArgs(JSON.parse(JSON.stringify([state.identity,
+                diagnosticSession.currentGID ?? diagnosticSession.currentGid ?? directSession.currentGID ?? directSession.currentGid ?? wrk.status?.status?.gid ?? wrk.gid ?? '',
+                diagnosticSession.sessionEpoch ?? directSession.sessionEpoch ?? wrk.sessionEpoch ?? '',
+                diagnosticSession.connectionEpoch ?? '', directSession.connectionEpoch ?? '', method, actualArgs, state.generation]))) : null;
+        } catch {
+            return Promise.reject(rpcError('Invalid RPC arguments', { errorCode: 'INVALID_ARGUMENT', sent: false, resultState: 'not_sent' }));
+        }
+        let pending = key && state.flights.get(key);
+        if (state.subscribers >= MAX_PENDING_RPC || (!pending && wrk.requests.size >= MAX_PENDING_RPC)) {
+            return Promise.reject(rpcError('Worker API queue full', { errorCode: 'QUEUE_FULL', stage: 'worker_rpc', sent: false, resultState: 'not_sent' }));
+        }
+        if (pending?.draining) {
+            return Promise.reject(rpcError('API Timeout', { errorCode: 'DEADLINE', stage: 'worker_rpc', sent: false, resultState: 'not_sent' }));
+        }
+        const isNew = !pending;
+        if (isNew) {
+            if (!readOnly) invalidateReads(wrk);
+            const id = wrk.reqId++;
+            pending = { id, method, readOnly, key, deadline, sent: false, subscribers: new Set(), subscriberId: 0, draining: false, cancelSent: false };
+            pending.cancel = () => {
+                if (!pending.readOnly || !pending.sent || pending.cancelSent) return;
+                pending.cancelSent = true;
+                const onCancelSendError = () => {
+                    // 取消消息发送失败不能证明底层已停止，封闭此 worker 的新 RPC 防止重复读。
+                    wrk.rpcFailed = true;
+                    // 停机排空期间不能因读取消 IPC 失败丢弃仍待结算的写。
+                    if (!wrk.stopping && !shuttingDown) cleanupWorkerRequests(accountId, wrk);
+                };
+                try {
+                    proc.send({ type: 'api_cancel', id }, error => { if (error) onCancelSendError(); });
+                } catch {
+                    onCancelSendError();
+                }
+            };
+            pending.recordLate = (late = true) => {
+                if (readOnly || !pending.sent || pending.lateRecord) return;
+                pending.lateRecord = { id, method, at: Date.now(), sent: true, resultState: 'unknown', outcomeUnknown: true, late };
+                state.lateResults.push(pending.lateRecord);
+                if (state.lateResults.length > MAX_LATE_RESULTS) state.lateResults.shift();
+                if (late) log('系统', 'Worker 写请求等待迟到结算', { accountId: String(accountId), ...pending.lateRecord });
+            };
+            pending.settle = (error, result) => {
+                if (wrk.requests.get(id) !== pending) return;
+                // IPC已派发不等于游戏写已发送；立即终态unknown不是订阅超时后的迟到回包。
+                if (error?.outcomeUnknown === true && error.sent !== false) pending.recordLate(false);
+                scheduler.clear(`api_timeout_${accountId}_${id}`);
+                wrk.requests.delete(id);
+                if (key && state.flights.get(key) === pending) state.flights.delete(key);
+                if (!readOnly) {
+                    invalidateReads(wrk);
+                    if (pending.outcomeContext) pending.outcomeContext.pendingWrites -= 1;
+                }
+                if (pending.lateRecord) {
+                    pending.lateRecord.completedAt = Date.now();
+                    pending.lateRecord.resultState = error ? (error.resultState || 'failed') : 'completed';
+                    pending.lateRecord.outcomeUnknown = error?.outcomeUnknown === true;
+                    pending.lateRecord.errorCode = error?.errorCode;
+                    log('系统', pending.lateRecord.late ? 'Worker 写请求迟到结果已结算' : 'Worker 写请求终态结果未知', {
+                        accountId: String(accountId), ...pending.lateRecord,
+                    });
+                }
+                for (const subscriber of [...pending.subscribers]) {
+                    if (error) subscriber.finish(rpcError(error.message, {
+                        errorCode: error.errorCode, stage: error.stage, retryAfterMs: error.retryAfterMs,
+                        sent: error.sent, resultState: error.resultState, outcomeUnknown: error.outcomeUnknown,
+                        holdUntilTransportEpochChanged: error.holdUntilTransportEpochChanged,
+                        friendGid: error.friendGid, processing: error.processing,
+                    }));
+                    else {
+                        try { subscriber.finish(null, cloneJson(result)); }
+                        catch { subscriber.finish(rpcError('Invalid RPC response', { errorCode: 'INVALID_RESPONSE', stage: 'worker_rpc' })); }
+                    }
+                }
+            };
+            wrk.requests.set(id, pending);
+            if (key) state.flights.set(key, pending);
+            scheduler.setTimeoutTask(`api_timeout_${accountId}_${id}`, Math.max(1, deadline - Date.now()), () => {
+                pending.draining = true;
+                pending.recordLate();
+                pending.cancel();
+                for (const subscriber of [...pending.subscribers]) subscriber.finish(rpcError('API Timeout', {
+                    errorCode: 'DEADLINE', stage: 'worker_rpc', sent: pending.sent,
+                    resultState: !readOnly && pending.sent ? 'unknown' : 'not_completed', outcomeUnknown: !readOnly && pending.sent,
+                }));
+                // 无终态仍占有名额，防止取消后重复发起底层请求；只由回包/退出释放。
+            });
+        }
         return new Promise((resolve, reject) => {
-            const reqId = wrk.reqId++;
-            wrk.requests.set(reqId, { resolve, reject });
-
-            // API 超时保护
-            scheduler.setTimeoutTask(`api_timeout_${  accountId  }_${  reqId}`, timeoutMs, () => {
-                if (wrk.requests.has(reqId)) {
-                    wrk.requests.delete(reqId);
-                    reject(new Error('API Timeout'));
+            const subscriberKey = `api_subscriber_${accountId}_${pending.id}_${++pending.subscriberId}`;
+            const subscriber = {
+                finish(error, result) {
+                    if (!pending.subscribers.delete(subscriber)) return;
+                    state.subscribers -= 1;
+                    scheduler.clear(subscriberKey);
+                    context.signal?.removeEventListener('abort', onAbort);
+                    if (error) reject(error); else resolve(result);
+                },
+            };
+            const onAbort = () => {
+                subscriber.finish(rpcError('Request Cancelled', {
+                    errorCode: 'CANCELLED', stage: 'worker_rpc', sent: pending.sent,
+                    resultState: !readOnly && pending.sent ? 'unknown' : 'not_completed', outcomeUnknown: !readOnly && pending.sent,
+                }));
+                if (!pending.subscribers.size) {
+                    pending.draining = true;
+                    pending.recordLate();
+                    pending.cancel();
+                }
+            };
+            state.subscribers += 1;
+            pending.subscribers.add(subscriber);
+            context.signal?.addEventListener('abort', onAbort, { once: true });
+            scheduler.setTimeoutTask(subscriberKey, Math.max(1, subscriberDeadline - Date.now()), () => {
+                subscriber.finish(rpcError('API Timeout', {
+                    errorCode: 'DEADLINE', stage: 'worker_rpc', sent: pending.sent,
+                    resultState: !readOnly && pending.sent ? 'unknown' : 'not_completed', outcomeUnknown: !readOnly && pending.sent,
+                }));
+                if (!pending.subscribers.size) {
+                    pending.draining = true;
+                    pending.recordLate();
+                    pending.cancel();
                 }
             });
-
-            wrk.process.send({
-                type: 'api_call',
-                id: reqId,
-                method,
-                args: actualArgs
-            });
+            if (context.signal?.aborted) onAbort();
+            if (!isNew || !pending.subscribers.size) {
+                if (isNew) pending.settle(rpcError('Request Cancelled', { errorCode: 'CANCELLED', sent: false, resultState: 'not_sent' }));
+                return;
+            }
+            try {
+                pending.sent = true;
+                if (!readOnly && context.rpcOutcome) {
+                    pending.outcomeContext = context.rpcOutcome;
+                    context.rpcOutcome.pendingWrites += 1;
+                }
+                proc.send({ type: 'api_call', id: pending.id, method, args: actualArgs, deadline, readOnly }, error => {
+                    if (error) pending.settle(rpcError('Worker send failed', {
+                        errorCode: 'WORKER_SEND_FAILED', stage: 'worker_rpc', sent: true,
+                        resultState: readOnly ? 'not_completed' : 'unknown', outcomeUnknown: !readOnly,
+                    }));
+                });
+            } catch {
+                pending.sent = false;
+                pending.settle(rpcError('Worker send failed', { errorCode: 'WORKER_SEND_FAILED', stage: 'worker_rpc', sent: false, resultState: 'not_sent' }));
+            }
         });
     }
+
+    function getDiagnostics(accountId) {
+        const wrk = workers[accountId];
+        if (!wrk) return cloneJson(retiredDiagnostics.get(String(accountId))
+            || { pending: 0, subscribers: 0, flights: 0, writeCount: 0, lateResults: [] });
+        const state = rpcState(wrk);
+        return cloneJson({ pending: wrk.requests.size, subscribers: state.subscribers, flights: state.flights.size,
+            writeCount: pendingWriteCount(wrk),
+            mutationGeneration: state.generation, lateResults: state.lateResults,
+            quiesceAck: wrk.quiesceAck || null, stopOutcome: wrk.stopOutcome || null });
+    }
+
+    // runtime-engine 已将同一函数传给 provider，沿此引用附带本地诊断，避免改动引擎注入结构。
+    callWorkerApi.getDiagnostics = getDiagnostics;
 
     return {
         startWorker,
         stopWorker,
         restartWorker,
-        callWorkerApi
+        callWorkerApi,
+        getDiagnostics,
+        shutdown,
+        emergencyCleanup
     };
 }
 

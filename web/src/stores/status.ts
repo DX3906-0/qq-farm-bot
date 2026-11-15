@@ -2,9 +2,11 @@ import type { Socket } from 'socket.io-client'
 import { useStorage } from '@vueuse/core'
 import { defineStore } from 'pinia'
 import { io } from 'socket.io-client'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import api from '@/api'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import { useAccountStore } from '@/stores/account'
+import type { AccountSnapshotMetadata } from '@/utils/operation-result'
 
 // Define interfaces for better type checking
 interface DailyGift {
@@ -16,6 +18,25 @@ interface DailyGift {
   completedCount?: number
   totalCount?: number
   tasks?: any[]
+}
+
+export interface ExpRateInfo {
+  expPerHour: number
+  activeRatePerHour: number
+  activeRatio: number
+  elapsedHours: number
+  sampleCount: number
+  gainCount: number
+  observedGain: number
+  rateEligibleGain?: number
+  partialGain?: number
+  partialUnknown?: boolean
+  lastObservedAt: number | null
+  confidence: 'low' | 'ok' | 'good'
+  source: 'none' | 'live' | 'history' | 'mixed'
+  estimate: boolean
+  reason: '' | 'insufficient' | 'idle' | 'stale' | 'clock-regression'
+  stale: boolean
 }
 
 interface DailyGiftsResponse {
@@ -30,9 +51,11 @@ export const useStatusStore = defineStore('status', () => {
   const accountLogs = ref<any[]>([])
   const dailyGifts = ref<DailyGiftsResponse | null>(null)
   const statusAccountId = ref('')
+  const statusMetadata = ref<AccountSnapshotMetadata | null>(null)
   const loading = ref(false)
   const error = ref('')
   const realtimeConnected = ref(false)
+  const statusTransportInterrupted = ref(false)
   const realtimeLogsEnabled = ref(true)
   const currentRealtimeAccountId = ref('')
   // 服务端当前已确认订阅的账号（由 subscribed 事件回填）。
@@ -49,6 +72,17 @@ export const useStatusStore = defineStore('status', () => {
   const tokenRef = useStorage('admin_token', '')
 
   let socket: Socket | null = null
+  let accountEpoch = 0
+  let statusRequest = 0
+  let statusInFlight: { accountId: string, epoch: number, promise: Promise<void> } | null = null
+
+  watch(getCurrentAccountId, () => {
+    clearAccountScopedData()
+  }, { flush: 'sync' })
+
+  function isCurrentRequest(accountId: string, epoch: number) {
+    return accountEpoch === epoch && isCurrentAccount(accountId)
+  }
 
   function getCurrentAccountId() {
     const accountStore = useAccountStore()
@@ -62,15 +96,34 @@ export const useStatusStore = defineStore('status', () => {
   const currentStatusReady = computed(() => {
     const currentId = getCurrentAccountId()
     return !!currentId && !!status.value && statusAccountId.value === currentId
+      && (status.value.accountId == null || String(status.value.accountId) === currentId)
+      && (statusMetadata.value === null || statusMetadata.value.accountId === currentId)
   })
+  const currentStatusMetadata = computed(() => currentStatusReady.value ? statusMetadata.value : null)
+  const currentStatusStale = computed(() => currentStatusReady.value && (
+    status.value.stale === true
+    || currentStatusMetadata.value?.source === 'ws' && statusTransportInterrupted.value
+  ))
 
-  function normalizeStatusPayload(input: any) {
-    return (input && typeof input === 'object') ? { ...input } : {}
+  function acceptStatusSnapshot(input: any, accountId: string, source: 'http' | 'ws') {
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+      || (input.accountId != null && String(input.accountId) !== accountId))
+      return false
+    status.value = { ...input }
+    statusAccountId.value = accountId
+    statusMetadata.value = { accountId, updatedAt: Date.now(), source }
+    statusTransportInterrupted.value = false
+    error.value = ''
+    return true
   }
 
   function clearAccountScopedData() {
+    accountEpoch += 1
+    loading.value = false
     status.value = null
     statusAccountId.value = ''
+    statusMetadata.value = null
+    statusTransportInterrupted.value = false
     logs.value = []
     accountLogs.value = []
     dailyGifts.value = null
@@ -173,13 +226,15 @@ export const useStatusStore = defineStore('status', () => {
   function handleRealtimeStatus(payload: any) {
     const body = (payload && typeof payload === 'object') ? payload : {}
     const accountId = String(body.accountId || '')
-    if (currentRealtimeAccountId.value && accountId !== currentRealtimeAccountId.value)
+    if (!accountId || !isCurrentAccount(accountId)
+      || (currentRealtimeAccountId.value && accountId !== currentRealtimeAccountId.value))
       return
-    if (body.status && typeof body.status === 'object') {
-      status.value = normalizeStatusPayload(body.status)
-      statusAccountId.value = accountId || currentRealtimeAccountId.value || getCurrentAccountId()
-      error.value = ''
+    if (body.ok === false || body.error) {
+      error.value = String(body.error || '状态获取失败')
+      return
     }
+    if (!acceptStatusSnapshot(body.status, accountId, 'ws'))
+      error.value = '状态回包无效或账号不匹配'
   }
 
   function handleRealtimeLog(payload: any) {
@@ -256,6 +311,7 @@ export const useStatusStore = defineStore('status', () => {
 
     socket.on('disconnect', () => {
       realtimeConnected.value = false
+      statusTransportInterrupted.value = currentStatusMetadata.value?.source === 'ws'
       subscribedAccountId.value = ''
     })
 
@@ -265,6 +321,7 @@ export const useStatusStore = defineStore('status', () => {
 
     socket.on('connect_error', (err) => {
       realtimeConnected.value = false
+      statusTransportInterrupted.value = currentStatusMetadata.value?.source === 'ws'
       console.error('[realtime] 连接失败:', err.message)
     })
 
@@ -277,6 +334,8 @@ export const useStatusStore = defineStore('status', () => {
   }
 
   function connectRealtime(accountId: string) {
+    if (LOCAL_UI_READONLY)
+      return
     currentRealtimeAccountId.value = String(accountId || '').trim()
     if (!tokenRef.value)
       return
@@ -315,41 +374,56 @@ export const useStatusStore = defineStore('status', () => {
     socket.disconnect()
     socket = null
     realtimeConnected.value = false
+    statusTransportInterrupted.value = currentStatusMetadata.value?.source === 'ws'
     subscribedAccountId.value = ''
   }
 
-  async function fetchStatus(accountId: string) {
-    if (!accountId)
-      return
+  function fetchStatus(accountId: string): Promise<void> {
+    if (!accountId || !isCurrentAccount(String(accountId)))
+      return Promise.resolve()
     const requestedId = String(accountId)
+    const epoch = accountEpoch
+    if (statusInFlight?.accountId === requestedId && statusInFlight.epoch === epoch)
+      return statusInFlight.promise
+    const request = ++statusRequest
     loading.value = true
-    try {
-      const { data } = await api.get('/api/status', {
-        headers: { 'x-account-id': accountId },
-      })
-      if (!isCurrentAccount(requestedId))
-        return
-      if (data.ok) {
-        status.value = normalizeStatusPayload(data.data)
-        statusAccountId.value = requestedId
-        error.value = ''
+    const promise = (async () => {
+      try {
+        const { data } = await api.get('/api/status', {
+          headers: { 'x-account-id': requestedId },
+        })
+        if (!isCurrentRequest(requestedId, epoch) || request !== statusRequest)
+          return
+        if (data?.ok === true) {
+          if ((data.accountId != null && String(data.accountId) !== requestedId)
+            || !acceptStatusSnapshot(data.data, requestedId, 'http'))
+            error.value = '状态回包无效或账号不匹配'
+        }
+        else {
+          error.value = String(data?.error || '状态获取失败')
+        }
       }
-      else {
-        error.value = data.error
+      catch (e: any) {
+        if (isCurrentRequest(requestedId, epoch) && request === statusRequest)
+          error.value = String(e?.response?.data?.error || e?.message || '状态获取失败')
       }
-    }
-    catch (e: any) {
-      error.value = e.message
-    }
-    finally {
-      loading.value = false
-    }
+      finally {
+        if (isCurrentRequest(requestedId, epoch) && request === statusRequest)
+          loading.value = false
+      }
+    })().finally(() => {
+      if (statusInFlight?.promise === promise)
+        statusInFlight = null
+    })
+    statusInFlight = { accountId: requestedId, epoch, promise }
+    return promise
   }
 
   async function fetchLogs(accountId: string, options: any = {}) {
     if (!accountId && options.accountId !== 'all')
       return
     const requestedId = String(accountId || options.accountId || '')
+    const epoch = accountEpoch
     const params: any = { limit: 100, ...options }
     const headers: any = {}
     if (accountId && accountId !== 'all') {
@@ -361,7 +435,7 @@ export const useStatusStore = defineStore('status', () => {
 
     try {
       const { data } = await api.get('/api/logs', { headers, params })
-      if (requestedId && requestedId !== 'all' && !isCurrentAccount(requestedId))
+      if (accountEpoch !== epoch || (requestedId && requestedId !== 'all' && !isCurrentAccount(requestedId)))
         return
       if (data.ok) {
         logs.value = Array.isArray(data.data)
@@ -369,7 +443,6 @@ export const useStatusStore = defineStore('status', () => {
               .map((item: any) => normalizeLogEntry(item))
               .filter((item: any) => !shouldHideLogEntryInFrontend(item))
           : []
-        error.value = ''
       }
     }
     catch (e: any) {
@@ -381,11 +454,12 @@ export const useStatusStore = defineStore('status', () => {
     if (!accountId)
       return
     const requestedId = String(accountId)
+    const epoch = accountEpoch
     try {
       const { data } = await api.get('/api/daily-gifts', {
         headers: { 'x-account-id': accountId },
       })
-      if (!isCurrentAccount(requestedId))
+      if (!isCurrentRequest(requestedId, epoch))
         return
       if (data.ok) {
         dailyGifts.value = data.data
@@ -398,13 +472,14 @@ export const useStatusStore = defineStore('status', () => {
 
   async function fetchAccountLogs(accountId = '', limit = 100) {
     const requestedId = String(accountId || '')
+    const epoch = accountEpoch
     try {
       const headers: Record<string, string> = {}
       if (requestedId)
         headers['x-account-id'] = requestedId
       const res = await api.get(`/api/account-logs?limit=${Math.max(1, Number(limit) || 100)}`, { headers })
       if (Array.isArray(res.data)) {
-        if (requestedId && !isCurrentAccount(requestedId))
+        if (accountEpoch !== epoch || (requestedId && !isCurrentAccount(requestedId)))
           return
         accountLogs.value = requestedId
           ? res.data
@@ -425,7 +500,10 @@ export const useStatusStore = defineStore('status', () => {
   return {
     status,
     statusAccountId,
+    statusMetadata,
     currentStatusReady,
+    currentStatusMetadata,
+    currentStatusStale,
     logs,
     accountLogs,
     dailyGifts,

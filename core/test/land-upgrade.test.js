@@ -3,10 +3,11 @@ const assert = require('node:assert/strict');
 const { buildLandUpgradeDetail } = require('../src/services/farm-land-upgrade');
 
 test('land 21 keeps the exact server level and currency conditions and compares gold to crystal bonuses', () => {
-    const info = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 5,
+    const landsMap = new Map(Array.from({ length: 21 }, (_, index) => [index + 1, { unlocked: true, level: 4 }]));
+    const info = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 6,
         buff: { plant_yield_bonus: 30000, planting_time_reduction: 2000, plant_exp_bonus: 2000 },
-        upgrade_condition: { condition_type: 1, condition_value: 150,
-            required_items: [{ id: 1001, count: '450000000' }, { id: 1005, count: '18670' }] } });
+        upgrade_condition: { preceeding_lands_count_need: 1, level_need: 150,
+            items_need: [{ id: 1001, count: '450000000' }, { id: 1005, count: '18670' }] } }, landsMap);
     assert.equal(info.needLevel, 150);
     assert.deepEqual(info.costs.map(c => [c.id, c.count]), [['1001', '450000000'], ['1005', '18670']]);
     assert.equal(info.current.expBonus, 20);
@@ -16,12 +17,41 @@ test('land 21 keeps the exact server level and currency conditions and compares 
     assert.equal(info.unknown, false);
 });
 
-test('max level does not show upgrade costs; server bonuses override static defaults', () => {
-    const info = buildLandUpgradeDetail({ unlocked: true, level: 5, max_level: 5, buff: { plant_exp_bonus: 5000 } });
+test('blue crystal level 6 shows official bonuses and max state', () => {
+    const info = buildLandUpgradeDetail({ unlocked: true, level: 6, max_level: 6, buff: { plant_exp_bonus: 3000 } });
     assert.equal(info.mode, 'max');
-    assert.equal(info.current.expBonus, 50);
+    assert.equal(info.current.name, '蓝晶土地');
+    assert.equal(info.current.yieldBonus, 400);
+    assert.equal(info.current.growthReduction, 20);
+    assert.equal(info.current.expBonus, 30);
+    assert.equal(info.current.mutantMultiplier, 1.25);
+    assert.equal(info.current.resonanceBonus, 30);
     assert.equal(info.next, null);
     assert.deepEqual(info.costs, []);
+});
+
+test('purple crystal to blue crystal uses official level, cost and preceding-land conditions', () => {
+    const landsMap = new Map([
+        [1, { id: 1, unlocked: true, level: 5 }],
+        [2, { id: 2, unlocked: true, level: 5 }],
+        [3, { id: 3, unlocked: true, level: 4 }],
+    ]);
+    const info = buildLandUpgradeDetail({
+        id: 1, unlocked: true, level: 5, max_level: 6, could_upgrade: true,
+        upgrade_condition: {
+            preceeding_lands_count_need: 2,
+            level_need: 125,
+            items_need: [{ id: 1001, count: '100000000' }, { id: 1005, count: '11350' }],
+        },
+    }, landsMap);
+    assert.equal(info.next.name, '蓝晶土地');
+    assert.equal(info.needLevel, 125);
+    assert.deepEqual(info.costs.map(c => [c.id, c.count]), [['1001', '100000000'], ['1005', '11350']]);
+    assert.deepEqual(info.precedingLands, {
+        name: '紫晶土地', required: 2, owned: 2, met: true,
+    });
+    assert.equal(info.serverAllowed, true);
+    assert.equal(info.unknown, false);
 });
 
 test('unlocking shows prerequisite land and exact price instead of upgrade requirements', () => {
@@ -34,12 +64,12 @@ test('unlocking shows prerequisite land and exact price instead of upgrade requi
     assert.equal(buildLandUpgradeDetail(raw).prerequisite.met, false);
 });
 
-test('unknown server condition types stay unknown; known official fallback does not imply upgrade permission', () => {
-    const info = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 5,
-        upgrade_condition: { condition_type: 99, condition_value: 150, required_items: [] } });
+test('malformed server condition stays unknown; known official fallback does not imply upgrade permission', () => {
+    const info = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 6,
+        upgrade_condition: { preceeding_lands_count_need: 1, level_need: 0, items_need: [] } });
     assert.equal(info.unknown, true);
     assert.equal(info.needLevel, null);
-    const fallback = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 5 });
+    const fallback = buildLandUpgradeDetail({ id: 21, unlocked: true, level: 4, max_level: 6 });
     assert.equal(fallback.needLevel, 150);
     assert.equal(fallback.serverAllowed, false);
     assert.equal(fallback.costs[1].count, '18670');

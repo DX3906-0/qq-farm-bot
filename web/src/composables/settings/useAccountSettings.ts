@@ -4,6 +4,8 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAccountStore } from '@/stores/account'
 import { useUserStore } from '@/stores/user'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { operationFailure } from '@/utils/operation-result'
 
 type AlertType = 'primary' | 'danger'
 
@@ -21,9 +23,11 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
   const showClearStoppedConfirm = ref(false)
   const clearStoppedLoading = ref(false)
   const refreshWxCodesLoading = ref(false)
+  const accountTogglePending = computed<Record<string, boolean>>(() => Object.fromEntries(Object.entries(accountStore.operationStates).map(([id, state]) => [id, state === 'pending'])))
+  const accountToggleUnknown = computed<Record<string, string>>(() => Object.fromEntries(Object.entries(accountStore.operationStates).filter(([, state]) => state === 'unknown').map(([id]) => [id, accountStore.operationErrors[id] || '账号操作结果未确认，仅读取核对'])))
 
   const userIsAdmin = computed(() => userStore.isAdmin)
-  const isAccountOpsDisabled = computed(() => !userStore.isAdmin && userStore.isExpired)
+  const isAccountOpsDisabled = computed(() => LOCAL_UI_READONLY || !userStore.isAdmin && userStore.isExpired)
   const quotaLimit = computed(() => {
     const limit = userStore.accountLimit
     if (limit === undefined || limit === null)
@@ -40,6 +44,8 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
   })
   const isAddAccountDisabled = computed(() => isAccountOpsDisabled.value || isOverQuota.value)
   const addAccountDisabledReason = computed(() => {
+    if (LOCAL_UI_READONLY)
+      return '本地只读浏览不允许添加或登录账号'
     if (isAccountOpsDisabled.value)
       return '账号已到期，无法添加账号'
     if (isOverQuota.value)
@@ -47,10 +53,10 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
     return ''
   })
 
-  const stoppedAccounts = computed(() => accounts.value.filter((acc: any) => !acc.running))
+  const stoppedAccounts = computed(() => accounts.value.filter((acc: any) => acc.running === false))
   const stoppedAccountsCount = computed(() => stoppedAccounts.value.length)
   const currentAccountName = computed(() => {
-    const acc = accounts.value.find((item: any) => item.id === currentAccountId.value)
+    const acc = accounts.value.find((item: any) => String(item.id) === String(currentAccountId.value))
     return acc ? (acc.name || acc.nick || acc.id) : null
   })
 
@@ -68,12 +74,14 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
     }
   }
 
-  function openSettings(account: any) {
-    accountStore.selectAccount(account.id)
-    router.push('/settings')
+  async function openSettings(account: any) {
+    const allowed = await accountStore.selectAccount(String(account.id))
+    if (allowed === false) return
+    await router.push({ path: '/settings', query: { tab: 'strategy' } })
   }
 
   function openAddModal() {
+    if (LOCAL_UI_READONLY) return
     editingAccount.value = null
     showModal.value = true
   }
@@ -89,6 +97,7 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
   }
 
   async function confirmDelete() {
+    if (LOCAL_UI_READONLY || deleteLoading.value) return
     if (accountToDelete.value) {
       try {
         deleteLoading.value = true
@@ -96,6 +105,7 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
         accountToDelete.value = null
         showDeleteConfirm.value = false
       }
+      catch (error: any) { showAlert(error?.error || error?.message || '删除结果未确认，请核对', 'danger') }
       finally {
         deleteLoading.value = false
       }
@@ -103,16 +113,21 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
   }
 
   async function toggleAccount(account: any) {
-    if (account.running) {
-      await accountStore.stopAccount(account.id)
+    const id = String(account?.id || '')
+    if (LOCAL_UI_READONLY || !id || accountTogglePending.value[id] || accountToggleUnknown.value[id] || accountStore.readError
+      || account.running !== true && (isAccountOpsDisabled.value || account.running !== false)) return
+    try {
+      if (account.running) await accountStore.stopAccount(id)
+      else await accountStore.startAccount(id)
     }
-    else {
-      await accountStore.startAccount(account.id)
+    catch (error: any) {
+      const result = operationFailure(error, '账号操作结果未确认')
+      showAlert(result.error, 'danger')
     }
   }
 
   async function refreshWxCodesNow() {
-    if (refreshWxCodesLoading.value)
+    if (LOCAL_UI_READONLY || refreshWxCodesLoading.value)
       return
 
     refreshWxCodesLoading.value = true
@@ -159,6 +174,7 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
   }
 
   async function confirmClearStopped() {
+    if (LOCAL_UI_READONLY || clearStoppedLoading.value) return
     clearStoppedLoading.value = true
     try {
       const stoppedIds = stoppedAccounts.value.map((acc: any) => acc.id)
@@ -195,6 +211,8 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
     showClearStoppedConfirm,
     clearStoppedLoading,
     refreshWxCodesLoading,
+    accountTogglePending,
+    accountToggleUnknown,
     stoppedAccountsCount,
     isAddAccountDisabled,
     addAccountDisabledReason,

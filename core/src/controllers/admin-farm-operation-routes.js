@@ -46,9 +46,21 @@ function registerAdminFarmOperationRoutes({
     if (!accountId) return;
 
     try {
-      const { opType } = req.body;
-      await provider.doFarmOp(accountId, opType);
-      res.json({ ok: true });
+      const { opType } = req.body || {};
+      if (!['all', 'harvest', 'plant', 'clear', 'upgrade'].includes(opType)) {
+        res.status(400).json({ ok: false, error: '无效的农场操作类型' });
+        return;
+      }
+      const result = await provider.doFarmOp(accountId, opType);
+      if (!result || typeof result.hadWork !== 'boolean') {
+        res.json({ ok: false, error: '未返回农场操作结果', data: result || null });
+        return;
+      }
+      const errors = Array.isArray(result.errors) ? result.errors : [];
+      const skipped = !result.hadWork && errors.length === 0;
+      const ok = errors.length === 0 && (result.success === true || skipped);
+      const error = ok ? undefined : errors.map(item => item.message || String(item)).join('；') || '农场操作失败';
+      res.json({ ...result, ok, skipped, error, details: errors, data: result });
     } catch (error) {
       sendProviderError(res, error);
     }

@@ -7,12 +7,13 @@ const { getUserState, isConnected, sendMsgAsync } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { log, logWarn, randomDelay, toLong, toNum } = require('../utils/utils');
 const {
-  enterFriendFarm,
+  withFriendVisitSession,
+  runFriendVisitOperation,
+  assertFriendVisitActive,
   extractReplyFriends,
   getAllFriends,
   handleFriendEnterError,
   inFriendQuietHours,
-  leaveFriendFarm,
 } = require('./friend-api');
 const { analyzeFriendLands } = require('./friend-land-analyzer');
 const {
@@ -40,23 +41,22 @@ function getGoldenBugCount(items) {
   ), 0);
 }
 
-async function putGoldenBug(gid, landId) {
-  const payload = types.PutSocialItemRequest.encode(
-    types.PutSocialItemRequest.create({
-      host_gid: toLong(gid),
-      land_ids: [toLong(landId)],
-      item_id: toLong(GOLDEN_BUG_ITEM_ID),
-      social_type: toLong(GOLDEN_BUG_SOCIAL_TYPE),
-    })
-  ).finish();
-  const { body } = await sendMsgAsync(
-    'gamepb.plantpb.PlantService',
-    'PutSocialItem',
-    payload
-  );
-  const reply = types.PutSocialItemReply.decode(body);
-  updateOperationLimits(reply.operation_limits);
-  return reply;
+async function putGoldenBug(gid, landId, onSuccess = () => {}) {
+  return runFriendVisitOperation(gid, async () => {
+    const payload = types.PutSocialItemRequest.encode(
+      types.PutSocialItemRequest.create({
+        host_gid: toLong(gid),
+        land_ids: [toLong(landId)],
+        item_id: toLong(GOLDEN_BUG_ITEM_ID),
+        social_type: toLong(GOLDEN_BUG_SOCIAL_TYPE),
+      })
+    ).finish();
+    const { body } = await sendMsgAsync('gamepb.plantpb.PlantService', 'PutSocialItem', payload);
+    const reply = types.PutSocialItemReply.decode(body);
+    updateOperationLimits(reply.operation_limits);
+    onSuccess();
+    return reply;
+  });
 }
 
 async function runGoldenBugPlacement(options = {}) {
@@ -97,51 +97,40 @@ async function runGoldenBugPlacement(options = {}) {
       .sort((a, b) => b.level - a.level);
 
     let placed = 0;
-    let consecutiveFailures = 0;
+    let skippedFriends = 0;
     for (const friend of friends) {
-      if (remaining <= 0) break;
-
-      let entered = false;
+      if (remaining <= 0 || !isAutomationOn('friend') || !isAutomationOn('friend_golden_bug')) break;
       try {
-        const enterReply = await enterFriendFarm(friend.gid);
-        entered = true;
-        const analysis = analyzeFriendLands(
-          enterReply.lands || [],
-          toNum(userState.gid),
-          friend.name
-        );
-        const targets = analysis.canPutGoldenBug.slice(0, remaining);
-
-        for (const landId of targets) {
-          try {
-            await putGoldenBug(friend.gid, landId);
-            placed++;
-            remaining--;
-            consecutiveFailures = 0;
-            recordOperation('goldenBugPut', 1);
-            await randomDelay(500, 1000);
-          } catch (err) {
-            const message = String(err && err.message || '未知错误');
-            logWarn('好友', `给 ${friend.name || `GID:${friend.gid}`} 放置黄金虫失败: ${message}`, {
-              module: 'friend',
-              event: '放置黄金虫',
-              result: 'error',
-              friendGid: friend.gid,
-              landId,
+        await withFriendVisitSession(friend.gid, async enterReply => {
+          const analysis = analyzeFriendLands(enterReply.lands || [], toNum(userState.gid), friend.name);
+          const targets = analysis.canPutGoldenBug.slice(0, remaining);
+          for (const landId of targets) {
+            assertFriendVisitActive(friend.gid);
+            if (!isAutomationOn('friend') || !isAutomationOn('friend_golden_bug')) break;
+            await putGoldenBug(friend.gid, landId, () => {
+              placed++;
+              remaining--;
+              recordOperation('goldenBugPut', 1);
             });
-            consecutiveFailures++;
-            if (consecutiveFailures >= 3) remaining = 0;
-            break;
+            await randomDelay(500, 1000);
+            assertFriendVisitActive(friend.gid);
           }
-        }
+        });
       } catch (err) {
-        handleFriendEnterError(friend.gid, friend.name || `GID:${friend.gid}`, err);
-      } finally {
-        if (entered) {
-          try { await leaveFriendFarm(friend.gid); } catch { }
+        const handled = err.friendEnterHandling || (err.visitStage === 'enter'
+          ? handleFriendEnterError(friend.gid, friend.name || `GID:${friend.gid}`, err) : null);
+        const unknown = err.resultState === 'unknown' || err.outcomeUnknown === true || err.holdUntilTransportEpochChanged === true;
+        if (handled?.handled && !unknown) {
+          skippedFriends++;
+          continue;
         }
+        logWarn('好友', `给 ${friend.name || `GID:${friend.gid}`} 放置黄金虫失败: ${err.message}`, {
+          module: 'friend', event: '放置黄金虫', result: unknown ? 'unknown' : 'failed',
+          friendGid: friend.gid, placed, errorCode: err.errorCode,
+          holdUntilTransportEpochChanged: err.holdUntilTransportEpochChanged === true,
+        });
+        return { ok: false, failed: true, unknown, placed, inventory, dailyRemaining, error: err.message, errorMeta: { ...err } };
       }
-
       if (remaining > 0) await randomDelay(500, 1500);
     }
 
@@ -155,14 +144,13 @@ async function runGoldenBugPlacement(options = {}) {
         inventoryBefore: inventory,
       });
     }
-    return { placed, inventory, dailyRemaining };
+    return { placed, inventory, dailyRemaining, skippedFriends, skipped: placed === 0 && skippedFriends > 0 };
   } catch (err) {
+    const unknown = err.resultState === 'unknown' || err.outcomeUnknown === true || err.holdUntilTransportEpochChanged === true;
     logWarn('好友', `黄金虫投放检查失败: ${err.message}`, {
-      module: 'friend',
-      event: '放置黄金虫',
-      result: 'error',
+      module: 'friend', event: '放置黄金虫', result: unknown ? 'unknown' : 'failed',
     });
-    return null;
+    return { ok: false, failed: true, unknown, error: err.message, errorMeta: { ...err } };
   } finally {
     running = false;
   }

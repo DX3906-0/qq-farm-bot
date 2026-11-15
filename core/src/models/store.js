@@ -195,7 +195,8 @@ const DEFAULT_OFFLINE_REMINDER = {
     emailContent: ''
 };
 
-const DEFAULT_FERTILIZER_LAND_TYPES = ['purple', 'gold', 'black', 'red', 'normal'];
+const DEFAULT_FERTILIZER_LAND_TYPES = ['blue-crystal', 'purple', 'gold', 'black', 'red', 'normal'];
+const LEGACY_FERTILIZER_LAND_TYPES = ['purple', 'gold', 'black', 'red', 'normal'];
 const FERTILIZER_LAND_TYPE_SET = new Set(DEFAULT_FERTILIZER_LAND_TYPES);
 
 /** 默认自动化配置 */
@@ -216,6 +217,8 @@ const DEFAULT_AUTOMATION = {
     star_passport_claim: false,
     star_record_claim: false,
     solar_terms_claim: false,
+    solar_terms_quiz_notify: false,
+    solar_terms_auto_answer: false,
     qingmei_seed_claim: false,
     qingmei_wine_brew: false,
     qixi_dew_use: false,
@@ -590,6 +593,19 @@ function normalizeFertilizerLandTypes(rawTypes, fallback = DEFAULT_FERTILIZER_LA
     return result;
 }
 
+/** 只迁移未标记的旧版配置；正常保存必须允许用户主动取消蓝晶。 */
+function migrateLegacyFertilizerScope(rawConfig) {
+    const rawTypes = rawConfig?.automation?.fertilizer_land_types;
+    if (!Array.isArray(rawTypes)) return rawConfig;
+    const types = normalizeFertilizerLandTypes(rawTypes);
+    const legacyAllSelected = LEGACY_FERTILIZER_LAND_TYPES.every((type) => types.includes(type));
+    if (!legacyAllSelected || types.includes('blue-crystal')) return rawConfig;
+    return {
+        ...rawConfig,
+        automation: { ...rawConfig.automation, fertilizer_land_types: ['blue-crystal', ...types] }
+    };
+}
+
 function normalizeOfflineReminder(raw) {
     const input = raw && typeof raw === 'object' ? raw : {};
     const def = DEFAULT_OFFLINE_REMINDER;
@@ -823,7 +839,8 @@ const globalConfig = {
     captureConfig: null,
     deviceProtocol: null,
     userDeviceProtocols: {},
-    antiResaleConfig: null
+    antiResaleConfig: null,
+    fertilizerLandTypesVersion: 2
 };
 
 function normalizeAccountConfig(raw, fallbackConfig = accountFallbackConfig) {
@@ -1130,6 +1147,9 @@ function loadGlobalConfig() {
     try {
         const data = readJsonFile(STORE_FILE, () => ({}));
         if (!data || typeof data !== 'object') return;
+        const migrateFertilizerScope = Number(data.fertilizerLandTypesVersion) < 2 || data.fertilizerLandTypesVersion == null;
+        // 随主进程正常保存一同落盘，worker 不新增写盘路径。
+        globalConfig.fertilizerLandTypesVersion = 2;
 
         accountFallbackConfig = cloneAccountConfig(DEFAULT_ACCOUNT_CONFIG);
         globalConfig.defaultAccountConfig = cloneAccountConfig(accountFallbackConfig);
@@ -1148,7 +1168,10 @@ function loadGlobalConfig() {
                 inactiveActivityConfigNeedsSave = true;
                 inactiveActivityDirtyAccounts.add(id);
             }
-            globalConfig.accountConfigs[id] = normalizeAccountConfig(val, DEFAULT_ACCOUNT_CONFIG);
+            globalConfig.accountConfigs[id] = normalizeAccountConfig(
+                migrateFertilizerScope ? migrateLegacyFertilizerScope(val) : val,
+                DEFAULT_ACCOUNT_CONFIG
+            );
         }
         for (const [key, val] of Object.entries(globalConfig.accountConfigs)) {
             globalConfig.accountConfigs[key] = normalizeAccountConfig(val, DEFAULT_ACCOUNT_CONFIG);
@@ -1160,7 +1183,9 @@ function loadGlobalConfig() {
         for (const [key, val] of Object.entries(rawPlans)) {
             const username = String(key || '').trim();
             if (!username || !val) continue;
-            globalConfig.userDefaultAccountPlans[username] = normalizeUserDefaultPlan(val);
+            globalConfig.userDefaultAccountPlans[username] = normalizeUserDefaultPlan(
+                migrateFertilizerScope ? { ...val, config: migrateLegacyFertilizerScope(val.config) } : val
+            );
         }
 
         // UI 配置
@@ -1954,14 +1979,25 @@ function setHarvestPacing(state, accountId) {
 // ==================== 账号管理 ====================
 
 function loadAccounts() {
+    const { readGatewayDelegation, mergeDelegatedAccounts } = require('../runtime/gateway-routing');
+    const delegation = readGatewayDelegation();
     ensureDataDir();
     const data = readJsonFile(ACCOUNTS_FILE, () => ({ accounts: [], nextId: 1 }));
-    return normalizeAccountsData(data);
+    if (!delegation) return normalizeAccountsData(data);
+    const merged = mergeDelegatedAccounts(data);
+    const normalized = normalizeAccountsData(merged);
+    normalized.nextId = Math.max(normalized.nextId, Number.parseInt(merged.nextId, 10) || 1);
+    return normalized;
 }
 
 function saveAccounts(data) {
+    const { splitDelegatedAccounts } = require('../runtime/gateway-routing');
+    const split = splitDelegatedAccounts(normalizeAccountsData(data));
     ensureDataDir();
-    writeJsonFileAtomic(ACCOUNTS_FILE, normalizeAccountsData(data));
+    if (split.delegation) {
+        writeJsonFileAtomic(getDataFile('gateway-delegation.json'), split.delegation);
+    }
+    writeJsonFileAtomic(ACCOUNTS_FILE, split.raw);
 }
 
 function getAccounts() {

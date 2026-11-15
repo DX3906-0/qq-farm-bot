@@ -1,248 +1,172 @@
 <div align="center">
 
-# QQ 农场 · 多账号自动化
+# QQ Farm Bot
 
-**一台机器，管一队农场号。**
+**多账号农场面板，让日常经营更省心。**
 
-改代码不掉线 · 网络抖一抖不用爬起来扫码 · 活动换皮自己跟上
+独立运行 · 持续连接 · 按需补码 · 完整图鉴
 
-</div>
-
-<div align="center">
-
-![Node](https://img.shields.io/badge/Node.js-18%2B-3c873a?style=flat-square&logo=node.js&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-20%2B-3c873a?style=flat-square&logo=node.js&logoColor=white)
 ![Vue](https://img.shields.io/badge/Vue-3-42b883?style=flat-square&logo=vue.js&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ed?style=flat-square&logo=docker&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
+![Last Commit](https://img.shields.io/github/last-commit/DX3906-0/qq-farm-bot?style=flat-square)
 
-**163** 装扮图标 · **26** 份协议定义 · **8** 个活动族 · **46** 个测试文件
+[项目亮点](#项目亮点) · [快速开始](#快速开始) · [补码守护](#补码守护) · [资源图鉴](#资源图鉴) · [致谢](#致谢)
 
 </div>
 
----
+QQ Farm Bot 把农场经营、账号管理、活动和图鉴放进同一个 Web 面板。你可以为不同账号安排不同策略，也可以随时接手一块土地、一次收获或一项活动。
+
+在已有农场自动化能力之上，本项目更关注另一件事：**让持续运行和日常维护，也成为自动化的一部分。**
+
+## 项目亮点
+
+### 连接留下，业务继续更新
+
+游戏连接和经营任务分开运行。调整策略、更新业务或重载单个账号时，可以继续使用已有连接，减少重复登录和重新获取登录码的次数。
+
+面板更新与农场运行也彼此独立。换一套界面，正在经营的账号照常工作。
+
+### 一套面板，多种经营节奏
+
+每个账号都有自己的任务、配置和运行状态。日常种植、统一收获、好友互动、活动兑换可以按账号分别安排，切换账号时也能保留各自的浏览位置和筛选条件。
+
+手动操作不必等自动任务走完整轮：已经发出的操作先结束，接下来的步骤把位置让给你。
+
+### 一个轻量守护，补齐最后一公里
+
+服务器负责经营，本机守护负责登录码。当 QQ 账号需要补码时，守护通过 NapCat 获取新的登录码并交回面板，把原来需要来回操作的流程串成一条自动链路。
+
+平时只做轻量检查，需要时才唤醒宿主；任务结束后可以让宿主休眠。笔记本使用电池时，还能切换为节能模式。**农场继续跑，电脑不必一直保持完整客户端常驻。**
+
+### 网络波动，先缓一缓
+
+短暂延迟不必立刻变成重新登录。连接状态和业务状态分别判断，网络不稳定时先降低请求节奏，恢复后继续经营；补码守护也会控制尝试间隔，让恢复过程更平稳。
+
+### 不止是按钮，还有一份可看的农场百科
+
+作物、装扮、藏品、变异效果和活动奖励都有对应图片。变异宝典支持搜索、筛选和系列浏览，土地详情能直接查看生长状态、占地和可执行操作。
+
+资源工具按游戏清单定位原图，把散落的素材整理成可复用的资源库。图鉴不是一串物品编号，而是能认得出、查得到的内容。
+
+## 功能一览
+
+| 模块 | 可以做什么 |
+| --- | --- |
+| 农场经营 | 种植、施肥、收获、土地升级、统一收获和延迟收获 |
+| 多账号 | 分账号策略、独立运行状态、快速切换 |
+| 好友互动 | 好友列表、土地查看、帮助与互动任务 |
+| 活动中心 | 奶茶经营与兑换、节令小礼、活动进度与奖励 |
+| 收藏与图鉴 | 作物、装扮、头像框、铭牌、藏品和变异宝典 |
+| 运行管理 | 日志、统计、通知、补码守护与连接状态 |
+
+## 快速开始
+
+### 环境
+
+- Node.js 20+ 与 pnpm 10。
+- 面板可在 Windows、Linux 上运行。
+- QQ 自动补码守护需要 Windows、Python 3.10+ 和已配置的 NapCat。
+
+### 启动面板
+
+```bash
+git clone https://github.com/DX3906-0/qq-farm-bot.git
+cd qq-farm-bot
+pnpm install
+pnpm build:web
+```
+
+Linux：
+
+```bash
+ADMIN_PORT=3007 pnpm dev:core
+```
+
+Windows PowerShell：
+
+```powershell
+$env:ADMIN_PORT = "3007"
+pnpm dev:core
+```
+
+打开 `http://localhost:3007`，登录后添加账号并设置经营策略。首次使用请修改默认管理员密码。
+
+开发界面时，可以单独运行 `pnpm dev:web`。使用 Docker 时，先完成前端构建，再运行 `docker compose up -d --build`。
+
+## 补码守护
+
+守护不是另一套农场。它只处理本机登录与补码，经营任务仍由面板管理。
+
+| 组件 | 分工 |
+| --- | --- |
+| 网关 | 保持已有游戏连接 |
+| 账号任务 | 执行各自的经营计划 |
+| 本机守护 | 检查掉线、按需获取登录码、交回面板 |
+
+在 `tools/capture-guard/` 中复制配置示例，填写自己的面板地址、NapCat 配置和账号映射：
+
+```powershell
+Copy-Item tools/capture-guard/.napcat-guard-config.json.example tools/capture-guard/.napcat-guard-config.json
+python tools/capture-guard/napcat-code-guard.py
+```
+
+常用入口：
+
+- `守护-立即启动.bat`：后台启动。
+- `守护-安装自启.bat`：设置登录 Windows 后启动。
+- `napcat_guard.log`：查看最近检查和补码结果。
+- `python napcat-code-guard.py --reset`：清除冷却记录，不停止常驻守护。
+
+如需执行一次补码检查，可在配置完成后运行 `python napcat-code-guard.py --once`。微信账号使用面板扫码流程，不经过 QQ 补码守护。
+
+## 资源图鉴
 
 <div align="center">
-  <img src="docs/images/deco-wall.png" alt="装扮图鉴" width="900">
+  <img src="docs/images/deco-wall.png" alt="装扮图标样例" width="900">
   <br>
-  <sub>仓库里收录的 163 个装扮图标 —— 全部从官方 CDN 直取，不用点开游戏界面</sub>
+  <sub>装扮图标样例。当前资源库还收录了作物、藏品和变异效果。</sub>
 </div>
 
----
+当前配置中，**1058 / 1074 个物品可找到图片，30 个藏品图标已齐**。
 
-## 先说清楚这东西是从哪来的
+图片来源分开记录：
 
-**本项目的整体架构、核心业务逻辑，基线来自 [404](https://github.com/muyuewang/qq-farm-bot-404) 的开源项目。**
+- **官方资源清单**：按清单中的资源名、版本和标识，从官方 CDN 或已保存缓存取得。
+- **固定版本上游快照**：来自公开仓库的原始图片，并核对物品身份与文件哈希。
+- **既有资源同步**：把项目已有素材补到前后端两套目录，不重新标成官方来源。
 
-它解决的是「怎么把农场协议跑起来」这个问题。没有它，后面的一切无从谈起。
+逐图信息见 [资源来源索引](core/src/gameConfig/art-resource-sources.json)。采集工具位于 `tools/asset-fetcher/`。
 
-在此之上，还有另一个上游 [liyangpengs/qq-farm-bot](https://github.com/liyangpengs/qq-farm-bot)
-贡献了活动适配与新协议跟进，代码里若干模块直接标注了「移植自」出处
-（微信凭证保活、请求优先级闸门、萌宠日记等），保持原样保留。
+客户端有时会提前携带动物、牧草等资源。收录图片只是完善资源库，不代表相关玩法已经开放。
 
-**这个仓库相对它的增量是**：把「连接」和「业务」拆成两个进程，
-让改代码不再需要重新抓码；以及配套的掉线与凭证自愈体系。
-详见下面三节。
+## 项目结构
 
-<div align="center">
-
-| 来源 | 提供了什么 |
-|:---|:---|
-| [**404**](https://github.com/muyuewang/qq-farm-bot-404) | 架构基线、核心业务逻辑、协议接入 |
-| [**liyangpengs**](https://github.com/liyangpengs/qq-farm-bot) | 活动适配、新协议跟进、若干移植模块 |
-| **本仓库** | 网关/worker 分离、掉线自愈、资源反解工具链 |
-
-</div>
-
-> 两个上游均**未声明开源许可证**。本仓库的 MIT 协议仅覆盖本项目自行编写的部分，
-> 继承部分的权利归原作者，请尊重上游的授权状态。
-
----
-
-**↓ 下面是本项目做的增量部分**
-
----
-
-## 为什么会有人为它加这层
-
-农场类小游戏有个共同的设计：**登录凭证是一次性的**。
-
-凭证过期了，不是"重新登录"那么简单 —— 服务器会把你的重连请求当成可疑行为，
-直接拒掉。拒得越多，风控越重。到最后只剩一条路：**人工重新抓包**。
-
-于是所有做这类自动化的项目都会撞上同一堵墙：
-
-> 改一行代码 → 重启进程 → 凭证失效 → 手动抓包 → 明天再改一行
-
-一天改十次，抓十次包。这种项目活不长。
-
-这个仓库就是为了拆掉这堵墙。做法不是"想办法绕过风控"，
-而是**让进程重启和凭证彻底解绑**。
-
----
-
-## 三件事，上游没那么做
-
-### 一 · 改代码不用重新抓码
-
-连接和业务被拆成两个进程。
-
-`gateway` 攥着游戏连接不放，`worker` 随时可以杀掉重启。
-你改完一行逻辑，重启 worker，连接那头根本不知道发生了什么：
-
-```
-─────────────────────────────────────────────
-  你：改代码 → 重启 worker
-  系统：连接还在，凭证没动，农场继续跑
-─────────────────────────────────────────────
+```text
+core/                   农场业务、连接网关、协议与配置
+web/                    Vue 面板与静态资源
+tools/capture-guard/    Windows 补码守护
+tools/asset-fetcher/    资源采集与审计工具
+docs/                   架构说明与资源示例
 ```
 
-这条链路走通之后，开发体验完全不一样了 ——
-从"每次改动都是一次冒险"，变成"随便改，反正不掉"。
+更详细的实现介绍见 [架构说明](docs/architecture.md)。
 
-> 前提是游戏连接本身仍然健康。网关进程重启就得重新抓码，这是凭证机制决定的，绕不过去。
+## 参与开发
 
-### 二 · 网络抖一下，不用你爬起来扫码
-
-游戏服务器会偶发静默 —— 连接看着是好的，请求发出去石沉大海。
-
-遇到这种情况，多数方案的结局是"判定卡死 → 重连 → 撞风控 → 等人工"。
-这里的做法分两级：
-
-**先让路。** 连续几次请求没回音，立刻停掉所有业务请求，只留心跳。
-把带宽全让给心跳，等连接自己缓过来。恢复后自动继续，不用你管。
-
-**再判死。** 让路也不管用，才认定连接真坏了。这个阈值不是拍脑袋定的，
-是拿几天的真实数据反推出来的 —— 结论让人意外：**大部分"假死"其实是患者在装死**，
-连接本身没坏。所以判定必须慢一点，宁可多等一分钟，也别白白浪费一个凭证。
-
-### 三 · 活动换皮，系统自己跟上
-
-游戏活动每期都在换名字、换 ID、换图标，但底层玩法是同一套。
-
-这里把活动按"族"来管：一个新活动上线，只要能认出它属于哪个族，
-大部分逻辑直接复用。判断"活动是否在期"也有讲究 —— 不能看字段有没有值，
-因为服务端会给不存在的活动也返回默认值。得看特定标记，每个族一个判据。
-
----
-
-## 顺手做的一件小事
-
-想给装扮图鉴配图，但游戏里的资源不在本地 —— 只有你把对应界面点开过，
-资源才会被缓存下来。没点开，就"没图"。
-
-其实"本地没图"不等于"游戏里没有"。资源的真实地址藏在资源清单里，
-只要能还原出清单里的 ID 编码规则，就能直接从官方 CDN 取图，**完全不用打开游戏**。
-
-于是就有了仓库里那 163 个图标。
-
-这套工具在 `tools/asset-fetcher/`，换个匹配规则就能抓别的资源类型。
-比"拿到图"更容易翻车的是**图放上去了但界面还是裂的** ——
-漏登记映射表、漏登记名称表、两个目录只同步了一个。
-所以还附了两个审计脚本，`--check` 可以直接进 CI。
-
----
-
-## 它长什么样
-
-| | |
-|---|---|
-| **后端** | Node.js · Express · protobufjs |
-| **前端** | Vue 3 · TypeScript · Pinia · Vite |
-| **部署** | Docker Compose |
-| **采集守护** | Python · NapCat · Win32 API |
-
-```
-core/          后端 —— 网关/worker 运行时、业务逻辑、协议定义
-web/           前端 —— Vue 3 面板
-tools/
-  capture-guard/    守护 —— 掉线检测、自动补码、宿主管控
-  asset-fetcher/    资源 —— 从官方 CDN 批量取美术资源
-docs/          设计与踩坑记录
-```
-
----
-
-## 跑起来
-
-所有环境相关的地址和口令都走环境变量，仓库里不含任何真实凭据。
+欢迎提交问题、改进界面或补充活动适配。反馈时附上复现步骤和已去除账号、登录码的日志即可。
 
 ```bash
-# 面板
-export FARM_PANEL="http://YOUR_HOST:3007"
-export FARM_PANEL_USER="admin"
-export FARM_PANEL_PASS="your-password"
-
-# 账号映射（面板账号 id → QQ 号）
-export FARM_ACCOUNT_1_UIN="1000000001"
-export FARM_ACCOUNT_10_UIN="1000000002"
+pnpm build:web
+pnpm -C core test
 ```
 
-```bash
-cd core && npm install && npm start      # 后端
-cd web  && npm install && npm run dev    # 前端
-```
+地址、口令、账号映射保存在本地配置或环境变量中，不提交到仓库。图片补充请保留原图和来源信息。
 
-守护进程（Windows 本机，负责掉线后自动补码）：
+## 致谢
 
-```bash
-cd tools/capture-guard
-cp .napcat-guard-config.json.example .napcat-guard-config.json
-python napcat-code-guard.py --once    # 先跑一轮，确认配置对
-python napcat-code-guard.py           # 常驻
-```
+本项目的架构基线与核心业务逻辑来自 [muyuewang/qq-farm-bot-404](https://github.com/muyuewang/qq-farm-bot-404)，活动与协议适配参考了 [liyangpengs/qq-farm-bot](https://github.com/liyangpengs/qq-farm-bot)。资源补充参考 [Xb-Fishing/qq-farm-evolution](https://github.com/Xb-Fishing/qq-farm-evolution) 和 [chengleier/qq-farm-bot](https://github.com/chengleier/qq-farm-bot)，逐文件出处保留在来源索引中。
 
-<details>
-<summary><b>守护使用注意事项</b></summary>
+连接与任务分离、本机按需补码守护、运行恢复和资源整理，是本项目在这些基础上的持续扩展。
 
-`--stop` 会杀掉**全局**守护进程（包括开机自启那个），而且它不会自动恢复。
-日常只想清熔断状态请用 `--reset`，它只动熔断文件，不碰进程。
-
-</details>
-
----
-
-## 想看得更深
-
-README 只讲做了什么。至于**为什么这么做**，
-包括那些走了弯路才想明白的地方，都在这里：
-
-- [**架构设计**](docs/architecture.md) —— 关键决策的取舍依据、失败方案复盘
-- [**活动适配**](core/docs/activity-update-runbook.md) —— 活动换皮的适配流程
-- [**协议运行时**](core/docs/tsdk-ace-runtime.md) —— 安全运行时接入
-- [**客户端更新**](core/docs/tsdk-update-runbook.md) —— 版本升级的应对
-
----
-
-## 测试
-
-```bash
-cd core && node --test test/*.test.js
-```
-
-46 个测试文件。有 2 个已知失败（对外地址广播顺序、商店轮询时序），
-跟核心逻辑无关，一直没修。
-
----
-
-## 声明
-
-本项目仅供**个人学习与技术研究** —— 分布式进程架构、协议交互分析、
-Cocos 资源打包格式，这些才是它的主题。
-
-使用风险自负，包括但不限于账号安全与游戏用户协议合规性。
-请勿用于商业用途或大规模批量操作。
-
-**关于代码来源**：架构基线与核心业务逻辑继承自
-[404](https://github.com/muyuewang/qq-farm-bot-404)，
-部分模块移植自 [liyangpengs](https://github.com/liyangpengs/qq-farm-bot)（源码内已标注）。
-两个上游均未声明开源许可证，本仓库的 MIT 仅覆盖自行编写的部分，
-详见 [LICENSE](LICENSE) 的「授权范围说明」。
-若你是上游作者并认为使用方式不妥，请提 issue，会立即处理。
-
-`core/src/gameConfig/deco_icons/` 中的图片版权归腾讯及相关权利人所有，
-仅作为资源获取工具链的验证样本收录，不在 MIT 授权范围内。
-
-<div align="center">
-<sub>如果这套拆分思路对你有用，给个 ⭐ 就好</sub>
-</div>
+本项目自行编写的代码适用 [MIT License](LICENSE)；继承代码与游戏美术资源按各自权利归属处理。仅供学习研究，请遵守游戏用户协议。

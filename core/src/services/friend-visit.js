@@ -1,37 +1,34 @@
 const { PlantPhase } = require('../config/config');
 const { getPlantBlacklist, isAutomationOn, getAutomation } = require('../models/store');
 const { getUserState } = require('../utils/network');
-const { toNum, log, logWarn, randomDelay, sleep } = require('../utils/utils');
+const { toNum, log, logWarn } = require('../utils/utils');
+async function randomDelay(...args) {
+  await require('../utils/utils').randomDelay(...args);
+  assertFriendVisitActive();
+}
 const { recordOperation, getOperationCount } = require('./stats');
 const { notifyCrossAccountSteal } = require('./friend-alert');
 const { sellAllFruits } = require('./warehouse');
 const {
   enterFriendFarm,
   leaveFriendFarm,
-  checkCanOperateRemote,
+  withFriendVisitSession,
+  runFriendVisitOperation,
+  assertFriendVisitActive,
   handleFriendEnterError,
   SYSTEM_NPC_GIDS,
 } = require('./friend-api');
 const { analyzeFriendLands } = require('./friend-land-analyzer');
 const { getCurrentPhase } = require('./farm-land-analyzer');
 const {
-  getRemainingTimes,
   getBadRemainingTimes,
-  PUT_BUG_OPERATION_ID,
-  PUT_WEED_OPERATION_ID,
-  BAD_DAILY_LIMIT,
   canGetExpByCandidates,
   getCanGetHelpExp,
   setCanGetHelpExp,
-  helpWater,
-  helpWeed,
-  helpInsecticide,
-  helpFarming,
-  stealHarvest,
-  stealHarvestDetailed,
-  putInsectsDetailed,
-  putWeedsDetailed,
 } = require('./friend-operation-limits');
+const { putFriendItemsDetailed, friendFarming: helpFarming, friendHarvestDetailed: stealHarvestDetailed } = require('./friend-api');
+const putInsectsDetailed = (gid, ids) => putFriendItemsDetailed(gid, ids, 'PutInsects');
+const putWeedsDetailed = (gid, ids) => putFriendItemsDetailed(gid, ids, 'PutWeeds');
 
 // ===== Batch helper =====
 
@@ -88,30 +85,15 @@ function logStealNoop(gid, name, stealableCount, failDetails) {
 }
 
 /**
- * Run an operation on multiple land IDs. Falls back to single-ID calls if batch fails.
- * Returns the number of successful operations.
+ * 批量执行一次写操作；失败直接抛出，不以单条写重试。
+ * 返回成功操作数量。
  */
-async function runBatchWithFallback(landIds, batchFn, singleFn) {
+async function runBatchWithFallback(landIds, batchFn) {
   const ids = Array.isArray(landIds) ? landIds.filter(Boolean) : [];
   if (ids.length === 0) return 0;
-
-  try {
-    await batchFn(ids);
-    return ids.length;
-  } catch (_) {
-    // Fallback: one by one
-    let ok = 0;
-    for (const id of ids) {
-      try {
-        await singleFn([id]);
-        ok++;
-      } catch (_) {
-        // Skip individual failures
-      }
-      await sleep(100);
-    }
-    return ok;
-  }
+  // 没有服务不可用的明确码与预确认替代方法证据，写失败不重发。
+  await batchFn(ids);
+  return ids.length;
 }
 
 // ===== One-key farming for friend farms =====
@@ -127,15 +109,15 @@ async function runBatchWithFallback(landIds, batchFn, singleFn) {
 // 这正好解释了「NPC 一键务农好用、真实好友却提示没有可务农土地」。
 // **上游最新版（main，已重写为 TS）的帮忙分支已完全不调用 CheckCanOperate，直接执行**，
 // 与本实现一致；真正的「来晚一步」等拒绝由帮忙 RPC 自身返回错误兜底
-// （runBatchWithFallback 已做「批量失败 → 逐块回退」）。
+// 写失败保留原错误；不能把超时视为服务端未执行。
 //
 // 帮忙经验候选 ID：与上游最新版一致用 [10005, 10006, 10007] 做**整体**判断
 // （任一还能拿经验就照帮），而非逐类型——更贴近「经验满也不影响帮忙」的实际表现。
 const HELP_EXP_IDS = [0x2715, 0x2716, 0x2717];
 const FRIEND_HELP_GROUPS = [
-  { key: 'weed', listKey: 'needWeed', fn: helpWeed, name: '草', record: 'helpWeed' },
-  { key: 'bug', listKey: 'needBug', fn: helpInsecticide, name: '虫', record: 'helpBug' },
-  { key: 'water', listKey: 'needWater', fn: helpWater, name: '水', record: 'helpWater' },
+  { key: 'weed', listKey: 'needWeed', name: '草', record: 'helpWeed' },
+  { key: 'bug', listKey: 'needBug', name: '虫', record: 'helpBug' },
+  { key: 'water', listKey: 'needWater', name: '水', record: 'helpWater' },
 ];
 
 /**
@@ -143,7 +125,7 @@ const FRIEND_HELP_GROUPS = [
  *
  * 与游戏内一键务农按钮同源——优先走**合并的 Farming RPC**（host_gid=好友GID），
  * 一次请求代替原先的 WaterLand + WeedOut + Insecticide 三次请求（以及其间的随机延迟）。
- * 服务端不接受合并务农时，自动回退为旧的逐类型 RPC，行为不降级。
+ * 没有明确的服务不可用码和预确认替代方法证据，失败不再发送逐类型写。
  *
  * **不做 CheckCanOperate 预检查**（上游在此处传了语义错误的操作 ID，且该接口对帮忙类
  * 操作实测恒返回 false；详见 FRIEND_HELP_GROUPS 上方注释）。真正的「来晚一步」等
@@ -154,7 +136,7 @@ const FRIEND_HELP_GROUPS = [
  * @param {boolean} [opts.checkExpLimit]  是否把经验上限校验下传给 RPC（调用后比对经验增长）
  * @param {boolean} [opts.ignoreExpGate]  强制忽略经验闸（护主犬好友：经验满也照帮）
  * @returns {{water:number, weed:number, bug:number, total:number, blocked:boolean, oneKey:boolean, reason:string}}
- *          oneKey=true 表示走了合并 Farming；false 表示走了逐类型回退。
+ *          oneKey=true 表示合并 Farming 已成功；失败直接抛出。
  */
 async function runFriendFarming(gid, analysis, opts = {}) {
   const {
@@ -163,11 +145,11 @@ async function runFriendFarming(gid, analysis, opts = {}) {
     ignoreExpGate = false,
     skipPrecheck = null,
     onlyKeys = null,
+    context = '',
   } = opts;
   // reason 区分 total=0 的真实原因，供面板给出准确提示：
   //  - no_target  好友农场确实没有草/虫/干旱（analysis 三个列表全空）
   //  - gated      有活，但全被闸门挡下（帮忙经验闸，或 NPC 预检查兜底）
-  //  - all_failed 真的发了 RPC 但全部没成功（合并 + 逐类型回退都失败）
   const empty = (reason) => ({ water: 0, weed: 0, bug: 0, total: 0, blocked: false, oneKey: false, reason });
 
   const numericGid = toNum(gid);
@@ -225,7 +207,7 @@ async function runFriendFarming(gid, analysis, opts = {}) {
     return counts;
   }
   catch (err) {
-    logWarn('好友', `一键务农(Farming)未被服务端接受，回退逐类型: ${err.message}`, {
+    logWarn('好友', `一键务农(Farming)失败，不重发写请求: ${err.message}`, {
       module: 'friend',
       event: '好友一键务农',
       result: 'error',
@@ -233,22 +215,9 @@ async function runFriendFarming(gid, analysis, opts = {}) {
       context,
       error: err.message,
     });
+    throw err;
   }
 
-  // 3) 回退：逐类型 RPC（保留原有的批量+单条兜底）
-  const counts = { water: 0, weed: 0, bug: 0, total: 0, blocked: false, oneKey: false, reason: '' };
-  for (const group of allowed) {
-    const ok = await runBatchWithFallback(
-      group.list,
-      ids => group.fn(numericGid, ids, checkExpLimit),
-      id => group.fn(numericGid, id, checkExpLimit),
-    );
-    counts[group.key] = ok;
-    counts.total += ok;
-  }
-  if (counts.total === 0)
-    counts.reason = 'all_failed';
-  return counts;
 }
 
 // ===== Single friend operation =====
@@ -293,20 +262,13 @@ async function doFriendOperation(gid, opType) {
       }
 
       // ⭐ 2026-10-23：**删掉 CheckCanOperate(0x2714) 预检查**（同自动路径）。
-      // 上游最新版无此预检查，直接打 Harvest；实测该接口会误判（罗辑宠物守护日志证实
-      // 希恩斯从未偷到过罗辑，却每次被判"额度已用完"）。真正的拒绝由 Harvest 自身兜底。
+      // 上游最新版无此预检查，直接打 Harvest；实测该接口会误判（账号甲宠物守护日志证实
+      // 账号乙从未偷到过账号甲，却每次被判"额度已用完"）。真正的拒绝由 Harvest 自身兜底。
       let okCount = 0;
       const failDetails = [];
       const batch = await stealHarvestDetailed(numericGid, analysis.stealable);
       okCount = batch.ok;
       if (okCount === 0 && batch.error) failDetails.push(batch.error);
-      const remaining = analysis.stealable.filter(id => !batch.harvested.includes(id));
-      for (const landId of remaining) {
-        const r = await stealHarvestDetailed(numericGid, [landId]);
-        if (r.ok > 0) okCount += r.ok;
-        else if (r.error) failDetails.push(`#${landId}:${r.error}`);
-        await randomDelay(150, 400);
-      }
 
       if (okCount === 0) {
         logWarn('好友', `手动偷取 ${numericGid} 未生效（可偷 ${analysis.stealable.length} 块）: ${failDetails.slice(0, 2).join(' | ').slice(0, 160) || '服务端未返回已收下的土地'}`, {
@@ -327,7 +289,7 @@ async function doFriendOperation(gid, opType) {
       });
 
       try {
-        await sellAllFruits();
+        await runFriendVisitOperation(numericGid, () => sellAllFruits());
       }
       catch (sellErr) {
         logWarn('仓库', `手动偷取后自动出售失败: ${sellErr.message}`, {
@@ -429,15 +391,8 @@ async function doFriendOperation(gid, opType) {
 
       // Put insects
       if (analysis.canPutBug.length && getBadRemainingTimes() > 0) {
-        // NPC 跳过 CheckCanOperate 预检查（可能错误返回 false），直接放虫
-        const canPutBug = skipPrecheck
-          ? skipPrecheck()
-          : await checkCanOperateRemote(numericGid, PUT_BUG_OPERATION_ID);
-        const remainingBug = Math.min(
-          getRemainingTimes(PUT_BUG_OPERATION_ID, BAD_DAILY_LIMIT),
-          getBadRemainingTimes()
-        );
-        const targets = canPutBug.canOperate ? analysis.canPutBug.slice(0, remainingBug) : [];
+        // 官方坏操作：新鲜地块候选 + 已确认共享预算，不发送帮忙/偷取预检查。
+        const targets = analysis.canPutBug.slice(0, getBadRemainingTimes());
         const result = targets.length > 0
           ? await putInsectsDetailed(numericGid, targets)
           : { ok: 0, failed: [] };
@@ -445,20 +400,12 @@ async function doFriendOperation(gid, opType) {
         failedMsgs = failedMsgs.concat(
           (result.failed || []).map(f => `放虫#${f.landId}:${f.reason}`)
         );
-        if (bugCount > 0) recordOperation('putBug', bugCount);
+        // putFriendItemsDetailed records each confirmed land immediately.
       }
 
       // Put weeds
       if (analysis.canPutWeed.length && getBadRemainingTimes() > 0) {
-        // NPC 跳过 CheckCanOperate 预检查（可能错误返回 false），直接放草
-        const canPutWeed = skipPrecheck
-          ? skipPrecheck()
-          : await checkCanOperateRemote(numericGid, PUT_WEED_OPERATION_ID);
-        const remainingWeed = Math.min(
-          getRemainingTimes(PUT_WEED_OPERATION_ID, BAD_DAILY_LIMIT),
-          getBadRemainingTimes()
-        );
-        const targets = canPutWeed.canOperate ? analysis.canPutWeed.slice(0, remainingWeed) : [];
+        const targets = analysis.canPutWeed.slice(0, getBadRemainingTimes());
         const result = targets.length > 0
           ? await putWeedsDetailed(numericGid, targets)
           : { ok: 0, failed: [] };
@@ -466,7 +413,7 @@ async function doFriendOperation(gid, opType) {
         failedMsgs = failedMsgs.concat(
           (result.failed || []).map(f => `放草#${f.landId}:${f.reason}`)
         );
-        if (weedCount > 0) recordOperation('putWeed', weedCount);
+        // putFriendItemsDetailed owns the once-only statistics commit.
       }
 
       okCount = bugCount + weedCount;
@@ -495,7 +442,7 @@ async function doFriendOperation(gid, opType) {
 
     return { ok: false, opType, count: 0, message: '未知操作类型' };
   } catch (err) {
-    return { ok: false, opType, count: 0, message: err.message || '操作失败' };
+    throw err;
   } finally {
     try {
       await leaveFriendFarm(numericGid);
@@ -512,7 +459,8 @@ async function doFriendOperation(gid, opType) {
  * Tracks per-operation counts in the `tally` object.
  * Returns: { acted, entered }
  */
-async function visitFriend(friend, tally, myGid, accountId) {
+async function visitFriend(friend, tally, myGid, accountId, options = {}) {
+  const onlyBad = options.onlyBad === true;
   const { gid, name } = friend;
   let enterReply;
 
@@ -550,16 +498,16 @@ async function visitFriend(friend, tally, myGid, accountId) {
   const skipPrecheck = isNpcFriend ? () => ({ canOperate: true, canStealNum: 0 }) : null;
 
   // ---- Help (weed / bug / water) ----
-  const helpEnabled = !!isAutomationOn('friend_help');
+  const helpEnabled = !onlyBad && !!isAutomationOn('friend_help');
   const expLimitEnabled = !!isAutomationOn('friend_help_exp_limit');
 
-  if (!expLimitEnabled) setCanGetHelpExp(true);
+  if (!onlyBad && !expLimitEnabled) setCanGetHelpExp(true);
 
   if (helpEnabled) {
     // Skip help if exp limit is reached and we haven't been overridden
     if (!expLimitEnabled || getCanGetHelpExp()) {
       // 一键务农：浇水/除草/除虫合并为一次 Farming RPC（与游戏内一键务农按钮同源），
-      // 服务端不接受时内部自动回退逐类型 RPC。
+      // 失败直接停止本次事务，不重试写操作。
       const farmingResult = await runFriendFarming(gid, analysis, {
         expGateEnabled: expLimitEnabled,
         checkExpLimit: expLimitEnabled,
@@ -591,7 +539,7 @@ async function visitFriend(friend, tally, myGid, accountId) {
   }
 
   // ---- Steal ----
-  if (isAutomationOn('friend_steal') && analysis.stealable.length > 0) {
+  if (!onlyBad && isAutomationOn('friend_steal') && analysis.stealable.length > 0) {
     // ⭐ 2026-10-23：同 visitFriendForSteal —— 删掉 CheckCanOperate(0x2714) 预检查，
     // 直接打 Harvest 并以回包 land 为成功判据（上游最新版即此做法）。
     if (shouldSkipStealAttempt(gid, analysis.stealableInfo)) {
@@ -615,19 +563,6 @@ async function visitFriend(friend, tally, myGid, accountId) {
         failDetails.push(batch.error);
       }
 
-      const remaining = analysis.stealable.filter(id => !batch.harvested.includes(id));
-      for (const landId of remaining) {
-        const r = await stealHarvestDetailed(gid, [landId]);
-        if (r.ok > 0) {
-          stolen++;
-          const info = analysis.stealableInfo.find(s => s.landId === landId);
-          if (info) stolenNames.push(info.name);
-        }
-        else if (r.error) {
-          failDetails.push(`#${landId}:${r.error}`);
-        }
-        await randomDelay(500, 1000);
-      }
 
       if (stolen > 0) {
         stealNoopMemory.delete(gid);
@@ -646,60 +581,49 @@ async function visitFriend(friend, tally, myGid, accountId) {
   }
 
   // ---- Bad (put weeds & insects) ----
-  const badEnabled = isAutomationOn('friend_bad');
+  // 普通合并巡查只偷/帮；捣乱专轮由候选白名单和暂停状态统一准入。
+  const badEnabled = onlyBad && isAutomationOn('friend_bad', accountId);
   let badCount = 0;
   let putBugCount = 0;
   let putWeedCount = 0;
   const badFailedMsgs = [];
+  const badFailures = [];
 
   if (badEnabled) {
-    const canPutBug = skipPrecheck
-      ? skipPrecheck()
-      : await checkCanOperateRemote(gid, PUT_BUG_OPERATION_ID);
-    const canPutWeed = skipPrecheck
-      ? skipPrecheck()
-      : await checkCanOperateRemote(gid, PUT_WEED_OPERATION_ID);
-
-    // Put insects
-    if (analysis.canPutBug.length > 0 && canPutBug.canOperate && getBadRemainingTimes() > 0) {
-      const remainingBug = Math.min(
-        getRemainingTimes(PUT_BUG_OPERATION_ID, BAD_DAILY_LIMIT),
-        getBadRemainingTimes()
-      );
-      const targets = analysis.canPutBug.slice(0, remainingBug);
+    // 官方Put路径不使用CheckCanOperate；本次进入的地块和共享99预算才是准入。
+    if (analysis.canPutBug.length > 0 && getBadRemainingTimes() > 0) {
+      const targets = analysis.canPutBug.slice(0, getBadRemainingTimes());
       const result = targets.length > 0
         ? await putInsectsDetailed(gid, targets)
         : { ok: 0, failed: [] };
       const okCount = result.ok || 0;
       badFailedMsgs.push(...(result.failed || []).map(f => `放虫#${f.landId}:${f.reason}`));
+      badFailures.push(...(result.failed || []).map(f => ({ ...f, opType: 'putBug' })));
       if (okCount > 0) {
         actionLogs.push(`放虫${okCount}`);
         tally.putBug += okCount;
         putBugCount += okCount;
         badCount += okCount;
-        recordOperation('putBug', okCount);
+        // Confirmed placement stats were already recorded inside the RPC.
       }
       await randomDelay(500, 1500);
     }
 
     // Put weeds
-    if (analysis.canPutWeed.length > 0 && canPutWeed.canOperate && getBadRemainingTimes() > 0) {
-      const remainingWeed = Math.min(
-        getRemainingTimes(PUT_WEED_OPERATION_ID, BAD_DAILY_LIMIT),
-        getBadRemainingTimes()
-      );
-      const targets = analysis.canPutWeed.slice(0, remainingWeed);
+    if (analysis.canPutWeed.length > 0 && getBadRemainingTimes() > 0) {
+      const targets = analysis.canPutWeed.slice(0, getBadRemainingTimes());
       const result = targets.length > 0
         ? await putWeedsDetailed(gid, targets)
         : { ok: 0, failed: [] };
       const okCount = result.ok || 0;
       badFailedMsgs.push(...(result.failed || []).map(f => `放草#${f.landId}:${f.reason}`));
+      badFailures.push(...(result.failed || []).map(f => ({ ...f, opType: 'putWeed' })));
       if (okCount > 0) {
         actionLogs.push(`放草${okCount}`);
         tally.putWeed += okCount;
         putWeedCount += okCount;
         badCount += okCount;
-        recordOperation('putWeed', okCount);
+        // Do not double-count the RPC owner's confirmed placement.
       }
       await randomDelay(500, 1500);
     }
@@ -710,7 +634,7 @@ async function visitFriend(friend, tally, myGid, accountId) {
   // 手动在游戏里用完自用次数时该标记为空。因此在自用未满时先尝试自用一次：
   // useQixiDew 会用掉剩余自用次数并在达到上限后写入标记（手动已用完时首次尝试即
   // 收到每日上限错误，同样写入标记），确认自用已满后才对好友使用灵露。
-  if (isAutomationOn('qixi_dew_use_on_friend')) {
+  if (!onlyBad && isAutomationOn('qixi_dew_use_on_friend')) {
     const activityDew = require('./activity');
     // 好友名单复用香囊的 qixi_friend_priority：名单非空时只对名单内好友使用灵露
     const dewPriority = (Array.isArray((getAutomation() || {}).qixi_friend_priority)
@@ -723,7 +647,7 @@ async function visitFriend(friend, tally, myGid, accountId) {
       let selfLimitReached = activityDew.isQixiDewLimitReachedToday();
       if (!selfLimitReached) {
         try {
-          const selfResult = await activityDew.useQixiDew();
+          const selfResult = await runFriendVisitOperation(gid, () => activityDew.useQixiDew());
           const selfUsed = Number(selfResult?.usedCount || 0);
           if (selfUsed > 0) {
             actionLogs.push(`灵露自用${selfUsed}`);
@@ -757,7 +681,7 @@ async function visitFriend(friend, tally, myGid, accountId) {
         const targets = planted.slice(0, remaining);
         if (targets.length > 0) {
           try {
-            const r = await activityDew.useQixiDewOnFriend(gid, targets);
+            const r = await runFriendVisitOperation(gid, () => activityDew.useQixiDewOnFriend(gid, targets));
             const used = Number(r && r.usedCount) || 0;
             if (used > 0) {
               actionLogs.push(`友灵露${used}`);
@@ -794,6 +718,7 @@ async function visitFriend(friend, tally, myGid, accountId) {
     count: badCount,
     bugCount: putBugCount,
     weedCount: putWeedCount,
+    failed: badFailures,
     message: badCount > 0
       ? `捣乱完成 虫${putBugCount}/草${putWeedCount}`
       : badFailedMsgs.slice(-3).join(' | '),
@@ -863,7 +788,7 @@ async function visitFriendForSteal(friend, tally, myGid, accountId) {
   if (analysis.stealable.length > 0) {
     // ⭐ 2026-10-23：**删掉 CheckCanOperate(0x2714) 预检查**（与昨天删掉帮忙类预检查同一理由）。
     // 上游最新版（liyangpengs/qq-farm-bot main，TS 重写）的偷取分支**完全没有这个预检查**，
-    // 直接打 Harvest；而实测该预检查会误判——罗辑的宠物守护日志证实希恩斯从未偷到过罗辑，
+    // 直接打 Harvest；而实测该预检查会误判——账号甲的宠物守护日志证实账号乙从未偷到过账号甲，
     // 却每次返回 canOperate=false / canStealNum=0（"额度已用完"），真实好友被 100% 误杀。
     // 现在：批量 Harvest → 未拿全逐块补 → 全失败才打 warn 并汇总真实错误原因。
     if (shouldSkipStealAttempt(gid, analysis.stealableInfo)) {
@@ -888,19 +813,6 @@ async function visitFriendForSteal(friend, tally, myGid, accountId) {
       failDetails.push(batch.error);
     }
 
-    const remaining = analysis.stealable.filter(id => !batch.harvested.includes(id));
-    for (const landId of remaining) {
-      const r = await stealHarvestDetailed(gid, [landId]);
-      if (r.ok > 0) {
-        stolen++;
-        const info = analysis.stealableInfo.find(s => s.landId === landId);
-        if (info) stolenNames.push(info.name);
-      }
-      else if (r.error) {
-        failDetails.push(`#${landId}:${r.error}`);
-      }
-      await randomDelay(200, 600);
-    }
 
     if (stolen > 0) {
       stealNoopMemory.delete(gid);
@@ -1060,8 +972,8 @@ async function visitFriendForHelp(friend, tally, myGid, accountId, ignoreExpLimi
 // ===== Exports =====
 module.exports = {
   runBatchWithFallback,
-  doFriendOperation,
-  visitFriend,
-  visitFriendForSteal,
-  visitFriendForHelp,
+  doFriendOperation: (gid, opType) => withFriendVisitSession(gid, () => doFriendOperation(gid, opType)),
+  visitFriend: (friend, ...args) => withFriendVisitSession(friend.gid, () => visitFriend(friend, ...args)),
+  visitFriendForSteal: (friend, ...args) => withFriendVisitSession(friend.gid, () => visitFriendForSteal(friend, ...args)),
+  visitFriendForHelp: (friend, ...args) => withFriendVisitSession(friend.gid, () => visitFriendForHelp(friend, ...args)),
 };

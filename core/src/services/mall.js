@@ -53,9 +53,16 @@ function getDateKey() {
 
 // ---- RPC 调用 ----
 
-async function getMallListBySlotType(slotType = 1) {
+async function getMallListBySlotType(slotType = 1, options = {}) {
+  // 2026-11-03：官方 request 有 is_manual_open(2) / global_scene_id(3, 1=农场)。
+  // ⚠️ 实测：这两个字段**不传**时服务端正常返回商品；显式传 global_scene_id=1
+  // 会导致列表变空（服务端把未开启的场景过滤掉了）。所以只在明确指定时才带上。
+  const payload = { slot_type: Number(slotType) || 1 };
+  if (options.globalSceneId != null) payload.global_scene_id = Number(options.globalSceneId) || 0;
+  if (options.manualOpen === true) payload.is_manual_open = true;
+
   const request = types.GetMallListBySlotTypeRequest.encode(
-    types.GetMallListBySlotTypeRequest.create({ slot_type: Number(slotType) || 1 })
+    types.GetMallListBySlotTypeRequest.create(payload)
   ).finish();
   const { body } = await sendMsgAsync('gamepb.mallpb.MallService', 'GetMallListBySlotType', request);
   return types.GetMallListBySlotTypeResponse.decode(body);
@@ -78,12 +85,22 @@ async function purchaseMallGoods(goodsId, count = 1) {
 async function getMallGoodsList(slotType = 1) {
   const reply = await getMallListBySlotType(slotType);
   const rawList = Array.isArray(reply && reply.goods_list) ? reply.goods_list : [];
+
+  // 2026-11-03：官方 proto 里 goods_list 已经是 repeated MallGoods（结构化），
+  // protobufjs 解码时已递归解成对象。旧代码把它当 bytes 再 decode 一次 →
+  // 必然抛错 → 被 catch 静默吞掉 → 商城永远返回空数组（"没有商品"的真凶）。
   const goodsList = [];
   for (const raw of rawList) {
-    try {
-      goodsList.push(types.MallGoods.decode(raw));
-    } catch {
-      // 跳过解码失败的
+    if (!raw) continue;
+    // 兼容两种形态：已是对象直接用；旧版可能是 bytes
+    if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
+      try {
+        goodsList.push(types.MallGoods.decode(raw));
+      } catch {
+        // 单条解码失败不影响其余
+      }
+    } else {
+      goodsList.push(raw);
     }
   }
   return goodsList;
@@ -108,7 +125,32 @@ function bytesToBuffer(value) {
 }
 
 /**
- * 解析商城价格字段（protobuf varint + zigzag 编码）
+ * 读取一个 varint（用乘法而非位运算，避免 32 位截断导致大数值变负）。
+ * @returns {{value: number, pos: number}}
+ */
+function readVarint(buf, pos) {
+  let value = 0;
+  let mul = 1;
+  while (pos < buf.length) {
+    const b = buf[pos++];
+    value += (b & 0x7F) * mul;
+    if ((b & 0x80) === 0) break;
+    mul *= 128;
+  }
+  return { value, pos };
+}
+
+/**
+ * 解析商城价格字段。
+ *
+ * `MallGoods.price` 在 proto 里是 `bytes`，实际内容是 PriceInfo 结构：
+ *   field 1 = 货币道具 id（1001=金币 1002=点券 1005=金豆 …）
+ *   field 2 = 数量
+ *   field 3 = balance（余额，通常不下发）
+ *
+ * ⚠️ 2026-11-02 修正：旧实现只读了 field 1 就当成价格返回，
+ * 于是「价格」实际是货币 id（1/2/3…），除少数巧合外全部错。
+ * 现在返回数量（field 2）；若只有单个裸 varint（非嵌套结构）则原样返回。
  */
 function parseMallPriceValue(raw) {
   if (raw == null) return 0;
@@ -117,35 +159,52 @@ function parseMallPriceValue(raw) {
   const buf = bytesToBuffer(raw);
   if (!buf || !buf.length) return 0;
 
-  let pos = 0; let result = 0;
+  let pos = 0;
+  let single = 0;
+  let fieldCount = 0;
+  let currencyId = 0;
+  let count = 0;
+
   while (pos < buf.length) {
-    const byte = buf[pos++];
-    const fieldNum = byte >> 3;
-    const wireType = byte & 0x7;
-    if (wireType !== 0) break;
-    let value = 0; let shift = 0;
-    while (pos < buf.length) {
-      const b = buf[pos++];
-      value |= (b & 0x7F) << shift;
-      if ((b & 0x80) === 0) break;
-      shift += 7;
-    }
-    if (fieldNum === 1) result = value;
+    const tag = buf[pos++];
+    const fieldNum = tag >> 3;
+    const wireType = tag & 0x7;
+    if (wireType !== 0) break; // 只处理 varint 字段
+    const r = readVarint(buf, pos);
+    pos = r.pos;
+    fieldCount += 1;
+    if (fieldNum === 1) currencyId = r.value;
+    else if (fieldNum === 2) count = r.value;
+    single = r.value;
   }
-  return Math.max(0, Math.floor(result || 0));
+
+  // 多字段：标准 PriceInfo，价格取 field 2（数量）
+  if (count > 0) return Math.floor(count);
+  // 只有 field 1（货币 id）没有数量 → 未定价
+  // 单字段同样按官方 PriceInfo 语义理解：field 1 是货币 id，不是价格
+  return 0;
 }
 
 /**
  * 解析限购信息
  */
 function parseMallLimitInfo(raw) {
-  const empty = { limitCount: 0, boughtNum: 0 };
+  const empty = { limitCount: 0, boughtNum: 0, limitType: 0 };
   if (raw == null) return empty;
 
   const buf = bytesToBuffer(raw);
   if (!buf || !buf.length) return empty;
 
-  let pos = 0; let limitCount = 0; let boughtNum = 0;
+  // PurchaseLimit 的官方字段编号（mallpb.proto）：
+  //   1 = limit_type   (1=每日 2=每周 3=每月 4=永久)
+  //   2 = bought_count
+  //   3 = limit_count
+  // ⚠️ 2026-11-02 修正：旧实现把 field 1 当成 limitCount、且完全没读 field 3，
+  //    导致「限购总数」实际是「限购类型」（1~4），前端限购进度全部错乱。
+  let pos = 0;
+  let limitType = 0;
+  let boughtNum = 0;
+  let limitCount = 0;
   while (pos < buf.length) {
     const byte = buf[pos++];
     const fieldNum = byte >> 3;
@@ -158,12 +217,14 @@ function parseMallLimitInfo(raw) {
       if ((b & 0x80) === 0) break;
       shift += 7;
     }
-    if (fieldNum === 1) limitCount = value;
+    if (fieldNum === 1) limitType = value;
     else if (fieldNum === 2) boughtNum = value;
+    else if (fieldNum === 3) limitCount = value;
   }
   return {
     limitCount: Math.max(0, limitCount),
     boughtNum: Math.max(0, boughtNum),
+    limitType: Math.max(0, limitType),
   };
 }
 
@@ -428,11 +489,13 @@ async function buyFreeGifts(force = false) {
     const rawList = Array.isArray(reply && reply.goods_list) ? reply.goods_list : [];
     const goodsList = [];
 
+    // 2026-11-03：goods_list 已是 repeated MallGoods（结构化），不能再当 bytes decode
     for (const raw of rawList) {
-      try {
-        goodsList.push(types.MallGoods.decode(raw));
-      } catch {
-        // skip
+      if (!raw) continue;
+      if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
+        try { goodsList.push(types.MallGoods.decode(raw)); } catch { /* skip */ }
+      } else {
+        goodsList.push(raw);
       }
     }
 

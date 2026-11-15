@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-把 404 参考副本（D:/小工具/_ref404）的 gameConfig 数据并集合并进本地。
+把通过 FARM_REFERENCE_DIR 指定的参考副本 gameConfig 数据并集合并进本地。
 
 策略：**只追加，不覆盖**。
   - ItemInfo.json : 404 是本地严格超集（同名 ID 内容 0 差异）→ 按 404 顺序输出全部 716 项
@@ -19,7 +19,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCAL = os.path.abspath(os.path.join(HERE, '..', '..'))
-REF404 = os.path.abspath(os.path.join(LOCAL, '..', '_ref404'))
+REF404 = os.path.abspath(os.environ.get('FARM_REFERENCE_DIR') or os.path.join(LOCAL, '..', '_ref404'))
 
 TARGETS = ['ItemInfo.json', 'Plant.json']
 

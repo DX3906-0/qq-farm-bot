@@ -13,6 +13,7 @@ const props = defineProps<{
   expandedFriends: Set<string>
   friendLands: Record<string, any[]>
   friendLandsLoading: Record<string, boolean>
+  friendLandsError?: Record<string, string>
   isQqAccount: boolean
   canShowFriendAvatar: (friend: any) => boolean
   getFriendAvatar: (friend: any) => string
@@ -22,6 +23,8 @@ const props = defineProps<{
   getFriendStatusText: (friend: any) => string
   getFriendStatusHint: (friend: any) => string
   stealPlans: Record<string, any>
+  operationLocked?: boolean
+  operationTarget?: string
 }>()
 
 const emit = defineEmits<{
@@ -47,7 +50,7 @@ function goToPage(page: number) {
     class="overflow-hidden rounded-lg bg-white shadow dark:bg-gray-800"
   >
     <div
-      class="flex flex-col cursor-pointer justify-between gap-4 p-4 transition sm:flex-row sm:items-center hover:bg-gray-50 dark:hover:bg-gray-700/50"
+      class="friend-row flex flex-col cursor-pointer justify-between gap-4 p-4 transition sm:flex-row sm:items-center hover:bg-gray-50 dark:hover:bg-gray-700/50"
       :class="blacklistGidSet.has(Number(friend.gid)) ? 'opacity-50' : ''"
       @click="emit('toggleFriend', friend.gid)"
     >
@@ -65,6 +68,7 @@ function goToPage(page: number) {
         <div>
           <div class="flex items-center gap-2 font-bold">
             {{ friend.name }} ({{ friend.gid }})
+            <span v-if="operationTarget === String(friend.gid)" class="text-xs font-normal" role="status">处理中</span>
 
             <span v-if="blacklistGidSet.has(Number(friend.gid))" class="rounded bg-gray-200 px-1.5 py-0.5 text-xs text-gray-500 dark:bg-gray-700 dark:text-gray-400">已屏蔽</span>
             <span v-if="Number(friend?.dogId) === 90021" class="rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-600 dark:bg-red-900/30 dark:text-red-400">护主犬</span>
@@ -101,6 +105,7 @@ function goToPage(page: number) {
       <div class="flex flex-wrap gap-2">
         <button
           class="rounded bg-blue-100 px-3 py-2 text-sm text-blue-700 transition hover:bg-blue-200"
+          :disabled="operationLocked"
           @click="emit('operate', friend.gid, 'steal', $event)"
         >
           偷取
@@ -110,6 +115,7 @@ function goToPage(page: number) {
           :class="props.stealPlans[friend.gid]
             ? 'bg-violet-100 text-violet-700 hover:bg-violet-200 dark:bg-violet-900/30 dark:text-violet-300'
             : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300'"
+          :disabled="operationLocked"
           @click="emit('scheduleSteal', friend, $event)"
         >
           {{ props.stealPlans[friend.gid] ? (props.stealPlans[friend.gid].recurring ? '永久偷取✓' : '预约偷取✓') : '预约偷取' }}
@@ -117,12 +123,14 @@ function goToPage(page: number) {
         <button
           class="rounded bg-emerald-100 px-3 py-2 text-sm text-emerald-700 transition hover:bg-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:hover:bg-emerald-900/50"
           title="一键务农：浇水、除草、除虫一次完成（与游戏内一键务农同源）"
+          :disabled="operationLocked"
           @click="emit('operate', friend.gid, 'farming', $event)"
         >
           一键务农
         </button>
         <button
           class="rounded bg-red-100 px-3 py-2 text-sm text-red-700 transition hover:bg-red-200"
+          :disabled="operationLocked"
           @click="emit('operate', friend.gid, 'bad', $event)"
         >
           捣乱
@@ -146,21 +154,30 @@ function goToPage(page: number) {
       </div>
     </div>
 
-    <div v-if="expandedFriends.has(friend.gid)" class="border-t bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-900/50">
+    <div v-if="expandedFriends.has(String(friend.gid))" class="border-t bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-900/50">
       <div v-if="friendLandsLoading[friend.gid]" class="flex justify-center py-4">
         <div class="i-svg-spinners-90-ring-with-bg text-2xl text-blue-500" />
       </div>
-      <div v-else-if="!friendLands[friend.gid] || friendLands[friend.gid]?.length === 0" class="py-4 text-center text-gray-500">
-        当前没有返回土地数据，可稍后重试或先确认该好友农场是否可访问。
-      </div>
-      <div v-else class="grid grid-cols-2 gap-2 lg:grid-cols-8 md:grid-cols-5 sm:grid-cols-4">
-        <LandCard
-          v-for="land in friendLands[friend.gid]"
-          :key="land.id"
-          :land="land"
-          :show-actions="false"
-        />
-      </div>
+      <template v-else>
+        <div v-if="friendLandsError?.[friend.gid]" class="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-900/20 dark:text-red-300" role="alert">
+          读取好友土地失败：{{ friendLandsError[friend.gid] }}
+          <span v-if="friendLands[friend.gid]?.length" class="ml-1">以下保留上次成功读取的数据。</span>
+        </div>
+        <div v-if="!friendLandsError?.[friend.gid] && !friendLands[friend.gid]" class="py-4 text-center text-gray-500">
+          尚未读取该好友的土地数据，请确认账号在线后展开查看。
+        </div>
+        <div v-else-if="!friendLandsError?.[friend.gid] && friendLands[friend.gid]?.length === 0" class="py-4 text-center text-gray-500">
+          本次访问成功，但该好友没有返回可展示的土地。
+        </div>
+        <div v-if="friendLands[friend.gid]?.length" class="grid grid-cols-2 gap-2 lg:grid-cols-8 md:grid-cols-5 sm:grid-cols-4">
+          <LandCard
+            v-for="land in friendLands[friend.gid]"
+            :key="land.id"
+            :land="land"
+            :show-actions="false"
+          />
+        </div>
+      </template>
     </div>
   </div>
 
@@ -217,3 +234,11 @@ function goToPage(page: number) {
     </span>
   </div>
 </template>
+
+<style scoped>
+.friend-row button { transition: background-color 150ms ease, transform 90ms ease; }
+.friend-row button:not(:disabled):active { transform: scale(.97); filter: brightness(.96); }
+.friend-row button:disabled { cursor: not-allowed; opacity: .55; }
+@media (max-width: 640px), (pointer: coarse) { .friend-row button { min-height: 44px; } }
+@media (prefers-reduced-motion: reduce) { .friend-row, .friend-row button { transition: none; } .friend-row button:active { transform: none; } }
+</style>

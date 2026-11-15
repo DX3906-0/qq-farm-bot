@@ -9,6 +9,7 @@ const props = defineProps<{
   icon?: string
   color?: string
   img?: string
+  disabled?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -37,7 +38,7 @@ const colorClass = computed(() => colorMap[props.color || 'gray'] || colorMap.gr
 </script>
 
 <template>
-  <div class="flex items-center gap-3 rounded-2xl border border-gray-100 bg-white px-4 py-3 shadow-sm transition-colors hover:border-gray-200 dark:border-gray-700 dark:bg-gray-800 dark:hover:border-gray-600">
+  <div class="ui-subtle-panel flex items-center gap-3 rounded-lg px-4 py-3">
     <div v-if="img" class="h-11 w-11 shrink-0 overflow-hidden rounded-xl bg-gray-100 dark:bg-gray-700">
       <img :src="img" alt="" class="h-full w-full object-cover">
     </div>
@@ -52,12 +53,14 @@ const colorClass = computed(() => colorMap[props.color || 'gray'] || colorMap.gr
       <div class="truncate text-sm font-medium text-gray-800 dark:text-gray-100">
         {{ label }}
       </div>
-      <div v-if="sub" class="truncate text-xs text-gray-400 dark:text-gray-500">
+      <div v-if="sub" class="text-xs leading-relaxed text-[var(--muted-text)]">
         {{ sub }}
       </div>
     </div>
     <BaseSwitch
       :model-value="modelValue ?? false"
+      :disabled="disabled"
+      :aria-label="label"
       @update:model-value="emit('update:modelValue', $event ?? false)"
     />
   </div>

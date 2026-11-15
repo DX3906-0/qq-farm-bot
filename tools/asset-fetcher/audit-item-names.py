@@ -12,7 +12,7 @@ import json
 import os
 import re
 
-ROOT = 'D:/小工具/qq-farm-bot-main'
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 # ---- 已知名称 ----
 names = set()

@@ -5,9 +5,11 @@ rem  Stop the running NapCat code guard
 rem =========================================
 cd /d "%~dp0"
 
-set PY=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\python.exe
+if not defined FARM_PYTHON set FARM_PYTHON=python
+set "PY=%FARM_PYTHON%"
 
-if not exist "%PY%" goto nopy
+where "%PY%" >nul 2>nul
+if errorlevel 1 goto nopy
 
 echo Stopping napcat-code-guard daemon ...
 "%PY%" napcat-code-guard.py --stop

@@ -14,23 +14,24 @@ function getRuntime() {
     return defaultRuntime;
 }
 
-async function initWasm() {
-    return getRuntime().init();
+async function initWasm(runtime = getRuntime()) {
+    return runtime.init();
 }
 
-async function generateToken(value) {
-    await initWasm();
-    return getRuntime().generateToken(value);
+async function generateToken(value, runtime = getRuntime()) {
+    await initWasm(runtime);
+    return runtime.generateToken(value);
 }
 
-async function encryptBuffer(buffer) {
-    await initWasm();
-    return getRuntime().encrypt(buffer);
+async function encryptBuffer(buffer, runtime = getRuntime(), isCurrent) {
+    await initWasm(runtime);
+    if (isCurrent && !isCurrent()) throw new Error('加密请求已取消或运行时世代已变更');
+    return runtime.encrypt(buffer);
 }
 
-async function decryptBuffer(buffer) {
-    await initWasm();
-    return getRuntime().decrypt(buffer);
+async function decryptBuffer(buffer, runtime = getRuntime()) {
+    await initWasm(runtime);
+    return runtime.decrypt(buffer);
 }
 
 module.exports = {

@@ -17,12 +17,16 @@ export const HIDDEN_ACTIVITIES: ReadonlySet<string> = new Set([
   // 千星游记（通行令 / SeasonPassport）已于 2026-08-28 0 点结束，缺窗口数据 → 兜底隐藏；
   // 后端 getSeasonPassport 逻辑保留，活动返厂时移除本 key 即恢复。
   'journey',
-  // 日志确认「心许千灯星垂野」整棵活动树（含 观星礼录 records / 星砂兑换商店 shop / 节令小札 notes）
-  // 在 2026-08-28 0 点整体下线（getStarActivity 找不到根节点），缺窗口数据 → 一并兜底隐藏；
+  // 「心许千灯星垂野」的观星礼录/星砂商店已下线。notes为独立RPC，不属于此隐藏范围。
+  // 在 2026-08-28 0 点主活动下线（getStarActivity 找不到根节点），缺窗口数据 → 兜底隐藏；
   // 后端 getStarActivity 已优雅降级返回 warning，活动返厂时移除这些 key 即恢复。
   'records',
   'shop',
-  'notes',
+  // ⚠️ 'notes'（节令小札）已于 2026-11-08 移出隐藏集合：
+  // 它当初被一并归档，只因挂在千灯活动树下；但实测节令小札由**独立的**
+  // SolarTermsService 提供，与千灯活动无关 —— 11-07 立冬（term 403）仍在发放且可领取。
+  // 若继续隐藏：活动页看不到面板、设置里看不到「自动领取节令小札」开关，
+  // 而 worker 实际一直在跑节令领取，二者必须一致，否则用户无法开关。
 ])
 // 已按时间窗自动收口的活动（**不再列在此处**，窗口外由 isActivityInSeason 自动隐藏）：
 //   honghua      公益小红花  窗口 2026-09-01 ~ 2026-09-09 23:59

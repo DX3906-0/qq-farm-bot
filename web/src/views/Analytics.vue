@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, useId, watch } from 'vue'
+import { moveSlidingTabFocus, useSlidingTabs, vSlidingTabs } from '@/composables/useContentMotion'
 import api from '@/api'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useAccountStore } from '@/stores/account'
@@ -40,7 +41,15 @@ const searchKeyword = ref('')
 const batchLoading = ref(false)
 let analyticsRequestId = 0
 
-const activeTab = ref('crops')
+const activeTab = ref<'crops' | 'blacklist' | 'strategy'>('crops')
+const analyticsContent = ref<HTMLElement | null>(null)
+const analyticsPanelId = useId()
+const analyticsTabs = [
+  { key: 'crops', label: '全部作物', icon: 'i-carbon-sprout' },
+  { key: 'blacklist', label: '黑名单', icon: 'i-carbon-subtract-alt' },
+  { key: 'strategy', label: '种植策略', icon: 'i-carbon-chart-line' },
+] as const
+const { select: selectAnalyticsTab, selected: selectedAnalyticsTab } = useSlidingTabs(activeTab, () => analyticsContent.value, () => analyticsTabs.map(item => item.key), () => currentAccountId.value)
 
 const strategyLevel = ref(1)
 
@@ -356,54 +365,31 @@ function formatGrowTime(seconds: any) {
 
 <template>
   <div class="space-y-4">
-    <div class="flex gap-2 border-b border-gray-200 dark:border-gray-700">
+    <nav v-sliding-tabs class="ui-tabs" role="tablist" aria-label="数据分析功能">
       <button
-        class="border-b-2 px-4 py-2 text-sm font-medium transition-colors"
-        :class="activeTab === 'crops'
-          ? 'border-blue-500 text-blue-600 dark:border-blue-400 dark:text-blue-400'
-          : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'"
-        @click="activeTab = 'crops'"
+        v-for="item in analyticsTabs"
+        :id="`${analyticsPanelId}-${item.key}`"
+        :key="item.key"
+        type="button"
+        class="ui-tab ui-tab-counted"
+        role="tab"
+        :data-active="selectedAnalyticsTab === item.key"
+        :aria-selected="selectedAnalyticsTab === item.key"
+        :aria-controls="`${analyticsPanelId}-content`"
+        :tabindex="selectedAnalyticsTab === item.key ? 0 : -1"
+        @click="selectAnalyticsTab(item.key)"
+        @keydown="moveSlidingTabFocus"
       >
-        <div class="flex items-center space-x-2">
-          <div class="i-carbon-sprout h-6 w-6 flex items-center justify-center text-lg" />
-          <span>全部作物</span>
-          <span v-if="list.length" class="ml-1 rounded-full bg-green-100 px-2 py-0.5 text-xs text-green-700 dark:bg-green-900/50 dark:text-green-300">
-            {{ list.length }}
-          </span>
-        </div>
+        <span class="ui-tab-icon" aria-hidden="true"><span :class="item.icon" /></span>
+        <span class="ui-tab-label">{{ item.label }}</span>
+        <span class="ui-tab-count text-xs" :aria-hidden="item.key === 'strategy' || undefined">{{ item.key === 'crops' ? list.length || '' : item.key === 'blacklist' ? blacklist.length || '' : '' }}</span>
       </button>
-      <button
-        class="border-b-2 px-4 py-2 text-sm font-medium transition-colors"
-        :class="activeTab === 'blacklist'
-          ? 'border-blue-500 text-blue-600 dark:border-blue-400 dark:text-blue-400'
-          : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'"
-        @click="activeTab = 'blacklist'"
-      >
-        <div class="flex items-center space-x-2">
-          <div class="i-carbon-subtract-alt h-6 w-6 flex items-center justify-center text-lg" />
-          <span>黑名单</span>
-          <span v-if="blacklist.length" class="ml-1 rounded-full bg-red-100 px-2 py-0.5 text-xs text-red-700 dark:bg-red-900/50 dark:text-red-300">
-            {{ blacklist.length }}
-          </span>
-        </div>
-      </button>
-      <button
-        class="border-b-2 px-4 py-2 text-sm font-medium transition-colors"
-        :class="activeTab === 'strategy'
-          ? 'border-blue-500 text-blue-600 dark:border-blue-400 dark:text-blue-400'
-          : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300'"
-        @click="activeTab = 'strategy'"
-      >
-        <div class="flex items-center space-x-2">
-          <div class="i-carbon-chart-line h-6 w-6 flex items-center justify-center text-lg" />
-          <span>种植策略</span>
-        </div>
-      </button>
-    </div>
+    </nav>
 
-    <div>
+    <div :id="`${analyticsPanelId}-content`" ref="analyticsContent" class="tab-motion-viewport" role="tabpanel" :aria-labelledby="`${analyticsPanelId}-${activeTab}`" :aria-busy="loading">
+      <div data-motion-entry>
       <div v-if="loading" class="flex justify-center py-12">
-        <div class="i-svg-spinners-90-ring-with-bg text-4xl text-blue-500" />
+        <div class="i-svg-spinners-90-ring-with-bg text-4xl text-[var(--theme-primary)]" />
       </div>
 
       <div v-else-if="!currentAccountId" class="rounded-lg bg-white p-8 text-center text-gray-500 shadow dark:bg-gray-800">
@@ -437,7 +423,7 @@ function formatGrowTime(seconds: any) {
                 v-model="searchKeyword"
                 type="text"
                 placeholder="搜索作物..."
-                class="w-full border border-gray-300 rounded-lg bg-white py-2 pl-10 pr-4 text-sm sm:w-64 dark:border-gray-600 focus:border-blue-500 dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                class="w-full border border-gray-300 rounded-lg bg-white py-2 pl-10 pr-4 text-sm sm:w-64 dark:border-gray-600 focus:border-[var(--theme-primary)] dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-1 focus:ring-[var(--theme-primary)]"
               >
             </div>
             <div v-if="list.length" class="text-sm text-gray-500">
@@ -814,6 +800,7 @@ function formatGrowTime(seconds: any) {
             <span>可种植 {{ getStrategyAvailableCount() }}/{{ list.length }} 种作物 · 策略计算与设置页面种植策略一致</span>
           </div>
         </div>
+      </div>
       </div>
     </div>
   </div>

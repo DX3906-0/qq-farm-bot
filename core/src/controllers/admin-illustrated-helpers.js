@@ -77,7 +77,7 @@ function buildIllustratedItem(
   rawItem,
   { seedGoodsMap, userLevel, adminLogger, nongmeFruitMap },
 ) {
-  const fruitId = toNum(rawItem.seed_id) || 0;
+  const fruitId = toNum(rawItem.fruit_id ?? rawItem.seed_id) || 0;
   const fruitConfig = getItemById(fruitId);
   const nongmePlant = nongmeFruitMap?.get(fruitId);
   const { seedId, seedLevel } = getPlantSeedInfo(fruitId, nongmePlant);
@@ -115,10 +115,11 @@ function buildIllustratedItem(
 
   return {
     seedId: fruitId,
-    illustratedTier: toNum(rawItem.illustrated_tier ?? rawItem.illustratedTier) || 0,
+    // 2026-11-02：官方 IllustratedInfoV2 用 rarity / progress，旧字段名保留兼容
+    illustratedTier: toNum(rawItem.rarity ?? rawItem.illustrated_tier ?? rawItem.illustratedTier) || 0,
     unlocked,
     plantedCount: toNum(rawItem.planted_count) || 0,
-    harvestCount: toNum(rawItem.harvest_count) || 0,
+    harvestCount: toNum(rawItem.progress ?? rawItem.harvest_count) || 0,
     wishProgress: wishProgress?.total > 0 ? wishProgress : null,
     name: fruitConfig?.name || nongmePlant?.name || `果实${  fruitId}`,
     image: getItemImageById(fruitId) || getNongmeSeedImageUrl(seedId),
@@ -157,7 +158,7 @@ function collectBuyableIllustratedItems(
   const buyableItems = [];
 
   for (const rawItem of rawItems || []) {
-    const fruitId = toNum(rawItem.seed_id) || 0;
+    const fruitId = toNum(rawItem.fruit_id ?? rawItem.seed_id) || 0;
     if (rawItem.unlocked) continue;
 
     const nongmePlant = nongmeFruitMap?.get(fruitId);

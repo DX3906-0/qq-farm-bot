@@ -23,10 +23,13 @@ rem  Do NOT close the window while it says "Running one full fix pass".
 rem ============================================================
 cd /d "%~dp0"
 
-set PY=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\python.exe
-set PYW=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe
+if not defined FARM_PYTHON set FARM_PYTHON=python
+set "PY=%FARM_PYTHON%"
+if not defined FARM_PYTHONW set FARM_PYTHONW=pythonw
+set "PYW=%FARM_PYTHONW%"
 
-if not exist "%PY%" goto nopy
+where "%PY%" >nul 2>nul
+if errorlevel 1 goto nopy
 
 echo ============================================
 echo   NapCat guard - manual wake + fix

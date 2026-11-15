@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import api from '@/api'
+import { ref, watch } from 'vue'
+import transport, { createReadCoordinator, isReadCanceled, invalidateSafeReads, readParamsKey, safeGet } from '@/api'
 import { useAccountStore } from '@/stores/account'
 
 export interface ActivityExchangeShopItem {
@@ -467,10 +467,17 @@ export interface MilkTeaActivityData {
   startTime: number
   endTime: number
   settleStartTime: number
-  active: boolean
+  active: boolean | null
   settling: boolean
+  phase?: 'unknown' | 'upcoming' | 'business' | 'settling' | 'ended'
   page: string
   summary: MilkTeaSummary
+  share?: {
+    currentScore: number
+    daily: { claimed: boolean, claimedCount: number, claimLimit: number, firstShareAwarded: boolean }
+    redDots: { daily: boolean, milestone: boolean, firstShare: boolean }
+    milestones: Array<{ tierId: number, state: number, claimable: boolean, rewards: HeluDrawReward[] }>
+  }
   recommendedNames: string[]
   levels: MilkTeaLevelConfig[]
   goods?: MilkTeaGoodsItem[]
@@ -609,16 +616,51 @@ export const useActivityStore = defineStore('activity', () => {
   const redFlowerShareLoading = ref(false)
   const redFlowerTiersLoading = ref(false)
 
-  // 奶茶热销中（S4）—— 按页缓存，避免切 tab 重复请求
+  // 仅保存展示快照；每次重新进入页签仍读取，不把快照当健康缓存。
   const milkTeaPages = ref<Record<string, MilkTeaActivityData>>({})
   const milkTeaLoading = ref(false)
   const milkTeaOperateLoading = ref(false)
 
   const heluError = ref('')
 
-  let heluRequestId = 0
+  const accountStore = useAccountStore()
+  const reads = createReadCoordinator()
+  let accountEpoch = 0
+  const loadingReaders = new Map<object, number>()
+  function invalidateReads() {
+    reads.invalidate()
+    loadingReaders.clear()
+    heluLoading.value = qixiLoading.value = rainPoemLoading.value = redFlowerLoading.value = wishSignLoading.value = shareRewardLoading.value = milkTeaLoading.value = false
+  }
+  let readSignal: AbortSignal | undefined
+  const currentId = () => String(accountStore.currentAccountId || '')
+  const valid = (id: string, epoch: number, version: number) => !!id && id === currentId() && epoch === accountEpoch && version === reads.epoch
+  // 各函数的现有结果语义保留；读取消必须中断应用与后续阶段。
+  const api = {
+    async get<T = any>(path: string, config: any) {
+      const id = String(config.headers['x-account-id'])
+      const epoch = accountEpoch
+      const version = reads.epoch
+      const signal = config.signal || readSignal
+      const response = await safeGet<T>(path, { ...config, signal }, version)
+      if (!valid(id, epoch, version) || signal?.aborted)
+        throw Object.assign(new Error('读取已取消'), { code: 'ERR_CANCELED' })
+      return response
+    },
+  }
+  function setReadSignal(signal?: AbortSignal) { readSignal = signal }
+  watch(currentId, () => { accountEpoch++; clearActivityData() }, { flush: 'sync' })
 
   function clearActivityData() {
+    invalidateReads()
+    operatingCounts.clear()
+    wishSignActivity.value = null
+    shareRewardActivity.value = null
+    wishSignLoading.value = false
+    shareRewardLoading.value = false
+    wishSignOperateLoading.value = false
+    shareRewardOperateLoading.value = false
+    rainPoemFriends.value = []
     heluActivity.value = null
     qixiActivity.value = null
     rainPoemActivity.value = null
@@ -657,426 +699,199 @@ export const useActivityStore = defineStore('activity', () => {
     return currentId === String(accountId)
   }
 
-  async function fetchQixiActivity(accountId: string) {
-    qixiLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/qixi', { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId))) {
-        qixiActivity.value = data.activity || null
-        qixiFriends.value = data.friends || []
+  let unsharedRead = 0
+  function readActivity(accountId: string, path: string, loading: { value: boolean }, apply: (data: any) => void, params?: Record<string, unknown>, signal = readSignal): Promise<any> {
+    const epoch = accountEpoch
+    const version = reads.epoch
+    const id = String(accountId)
+    if (!valid(id, epoch, version)) return Promise.resolve({ ok: false, canceled: true })
+    const unique = path.startsWith('/api/activity/rain-poem') ? ++unsharedRead : 0
+    return reads.run(`${path}:${id}:${epoch}:${version}:${readParamsKey(params)}:${unique}`, async (shared) => {
+      loadingReaders.set(loading, (loadingReaders.get(loading) || 0) + 1)
+      loading.value = true
+      try {
+        const { data } = await api.get(path, { headers: { 'x-account-id': id }, params, signal: shared })
+        if (!valid(id, epoch, version) || shared.aborted) return { ok: false, canceled: true, error: undefined }
+        if (!data?.ok) throw new Error(data?.error || '获取活动失败')
+        apply(data)
+        return data
       }
-      return data
-    }
-    finally { qixiLoading.value = false }
+      finally {
+        if (valid(id, epoch, version)) {
+          const count = Math.max(0, (loadingReaders.get(loading) || 1) - 1)
+          loadingReaders.set(loading, count)
+          loading.value = count > 0
+        }
+      }
+    }, signal)
+  }
+  function fetchQixiActivity(accountId: string, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/qixi', qixiLoading, (data) => {
+      if (!data.activity) throw new Error('鹊桥响应不完整')
+      qixiActivity.value = data.activity
+      qixiFriends.value = data.friends || []
+    }, undefined, signal || readSignal)
   }
 
-  async function fetchRainPoemActivity(accountId: string) {
-    rainPoemLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/rain-poem', { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        rainPoemActivity.value = data.activity || null
-      return data
-    }
-    finally { rainPoemLoading.value = false }
+  function fetchRainPoemActivity(accountId: string, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/rain-poem', rainPoemLoading, (data) => {
+      if (!data.activity) throw new Error('雨落成诗响应不完整')
+      rainPoemActivity.value = data.activity
+    }, undefined, signal || readSignal)
   }
 
   async function fetchRainPoemFriends(accountId: string) {
+    const epoch = accountEpoch
     try {
       const { data } = await api.get<{ ok: boolean, friends: { gid: number, name: string, remark?: string, level?: number }[] }>(
         '/api/activity/rain-poem/friends',
         { headers: { 'x-account-id': accountId } }
       )
-      if (data.ok) rainPoemFriends.value = data.friends || []
+      if (!data?.ok || !Array.isArray(data.friends)) throw new Error('好友响应不完整')
+      rainPoemFriends.value = data.friends
       return data
     } catch (err) {
-      rainPoemFriends.value = []
+      if (isReadCanceled(err)) return { ok: false, friends: [], canceled: true }
+      if (epoch === accountEpoch && isCurrentAccount(accountId)) rainPoemFriends.value = []
       return { ok: false, friends: [], error: (err as Error)?.message || '获取好友失败' }
     }
   }
 
-  async function fetchRedFlowerActivity(accountId: string) {
-    redFlowerLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/honghua', { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        redFlowerActivity.value = data.activity || null
-      return data
-    }
-    finally { redFlowerLoading.value = false }
+  function fetchRedFlowerActivity(accountId: string, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/honghua', redFlowerLoading, (data) => {
+      if (!data.activity) throw new Error('小红花响应不完整')
+      redFlowerActivity.value = data.activity
+    }, undefined, signal || readSignal)
   }
 
-  async function donateRedFlowerLove(accountId: string) {
-    redFlowerLoveLoading.value = true
+  const operatingCounts = new Map<object, number>()
+  let writeEpoch = 0
+  async function operate(accountId: string, path: string, body: unknown, loading: { value: boolean }, apply?: (data: any) => void, refresh?: (signal?: AbortSignal) => Promise<any>, unwrap = false): Promise<any> {
+    const id = String(accountId)
+    const epoch = accountEpoch
+    const signal = readSignal
+    const current = () => !!id && id === currentId() && epoch === accountEpoch
+    const active = () => current() && !signal?.aborted
+    if (!active()) return { ok: false, canceled: true }
+    const count = (operatingCounts.get(loading) || 0) + 1
+    operatingCounts.set(loading, count)
+    loading.value = true
+    const write = ++writeEpoch
+    invalidateSafeReads()
+    invalidateReads()
     try {
-      const { data } = await api.post('/api/activity/honghua/love', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        await fetchRedFlowerActivity(accountId)
-      return data
+      // 只取消后续读与展示，绝不取消已经提交的写。
+      const { data } = await transport.post(path, body, { headers: { 'x-account-id': id }, skipErrorToast: true } as any)
+      if (!active()) return { ok: false, canceled: true }
+      if (write !== writeEpoch) return data?.ok ? { ...data, stale: true } : { ok: false, error: data?.error || '操作失败' }
+      invalidateReads()
+      if (data?.ok) {
+        apply?.(data)
+        if (refresh && active()) await refresh(signal)
+      }
+      const result = unwrap && data?.ok ? data.data || data : data
+      return result && typeof result.ok === 'boolean' ? result : { ok: false, error: data?.error || '操作响应不完整' }
     }
-    finally { redFlowerLoveLoading.value = false }
-  }
-
-  async function donateRedFlowerFund(accountId: string) {
-    redFlowerFundLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/honghua/fund', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        await fetchRedFlowerActivity(accountId)
-      return data
+    catch (error: any) {
+      if (!active() || isReadCanceled(error)) return { ok: false, canceled: true }
+      return { ok: false, error: error?.response?.data?.error || error?.message || '操作失败' }
     }
-    finally { redFlowerFundLoading.value = false }
-  }
-
-  async function claimRedFlowerShare(accountId: string) {
-    redFlowerShareLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/honghua/share/claim', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        await fetchRedFlowerActivity(accountId)
-      return data
+    finally {
+      invalidateSafeReads()
+      if (current()) {
+        if (write === writeEpoch) invalidateReads()
+        const remaining = Math.max(0, (operatingCounts.get(loading) || 1) - 1)
+        operatingCounts.set(loading, remaining)
+        loading.value = remaining > 0
+      }
     }
-    finally { redFlowerShareLoading.value = false }
   }
-
-  async function claimRedFlowerTiers(accountId: string) {
-    redFlowerTiersLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/honghua/tiers/claim', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && isCurrentAccount(String(accountId)))
-        await fetchRedFlowerActivity(accountId)
-      return data
-    }
-    finally { redFlowerTiersLoading.value = false }
-  }
+  const donateRedFlowerLove = (id: string) => operate(id, '/api/activity/honghua/love', {}, redFlowerLoveLoading, undefined, signal => fetchRedFlowerActivity(id, signal))
+  const donateRedFlowerFund = (id: string) => operate(id, '/api/activity/honghua/fund', {}, redFlowerFundLoading, undefined, signal => fetchRedFlowerActivity(id, signal))
+  const claimRedFlowerShare = (id: string) => operate(id, '/api/activity/honghua/share/claim', {}, redFlowerShareLoading, undefined, signal => fetchRedFlowerActivity(id, signal))
+  const claimRedFlowerTiers = (id: string) => operate(id, '/api/activity/honghua/tiers/claim', {}, redFlowerTiersLoading, undefined, signal => fetchRedFlowerActivity(id, signal))
 
   // 秋祈良愿
-  async function fetchWishSignActivity(accountId: string) {
-    wishSignLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/wish-sign', { headers: { 'x-account-id': accountId } })
-      if (data.ok) wishSignActivity.value = data.data || null
-      return data
-    }
-    catch (err) {
-      wishSignActivity.value = null
-      return { ok: false, error: (err as Error)?.message || '获取秋祈良愿活动失败' }
-    }
-    finally { wishSignLoading.value = false }
+  function fetchWishSignActivity(accountId: string, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/wish-sign', wishSignLoading, (data) => {
+      if (!data.data) throw new Error('秋祈良愿响应不完整')
+      wishSignActivity.value = data.data
+    }, undefined, signal || readSignal)
   }
 
-  async function operateWishSignActivity(accountId: string, action: 'draw' | 'claim', chooseId = 1) {
-    wishSignOperateLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/wish-sign/operate',
-        { action, chooseId },
-        { headers: { 'x-account-id': accountId } })
-      if (data.ok && data.data) await fetchWishSignActivity(accountId)
-      return data.data || data
-    }
-    catch (err) {
-      return { ok: false, error: (err as Error)?.message || '操作失败' }
-    }
-    finally { wishSignOperateLoading.value = false }
-  }
+  const operateWishSignActivity = (id: string, action: 'draw' | 'claim', chooseId = 1) =>
+    operate(id, '/api/activity/wish-sign/operate', { action, chooseId }, wishSignOperateLoading, undefined, signal => fetchWishSignActivity(id, signal), true)
 
   // 快乐不独享
-  async function fetchShareRewardActivity(accountId: string) {
-    shareRewardLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/share-reward', { headers: { 'x-account-id': accountId } })
-      if (data.ok) shareRewardActivity.value = data.data || null
-      return data
-    }
-    catch (err) {
-      shareRewardActivity.value = null
-      return { ok: false, error: (err as Error)?.message || '获取快乐不独享活动失败' }
-    }
-    finally { shareRewardLoading.value = false }
+  function fetchShareRewardActivity(accountId: string, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/share-reward', shareRewardLoading, (data) => {
+      if (!data.data) throw new Error('分享活动响应不完整')
+      shareRewardActivity.value = data.data
+    }, undefined, signal || readSignal)
   }
 
-  async function operateShareRewardActivity(accountId: string, action: 'daily' | 'share' | 'milestones') {
-    shareRewardOperateLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/share-reward/operate',
-        { action },
-        { headers: { 'x-account-id': accountId } })
-      if (data?.ok) await fetchShareRewardActivity(accountId)
-      return data.data || data
-    }
-    catch (err) {
-      return { ok: false, error: (err as Error)?.message || '操作失败' }
-    }
-    finally { shareRewardOperateLoading.value = false }
-  }
+  const operateShareRewardActivity = (id: string, action: 'daily' | 'share' | 'milestones') =>
+    operate(id, '/api/activity/share-reward/operate', { action }, shareRewardOperateLoading, undefined, signal => fetchShareRewardActivity(id, signal), true)
 
   // 奶茶热销中（S4）
-  async function fetchMilkTeaActivity(accountId: string, page = 'shop', input: Record<string, unknown> = {}) {
-    milkTeaLoading.value = true
-    try {
-      const { data } = await api.get('/api/activity/milk-tea/' + encodeURIComponent(page), {
-        headers: { 'x-account-id': accountId },
-        params: input,
-      })
-      const payload = (data?.data || null) as MilkTeaActivityData | null
-      if (data?.ok && payload && isCurrentAccount(String(accountId)))
-        milkTeaPages.value = { ...milkTeaPages.value, [page]: payload }
-      return { ok: !!data?.ok, data: payload, error: data?.error }
-    }
-    catch (err) {
-      return { ok: false, data: null, error: (err as Error)?.message || '获取奶茶热销中活动失败' }
-    }
-    finally { milkTeaLoading.value = false }
+  function fetchMilkTeaActivity(accountId: string, page = 'shop', input: Record<string, unknown> = {}, signal?: AbortSignal) {
+    return readActivity(accountId, '/api/activity/milk-tea/' + encodeURIComponent(page), milkTeaLoading, (data) => {
+      if (!data.data) throw new Error('奶茶响应不完整')
+      milkTeaPages.value = { ...milkTeaPages.value, [page]: data.data }
+    }, input, signal || readSignal)
   }
 
-  async function operateMilkTeaActivity(accountId: string, action: string, input: Record<string, unknown> = {}) {
-    milkTeaOperateLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/milk-tea/operate',
-        { action, input },
-        { headers: { 'x-account-id': accountId } })
-      return data?.data || data
-    }
-    catch (err) {
-      return { ok: false, error: (err as Error)?.message || '操作失败' }
-    }
-    finally { milkTeaOperateLoading.value = false }
-  }
+  const operateMilkTeaActivity = (id: string, action: string, input: Record<string, unknown> = {}) =>
+    operate(id, '/api/activity/milk-tea/operate', { action, input }, milkTeaOperateLoading, undefined, undefined, true)
 
-  async function useRainPoemPrankOnFriend(accountId: string, friendGid: number, itemId: number, landId = 0) {
-    rainPoemPrankLoading.value = true
-    try {
-      const { data } = await api.post<{ ok: boolean, itemId?: number, friendGid?: number, landId?: number, placed?: boolean, error?: string }>(
-        '/api/activity/rain-poem/prank',
-        { friendGid, itemId, landId },
-        { headers: { 'x-account-id': accountId } }
-      )
-      if (data.ok) await fetchRainPoemActivity(accountId)
-      return data
-    } catch (err) {
-      return { ok: false, error: (err as Error)?.message || '使用失败' }
-    } finally {
-      rainPoemPrankLoading.value = false
-    }
-  }
+  const useRainPoemPrankOnFriend = (id: string, friendGid: number, itemId: number, landId = 0) =>
+    operate(id, '/api/activity/rain-poem/prank', { friendGid, itemId, landId }, rainPoemPrankLoading, undefined, signal => fetchRainPoemActivity(id, signal))
 
-  async function unlockRainPoemResearch(accountId: string, nodeId?: number) {
-    rainPoemResearchLoading.value = true
+  let researchRequest = 0
+  async function unlockRainPoemResearch(id: string, nodeId?: number) {
+    const epoch = accountEpoch
+    const request = ++researchRequest
     rainPoemResearchNodeId.value = nodeId ?? null
     try {
-      const { data } = await api.post<{ ok: boolean, unlocked?: boolean, stageId?: number, error?: string }>(
-        '/api/activity/rain-poem/research/unlock',
-        { nodeId: nodeId ?? 0 },
-        { headers: { 'x-account-id': accountId } }
-      )
-      if (data.ok) await fetchRainPoemActivity(accountId)
-      return data
-    } catch (err) {
-      return { ok: false, error: (err as Error)?.message || '解锁失败' }
-    } finally {
-      rainPoemResearchLoading.value = false
-      rainPoemResearchNodeId.value = null
+      return await operate(id, '/api/activity/rain-poem/research/unlock', { nodeId: nodeId ?? 0 }, rainPoemResearchLoading, undefined, signal => fetchRainPoemActivity(id, signal))
+    }
+    finally {
+      if (epoch === accountEpoch && request === researchRequest) rainPoemResearchNodeId.value = null
     }
   }
+  const applyQixi = (data: any) => { if (data.activity) qixiActivity.value = data.activity }
+  const buildQixiBridge = (id: string) => operate(id, '/api/activity/qixi/bridge/build', {}, qixiBuildLoading, applyQixi)
+  const useQixiDew = (id: string) => operate(id, '/api/activity/qixi/dew/use', {}, qixiDewLoading, applyQixi)
+  const sendQixiSachet = (id: string, friendGid: number, count: number) => operate(id, '/api/activity/qixi/gift', { friendGid, count }, qixiGiftLoading, applyQixi)
 
-  async function buildQixiBridge(accountId: string) {
-    qixiBuildLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/qixi/bridge/build', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && data.activity && isCurrentAccount(String(accountId)))
-        qixiActivity.value = data.activity
-      return data
-    }
-    finally { qixiBuildLoading.value = false }
-  }
-  async function useQixiDew(accountId: string) {
-    qixiDewLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/qixi/dew/use', {}, { headers: { 'x-account-id': accountId } })
-      if (data.ok && data.activity && isCurrentAccount(String(accountId)))
-        qixiActivity.value = data.activity
-      return data
-    }
-    finally { qixiDewLoading.value = false }
-  }
-
-  async function sendQixiSachet(accountId: string, friendGid: number, count: number) {
-    qixiGiftLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/qixi/gift', { friendGid, count }, { headers: { 'x-account-id': accountId } })
-      if (data.ok && data.activity && isCurrentAccount(String(accountId)))
-        qixiActivity.value = data.activity
-      return data
-    }
-    finally { qixiGiftLoading.value = false }
-  }
-
-  async function fetchHeluActivity(accountId: string) {
-    if (!accountId)
-      return
-    const requestedId = String(accountId)
-    const requestId = ++heluRequestId
-    heluLoading.value = true
+  function fetchHeluActivity(accountId: string, signal?: AbortSignal) {
+    const epoch = accountEpoch
+    const version = reads.epoch
     heluError.value = ''
-    try {
-      const { data } = await api.get('/api/activity/star', {
-        headers: { 'x-account-id': accountId },
-      })
-      if (requestId !== heluRequestId || !isCurrentAccount(requestedId))
-        return
-      if (data.ok)
-        heluActivity.value = data.activity || null
-      else
-        heluError.value = data.error || '获取心许千灯星垂野失败'
-    }
-    catch (err: any) {
-      if (requestId === heluRequestId && isCurrentAccount(requestedId))
-        heluError.value = err.message || '获取心许千灯星垂野失败'
-    }
-    finally {
-      if (requestId === heluRequestId)
-        heluLoading.value = false
-    }
+    // 【2026-11-08】原先请求 /api/activity/star（心许千灯星垂野）。该活动已于 2026-08-28
+    // 整树下线，接口只会回 warning + 空 solarTerms（terms=0），页面因此显示
+    // 「活动已结束或不存在」且节令面板「暂无数据」。
+    // 节令小札实际由独立的 SolarTermsService 提供，挂在荷风游记(helu)接口上，改读 /api/activity/helu。
+    return readActivity(accountId, '/api/activity/helu', heluLoading, (data) => {
+      if (!data.activity) throw new Error('荷风游记响应不完整')
+      heluActivity.value = data.activity
+    }, undefined, signal || readSignal).catch((err) => {
+      if (valid(accountId, epoch, version) && !isReadCanceled(err)) heluError.value = err.message || '获取节令小札失败'
+      throw err
+    })
   }
 
-  async function claimStarRecords(accountId: string) {
-    const requestedId = String(accountId)
-    starRecordClaimLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/star/records/claim', {}, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      starRecordClaimLoading.value = false
-    }
-  }
-
-  async function drawHelu(accountId: string, payload: { mode?: string, count?: number } = {}) {
-    const requestedId = String(accountId)
-    drawLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/helu/draw', payload, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      drawLoading.value = false
-    }
-  }
-
-  async function exchangeHelu(accountId: string, slotId: number, count: number) {
-    const requestedId = String(accountId)
-    exchangeLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/helu/exchange', {
-        slotId,
-        count,
-      }, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      exchangeLoading.value = false
-    }
-  }
-
-  async function exchangeStarSand(accountId: string, slotId: number, count: number) {
-    const requestedId = String(accountId)
-    exchangeLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/star/exchange', {
-        slotId,
-        count,
-      }, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      exchangeLoading.value = false
-    }
-  }
-
-  async function claimHeluPassport(accountId: string) {
-    const requestedId = String(accountId)
-    passportClaimLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/star/passport/claim', {}, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      passportClaimLoading.value = false
-    }
-  }
-
-  async function claimHeluSolar(accountId: string, termId?: number) {
-    const requestedId = String(accountId)
-    solarClaimLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/star/solar/claim', {
-        termId,
-      }, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      solarClaimLoading.value = false
-    }
-  }
-
-  async function claimQingmeiSeeds(accountId: string) {
-    const requestedId = String(accountId)
-    qingmeiClaimLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/qingmei/claim', {}, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity) {
-        heluActivity.value = data.activity
-      }
-      return data
-    }
-    finally {
-      qingmeiClaimLoading.value = false
-    }
-  }
-
-  async function brewAndSellQingmeiWine(accountId: string) {
-    const requestedId = String(accountId)
-    qingmeiSellLoading.value = true
-    try {
-      const { data } = await api.post('/api/activity/qingmei/wine/sell', {
-        share: true,
-      }, {
-        headers: { 'x-account-id': accountId },
-      })
-      if (isCurrentAccount(requestedId) && data.ok && data.activity)
-        heluActivity.value = data.activity
-      return data
-    }
-    finally {
-      qingmeiSellLoading.value = false
-    }
-  }
+  const applyStar = (data: any) => { if (data.activity) heluActivity.value = data.activity }
+  const claimStarRecords = (id: string) => operate(id, '/api/activity/star/records/claim', {}, starRecordClaimLoading, applyStar)
+  const drawHelu = (id: string, payload: { mode?: string, count?: number } = {}) => operate(id, '/api/activity/helu/draw', payload, drawLoading, applyStar)
+  const exchangeHelu = (id: string, slotId: number, count: number) => operate(id, '/api/activity/helu/exchange', { slotId, count }, exchangeLoading, applyStar)
+  const exchangeStarSand = (id: string, slotId: number, count: number) => operate(id, '/api/activity/star/exchange', { slotId, count }, exchangeLoading, applyStar)
+  const claimHeluPassport = (id: string) => operate(id, '/api/activity/star/passport/claim', {}, passportClaimLoading, applyStar)
+  // 节令领取同步改走 helu 路由：/api/activity/star/* 属于已下线的千灯活动，
+  // 与读取（fetchHeluActivity）必须指向同一活动，否则面板能显示却点不动。
+  const claimHeluSolar = (id: string, termId?: number) => operate(id, '/api/activity/helu/solar/claim', { termId }, solarClaimLoading, applyStar)
+  const claimQingmeiSeeds = (id: string) => operate(id, '/api/activity/qingmei/claim', {}, qingmeiClaimLoading, applyStar)
+  const brewAndSellQingmeiWine = (id: string) => operate(id, '/api/activity/qingmei/wine/sell', { share: true }, qingmeiSellLoading, applyStar)
 
   return {
     heluActivity,
@@ -1102,6 +917,7 @@ export const useActivityStore = defineStore('activity', () => {
     qingmeiSellLoading,
     heluError,
     clearActivityData,
+    setReadSignal,
     fetchHeluActivity,
     fetchQixiActivity,
     fetchRainPoemActivity,

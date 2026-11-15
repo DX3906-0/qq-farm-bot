@@ -32,3 +32,43 @@ message ClaimShareRewardReply {
     bool has_reward = 2;        // 是否有奖励
     repeated corepb.Item items = 3;  // 奖励物品列表
 }
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message GetInviteInfoRequest {}
+
+message InviteUser {
+    int64 gid = 1;
+    int64 field_2 = 2;
+    string name = 3;
+    string avatar = 4;
+}
+
+message InviteRewardStage {
+    int64 index = 1;
+    int64 reward_index = 2;
+    corepb.Item item = 3;
+    int32 status = 4;
+}
+
+message InviteInfo {
+    InviteUser user_a = 1;
+    int32 status = 2;
+    InviteUser user_b = 3;
+    repeated InviteRewardStage reward_stages = 4;
+}
+
+message GetInviteInfoReply {
+    repeated InviteInfo infos = 1;
+}
+
+message GetInviteAwardRequest {
+    int64 share_cfg_id = 1;
+}
+
+message GetInviteAwardReply {
+    bool success = 1;
+    repeated corepb.Item items = 2;
+}

@@ -1,6 +1,7 @@
 const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('node:crypto');
 const { createScheduler } = require('../services/scheduler');
 const { getDataDir } = require('../config/runtime-paths');
 
@@ -17,17 +18,7 @@ const { getDataDir } = require('../config/runtime-paths');
  */
 const WX_LOGIN_DIR = path.join(getDataDir(), 'wx-login');
 
-/**
- * 性能/风控护栏（2026-10-27）——本机换码走 MMTLS 原生握手（内部最多试 12 个 IP ×5s），
- * 比原来一次 HTTP 请求重得多，且微信对「同一 openid 高频调授权接口」会打 40188 风控标签，
- * 所以必须三道闸：
- *   1) 单飞（single-flight）：同一 openid 的换码并发请求复用同一个 Promise，
- *      避免断线风暴时叠加多次握手（实测离线循环约 5 分钟一轮，很容易并发）。
- *   2) 最小间隔复用：`LOCAL_CODE_MIN_INTERVAL_MS` 内重复请求直接复用上次结果，不再握手。
- *   3) 硬超时：握手若卡死（MMTLS 在服务器环境可能长时间不返回）用 Promise.race 兜住，
- *      不让刷新链路被拖住（比失败更糟的是挂住）。
- */
-const LOCAL_CODE_MIN_INTERVAL_MS = 60 * 1000;
+// 同 openid 单飞直到真实收尾；原生会话可复用，一次性 Code 不得复用。
 const LOCAL_CODE_TIMEOUT_MS = 45 * 1000;
 /** 失败退避阶梯（毫秒）：避免离线循环每轮都去握一次手 */
 const LOCAL_CODE_BACKOFF_STEPS = [2 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000];
@@ -38,24 +29,16 @@ const LOCAL_CODE_BACKOFF_STEPS = [2 * 60 * 1000, 5 * 60 * 1000, 10 * 60 * 1000, 
  */
 const LOCAL_CODE_REISSUE_WINDOW_MS = 180 * 1000;
 /**
- * ⚠️ 40188（invalid scope）= 腾讯对该 openid 的授权范围判失效（风控标签），
- * 此时**任何**授权接口调用都会加固标签（HANDOVER §8 实证）。识别到就长退避 6 小时，
- * 期间本机/远程两条路都不再打授权接口，直到用户重新扫码（扫码成功会重置）。
+ * 40188 是授权范围拒绝，不能直接判为风控或所有凭据失效。
+ * 非网关入口保留6小时请求预算，拒绝后不向第三方重复授权；新扫码按世代重置。
  */
 const LOCAL_CODE_40188_BLOCK_MS = 6 * 60 * 60 * 1000;
-const localCodeCache = new Map(); // openid -> { code, at }
-const localCodeInflight = new Map(); // openid -> Promise
-const localCodeFail = new Map(); // openid -> { streak, nextAt }
+const localCodeCache = new Map(); // 世代键 -> { at }，仅记录退避时间，不存可复用 Code
+const localCodeInflight = new Map(); // openid -> 在途操作
+const localCodeFail = new Map(); // 世代键 -> { streak, nextAt }
 
-function localCodeCacheGet(openid) {
-    const hit = localCodeCache.get(openid);
-    if (!hit) return '';
-    if (Date.now() - hit.at > LOCAL_CODE_MIN_INTERVAL_MS) return '';
-    return hit.code;
-}
-
-function localCodeBlockedFor(openid) {
-    const f = localCodeFail.get(openid);
+function localCodeBlockedFor(cacheKey) {
+    const f = localCodeFail.get(cacheKey);
     if (!f) return 0;
     const left = f.nextAt - Date.now();
     return left > 0 ? left : 0;
@@ -63,201 +46,214 @@ function localCodeBlockedFor(openid) {
 
 function readLocalWxSession(wxid) {
     const openid = String(wxid || '').trim();
-    if (!openid) return null;
+    if (!openid || path.basename(openid) !== openid || /[\\/]/.test(openid)) throw new Error('微信凭据标识非法');
     const file = path.join(WX_LOGIN_DIR, `${openid}.json`);
     if (!fs.existsSync(file)) return null;
-    try {
-        const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
-        if (!rec || !rec.loginBuffer) return null;
-        return { file, rec };
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!rec || !rec.loginBuffer || (rec.openid && rec.openid !== openid)) {
+        throw Object.assign(new Error('本机微信凭据无效，请重新扫码'), { stage: 'local_credential_invalid' });
     }
-    catch {
-        return null;
-    }
+    return { file, rec };
 }
 
-/** 回写续期后的微信凭证（与 gateway-process.js::persistRefreshedWxBuffer 同字段，两边必须兼容） */
+/** 续期与扫码共用 CAS writer；写入失败必须阻止继续换码。 */
 function persistRefreshedWxBuffer(file, oldRec, refreshed) {
-    fs.writeFileSync(file, JSON.stringify({
-        ...(oldRec || {}),
-        loginBuffer: refreshed.loginBuffer,
-        refreshtoken: refreshed.refreshtoken || (oldRec && oldRec.refreshtoken) || '',
-        accesstoken: refreshed.accesstoken || (oldRec && oldRec.accesstoken) || '',
-        updatedAt: Date.now(),
-    }));
+    const { writeWxCredential } = require('../services/wx-login/credential-storage');
+    return writeWxCredential(file, refreshed, oldRec);
 }
 
-/**
- * ⭐ 失败时也要回写「已轮换的凭证」。
- * 背景（2026-10-28 定位）：`refreshLoginBuffer` 是两步请求，第1步刷 refreshtoken 成功后旧 token 即作废；
- * 第2步换 loginBuffer 失败时，新 token 只挂在 error.refreshtoken 上。调用方若只打日志，
- * 磁盘就永久停留在废 token → 每轮保活都 40188，永远无法自愈。
- */
-function persistRotatedCredentialsOnError(file, oldRec, err) {
-    try {
-        const nextRefresh = err && err.refreshtoken;
-        const nextAccess = err && err.accesstoken;
-        if (!nextRefresh && !nextAccess) return false;
-        fs.writeFileSync(file, JSON.stringify({
-            ...(oldRec || {}),
-            ...(nextRefresh ? { refreshtoken: nextRefresh } : {}),
-            ...(nextAccess ? { accesstoken: nextAccess } : {}),
-            updatedAt: Date.now(),
-        }));
-        return true;
-    }
-    catch {
-        return false;
-    }
+function assertCodeActive(options) {
+    if (options.signal?.aborted) throw options.signal.reason;
+    if (options.deadline && Date.now() >= options.deadline) throw new Error('本机换码总期限已到');
 }
 
-/** 判断是否属于「loginBuffer 需要先续期」的失败（MMTLS 握手被拒/超时） */
-function needsRefreshFirst(message) {
-    return /Unable to establish|ManualAuth rejected|超时|timeout/i.test(String(message || ''));
+// 只有服务端正面拒绝才需要先刷新 loginBuffer。WX_NATIVE_TICKET_REJECTED 属于明确的
+// 票据拒绝信号，仍保留；短链"解不出来"（ticketUnverified）不在此列，避免拿未证实的结论换票。
+function needsRefreshFirst(error) {
+    return (error?.code === 'WX_MANUAL_AUTH_REJECTED' && error.serverCode === -10)
+        || error?.code === 'WX_NATIVE_TICKET_REJECTED';
 }
 
-async function issueLocalCodeOnce(openid, wxConfig, logFn) {
+async function issueLocalCodeOnce(openid, wxConfig, logFn, options = {}, snapshot) {
+    assertCodeActive(options);
+    const local = snapshot === undefined ? readLocalWxSession(openid) : snapshot;
+    if (!local) throw Object.assign(new Error('本机没有该号微信登录会话，需先扫码'), { localSessionMissing: true });
+    const { withWxCredentialOperation } = require('../services/wx-login/credential-storage');
+    return withWxCredentialOperation(local.file, local.rec,
+        () => issueLocalCodeLocked(openid, wxConfig, logFn, options, local));
+}
+
+async function issueLocalCodeLocked(openid, wxConfig, logFn, options = {}, snapshot) {
+    assertCodeActive(options);
     const emit = typeof logFn === 'function' ? logFn : () => {};
-    const local = readLocalWxSession(openid);
+    const local = snapshot === undefined ? readLocalWxSession(openid) : snapshot;
     if (!local) {
-        throw new Error(`本机没有该号的微信登录会话（${openid}.json），需先在面板扫码一次`);
+        throw Object.assign(new Error(`本机没有该号的微信登录会话（${openid}.json），需先在面板扫码一次`), { localSessionMissing: true });
     }
-    const { file, rec } = local;
+    const { file } = local;
+    let rec = local.rec;
     const appId = String(wxConfig.appId || rec.appId || 'wx5306c5978fdb76e4').trim();
     const { WxLoginService } = require('../services/wx-login/service');
     const svc = new WxLoginService();
     const t0 = Date.now();
 
-    let session = {
-        openid: rec.openid || openid,
-        loginBuffer: rec.loginBuffer,
-        refreshtoken: rec.refreshtoken || '',
-        accesstoken: rec.accesstoken || '',
+    if (!rec.credentialGeneration) {
+        rec = persistRefreshedWxBuffer(file, rec, { credentialGeneration: crypto.randomBytes(16).toString('hex'), nativeSession: null, pendingCode: null });
+    }
+    const generation = rec.credentialGeneration;
+    const binding = `wx-login:${openid}:${generation}`;
+    const session = {
+        ...rec, openid,
+        refreshBusinessId: rec.refreshBusinessId ?? rec.refresh_business_id ?? 'pc_yyb',
+        credentialSource: rec.credentialSource ?? (rec.refreshBusinessId === 'pc_yyb_auth' ? 'pc_yyb_auth' : 'legacy_pc_yyb'),
     };
-
-    const withTimeout = (promise, label) => {
-        let timer = null;
-        return Promise.race([
-            promise,
-            new Promise((_, reject) => {
-                timer = setTimeout(
-                    () => reject(new Error(`${label}超时 ${LOCAL_CODE_TIMEOUT_MS}ms`)),
-                    LOCAL_CODE_TIMEOUT_MS);
-            }),
-        ]).finally(() => { if (timer) clearTimeout(timer); });
+    const checkCurrent = () => {
+        if (rec.credentialGeneration !== generation
+            || JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8'))) !== JSON.stringify(rec)) {
+            throw Object.assign(new Error('微信凭据已被并发更新'), { stage: 'credential_conflict' });
+        }
     };
-
+    const save = value => {
+        checkCurrent();
+        rec = persistRefreshedWxBuffer(file, rec, value);
+        return rec;
+    };
+    if (rec.nativeSession?.binding === binding && (rec.nativeSession.expiresAt === null
+        || (Number.isFinite(rec.nativeSession.expiresAt) && rec.nativeSession.expiresAt <= Date.now()))) save({ nativeSession: null });
+    const issue = () => svc.issueCode(session, appId, {
+        ...options, session: rec.nativeSession, sessionBinding: binding,
+        onSession(value) {
+            if (value?.binding !== binding) throw Object.assign(new Error('微信原生会话世代不匹配'), { stage: 'credential_conflict' });
+            save({ nativeSession: value });
+            assertCodeActive(options);
+        },
+    });
     let code = '';
     try {
-        code = await withTimeout(svc.issueCode(session, appId), '本机换码');
+        checkCurrent();
+        code = await issue();
     }
     catch (firstErr) {
-        // ⭐ 关键一步（照搬 gateway 的成熟路径）：
-        // loginBuffer 直接换码常被腾讯拒（ManualAuth rejected），但 refreshtoken 续期几乎必成功，
-        // 续期后同一 loginBuffer 就能换码。缺了这步，本机换码会一直失败（实测 2026-10-27）。
-        if (!needsRefreshFirst(firstErr.message)) throw firstErr;
-        if (!session.refreshtoken) {
-            throw new Error(`loginBuffer 被拒且无 refreshtoken 可续期（需重新扫码）: ${firstErr.message}`);
-        }
-        emit(`loginBuffer 直接换码失败，改用 refreshtoken 续期后重试: ${String(firstErr.message).slice(0, 80)}`, {
-            accountId: String((wxConfig && wxConfig._accountId) || ''),
-            openid,
-        });
-        const refreshed = await withTimeout(svc.refreshLoginBuffer(session), '微信凭证续期')
-            .catch((refreshErr) => {
-                // ⭐ 第1步 refresh 成功、第2步换 loginBuffer 失败时，error 上带着**已轮换**的新 token。
-                // 不回写 = 磁盘永久停在已作废的旧 refreshtoken（40188 永不恢复的根因）。
-                persistRotatedCredentialsOnError(file, rec, refreshErr);
-                throw refreshErr;
+        if (firstErr.stage === 'credential_conflict' || firstErr.stage === 'persist_native_session') throw firstErr;
+        assertCodeActive(options);
+        if (!needsRefreshFirst(firstErr)) throw firstErr;
+        checkCurrent();
+        emit('微信授权明确拒绝，按 accessToken 真实期限恢复 loginBuffer', { openid });
+        const expiresAt = rec.accessTokenExpiresAt;
+        if (Number.isFinite(expiresAt) && expiresAt > 0 && Date.now() >= expiresAt) {
+            const rotated = await svc.refreshCredentials(session, {
+                ...options,
+                onCredentialsRotated(value) {
+                    // 已收到的轮换响应即使赶上取消也先 CAS 落盘。
+                    save(value);
+                    assertCodeActive(options);
+                },
             });
-        if (!refreshed || !refreshed.loginBuffer) {
-            throw new Error(`refreshtoken 续期未返回有效 loginBuffer（需重新扫码）: ${firstErr.message}`);
+            assertCodeActive(options);
+            save(rotated);
+            Object.assign(session, rotated);
         }
-        persistRefreshedWxBuffer(file, rec, refreshed);
-        session = {
-            ...session,
-            loginBuffer: refreshed.loginBuffer,
-            refreshtoken: refreshed.refreshtoken || session.refreshtoken,
-            accesstoken: refreshed.accesstoken || session.accesstoken,
-        };
-        code = await withTimeout(svc.issueCode(session, appId), '续期后本机换码');
+        assertCodeActive(options);
+        const refreshed = await svc.refreshBufferWithAccessToken(session, options);
+        assertCodeActive(options);
+        if (!refreshed?.loginBuffer) throw new Error('微信续期响应未返回有效 loginBuffer');
+        save({ ...refreshed, nativeSession: null, loginBufferUpdatedAt: Date.now() });
+        Object.assign(session, refreshed);
+        code = await issue();
     }
-    if (!code) throw new Error('本机换码返回空 Code（loginBuffer 可能已失效，需重新扫码）');
-    return { code: String(code), ms: Date.now() - t0 };
+    assertCodeActive(options);
+    checkCurrent();
+    if (typeof code !== 'string' || !code) throw new Error('本机换码返回空 Code，暂不判定凭据失效');
+    return { code, generation, file, credential: rec, ms: Date.now() - t0 };
 }
 
-async function requestFarmCodeLocal(account, wxConfig, logFn) {
+async function requestFarmCodeLocal(account, wxConfig, logFn, options = {}) {
+    assertCodeActive(options);
     const emit = typeof logFn === 'function' ? logFn : () => {};
-    const openid = String((account && (account.wxid || account.openId)) || '').trim();
+    const openid = String(account && account.wxid || '').trim();
     if (!openid) throw new Error('账号缺少 wxid，无法本机换码');
 
-    // 闸 2：短窗口内复用上次换码结果（省一次握手，也降低腾讯侧高频特征）
-    const cached = localCodeCacheGet(openid);
-    if (cached) return cached;
+    // 在途操作按 openid 串行化，但一枚 Code 只能交付给一个重连。
+    const inflight = localCodeInflight.get(openid);
+    if (inflight) {
+        await inflight;
+        throw Object.assign(new Error('本机换码已交付其他重连，请勿复用一次性 Code'), { skipRemoteFallback: true });
+    }
+    const local = readLocalWxSession(openid);
+    if (local && !local.rec.credentialGeneration) {
+        local.rec = persistRefreshedWxBuffer(local.file, local.rec, { credentialGeneration: crypto.randomBytes(16).toString('hex'), nativeSession: null, pendingCode: null });
+    }
+    const cacheKey = `wx-login:${openid}:${local?.rec.credentialGeneration || 'missing'}`;
 
-    // 闸 3：失败退避期内不再握手（离线循环约 5 分钟一轮，不加退避会变成高频打授权接口）
-    const blockedMs = localCodeBlockedFor(openid);
+    // 失败退避绑定世代，新扫码不能继承旧会话冷却。
+    const blockedMs = localCodeBlockedFor(cacheKey);
     if (blockedMs > 0) {
-        throw new Error(`本机换码处于退避期，还剩 ${Math.ceil(blockedMs / 1000)}s`);
+        throw Object.assign(new Error(`本机换码处于退避期，还剩 ${Math.ceil(blockedMs / 1000)}s`), { skipRemoteFallback: true });
     }
 
     // 闸 4：「上一枚 Code 没生效」也退避。换码成功 ≠ 账号上线：
     // 缓存窗口一过又来要码，说明上一枚没让账号连上（loginBuffer 废/被风控拒），
     // 直接再握手会退化成每 60s 一次的高频特征 —— 按失败档退避。
-    const last = localCodeCache.get(openid);
+    const last = localCodeCache.get(cacheKey);
     if (last && Date.now() - last.at <= LOCAL_CODE_REISSUE_WINDOW_MS) {
-        const prev = localCodeFail.get(openid);
+        const prev = localCodeFail.get(cacheKey);
         const streak = (prev ? prev.streak : 0) + 1;
         const wait = LOCAL_CODE_BACKOFF_STEPS[Math.min(streak - 1, LOCAL_CODE_BACKOFF_STEPS.length - 1)];
-        localCodeFail.set(openid, { streak, nextAt: Date.now() + wait });
+        localCodeFail.set(cacheKey, { streak, nextAt: Date.now() + wait });
         emit(`上一枚 Code 未生效（${Math.round((Date.now() - last.at) / 1000)}s 内再次请求），退避 ${Math.round(wait / 60000)}min`, {
             accountId: String((account && account.id) || ''),
             openid,
             streak,
         });
-        throw new Error(`上一枚 Code 未生效，退避 ${Math.round(wait / 60000)} 分钟后重试`);
+        throw Object.assign(new Error(`上一枚 Code 未生效，退避 ${Math.round(wait / 60000)} 分钟后重试`), { skipRemoteFallback: true });
     }
 
-    // 闸 1：并发复用同一 Promise，避免叠加握手
-    const inflight = localCodeInflight.get(openid);
-    if (inflight) return await inflight;
-
-    const task = issueLocalCodeOnce(openid, wxConfig || {}, logFn)
+    const controller = new AbortController();
+    const abort = () => controller.abort(options.signal.reason);
+    if (options.signal) options.signal.addEventListener('abort', abort, { once: true });
+    const deadline = Math.min(options.deadline ?? Infinity, Date.now() + (options.timeoutMs ?? LOCAL_CODE_TIMEOUT_MS));
+    const stageOptions = { ...options, signal: controller.signal, deadline, timeoutMs: Math.max(0, deadline - Date.now()) };
+    const timer = setTimeout(() => controller.abort(new Error('本机换码总期限已到')), stageOptions.timeoutMs);
+    const task = issueLocalCodeOnce(openid, wxConfig || {}, logFn, stageOptions, local)
         .then((res) => {
-            localCodeFail.delete(openid);
-            localCodeCache.set(openid, { code: res.code, at: Date.now() });
+            assertCodeActive(stageOptions);
+            if (JSON.stringify(JSON.parse(fs.readFileSync(res.file, 'utf8'))) !== JSON.stringify(res.credential)) {
+                throw Object.assign(new Error('微信凭据已被并发更新，拒绝交付旧世代Code'), { stage: 'credential_conflict' });
+            }
+            localCodeFail.delete(cacheKey);
+            localCodeCache.set(`wx-login:${openid}:${res.generation}`, { at: Date.now() });
             emit(`本机换码成功（不依赖第三方取码服务，耗时 ${res.ms}ms）`, {
                 accountId: String((account && account.id) || ''),
                 openid,
                 ms: res.ms,
             });
-            return res.code;
+            return res;
         })
         .catch((err) => {
             const msg = String(err && err.message || '');
             const is40188 = /40188|invalid scope/i.test(msg);
-            const prev = localCodeFail.get(openid);
+            const prev = localCodeFail.get(cacheKey);
             const streak = (prev ? prev.streak : 0) + 1;
-            // 40188 = 风控标签：继续打任何授权接口只会加固标签（HANDOVER 实证），直接长退避 6h
+            // 授权范围拒绝后延长本入口请求预算，不推断拒绝成因。
             const wait = is40188
                 ? LOCAL_CODE_40188_BLOCK_MS
                 : LOCAL_CODE_BACKOFF_STEPS[Math.min(streak - 1, LOCAL_CODE_BACKOFF_STEPS.length - 1)];
-            localCodeFail.set(openid, { streak, nextAt: Date.now() + wait });
-            emit(`本机换码失败（第 ${streak} 次${is40188 ? '，40188 风控标签 → 退避 6h 并跳过远程兜底' : ''}，退避 ${Math.round(wait / 60000)}min）: ${msg.slice(0, 120)}`, {
+            localCodeFail.set(cacheKey, { streak, nextAt: Date.now() + wait });
+            emit(`本机换码失败（第 ${streak} 次${is40188 ? '，40188 授权范围拒绝 → 退避 6h 并跳过远程兜底' : ''}，退避 ${Math.round(wait / 60000)}min）: ${msg.slice(0, 120)}`, {
                 accountId: String((account && account.id) || ''),
                 openid,
                 streak,
                 risk40188: is40188,
             });
             if (is40188) {
-                const blocked = new Error(`微信授权被风控拒绝（40188 invalid scope），需重新扫码`);
-                blocked.skipRemoteFallback = true; // 上层据此不再打已死的远程取码服务
-                blocked.wxReloginNeeded = true;
-                throw blocked;
+                err.skipRemoteFallback = true;
+                throw err;
             }
             throw err;
         })
         .finally(() => {
+            clearTimeout(timer);
+            if (options.signal) options.signal.removeEventListener('abort', abort);
             localCodeInflight.delete(openid);
         });
     localCodeInflight.set(openid, task);
@@ -265,7 +261,8 @@ async function requestFarmCodeLocal(account, wxConfig, logFn) {
 }
 
 /** 第三方取码服务（兜底，仅在无本机会话时使用；公共域名可能随时失效） */
-async function requestFarmCodeRemote(account, wxConfig) {
+async function requestFarmCodeRemote(account, wxConfig, options = {}) {
+    assertCodeActive(options);
     const wxid = String(account && account.wxid || '').trim();
     if (!wxid) throw new Error('账号缺少 wxid，无法自动刷新 Code');
 
@@ -276,6 +273,7 @@ async function requestFarmCodeRemote(account, wxConfig) {
         const proxyApiUrl = String(wxConfig.proxyApiUrl || 'https://code.z74d.top/api').trim();
         const targetUrl = `${proxyApiUrl  }?api_key=${  encodeURIComponent(apiKey)  }&action=jslogin`;
         const response = await fetch(targetUrl, {
+            signal: options.signal,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ wxid, appid: appId }),
@@ -287,6 +285,7 @@ async function requestFarmCodeRemote(account, wxConfig) {
 
     const apiBase = String(wxConfig.apiBase || 'https://code.z74d.top/api').trim();
     const response = await fetch(`${apiBase  }/Wxapp/JSLogin`, {
+        signal: options.signal,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ Wxid: wxid, Appid: appId }),
@@ -311,6 +310,7 @@ function createAutoCodeRefreshService(deps) {
   } = deps;
 
   const scheduler = createScheduler('auto_code_refresh');
+  const operations = new Map();
 
   function getTaskName(accountId) {
     return `refresh_${  String(accountId || '')}`;
@@ -334,25 +334,38 @@ function createAutoCodeRefreshService(deps) {
     return store.getGlobalWxConfig ? store.getGlobalWxConfig() : {};
   }
 
-  async function requestFarmCode(account, wxConfig) {
+  function usesGateway(account) {
+    if (!account || process.env.FARM_NETWORK_MODE !== 'gateway') return false;
+    const configured = String(process.env.FARM_GATEWAY_ACCOUNTS || '').trim();
+    return !configured || configured.split(',').map(s => s.trim()).includes(String(account.id));
+  }
+
+  async function requestFarmCode(account, wxConfig, options) {
     // 首选本机换码（不依赖第三方取码服务）；只有本机不可用时才回退到远程服务
     try {
-      return await requestFarmCodeLocal(account, wxConfig, (msg, meta) => log('系统', msg, meta));
+      return await requestFarmCodeLocal(account, wxConfig, (msg, meta) => log('系统', msg, meta), options);
     }
     catch (localErr) {
-      // 40188 风控标签：再打任何授权接口（含远程兜底）只会加固标签，直接放弃本轮
-      if (localErr && localErr.skipRemoteFallback) throw localErr;
+      // 仅缺失本地会话允许远端兜底；写错、拒绝、取消和冷却均不能再授权。
+      if (!localErr?.localSessionMissing || localErr.skipRemoteFallback) throw localErr;
       log('系统', `本机换码不可用，回退第三方取码服务: ${localErr.message}`, {
         accountId: String(account && account.id),
         accountName: account && account.name,
       });
     }
-    return await requestFarmCodeRemote(account, wxConfig);
+    assertCodeActive(options);
+    return { code: await requestFarmCodeRemote(account, wxConfig, options) };
   }
 
   async function refreshAccountCode(accountId, reason = 'timer') {
     const account = findAccount(accountId);
     if (!account) return false;
+    // 网关是连接与滚动凭据唯一管理者。主进程不得再换码后重启 worker，
+    // 否则同一份 refreshtoken 被两进程轮换、产生旧写覆盖和重复原生握手。
+    if (usesGateway(account)) {
+      log('系统', '账号由连接网关维护凭据，跳过主进程换码', { accountId: String(accountId) });
+      return false;
+    }
 
     const wxConfig = getWxConfig();
     if (wxConfig.enabled === false) {
@@ -363,9 +376,21 @@ function createAutoCodeRefreshService(deps) {
       return false;
     }
 
+    const key = String(accountId);
+    if (operations.has(key)) return await operations.get(key).promise;
+    const controller = new AbortController();
+    const options = { signal: controller.signal, deadline: Date.now() + LOCAL_CODE_TIMEOUT_MS, timeoutMs: LOCAL_CODE_TIMEOUT_MS };
+    const timer = setTimeout(() => controller.abort(new Error('自动换码总期限已到')), options.timeoutMs);
+    const operation = { controller };
+    operations.set(key, operation);
+    operation.promise = (async () => {
     try {
-      const code = await requestFarmCode(account, wxConfig);
-      const nextAccount = { ...account, code };
+      const result = await requestFarmCode(account, wxConfig, options);
+      assertCodeActive(options);
+      if (result.file && JSON.stringify(JSON.parse(fs.readFileSync(result.file, 'utf8'))) !== JSON.stringify(result.credential)) {
+        throw Object.assign(new Error('微信凭据已被并发更新，拒绝重连旧世代Code'), { stage: 'credential_conflict' });
+      }
+      const nextAccount = { ...account, code: result.code };
       addOrUpdateAccount(nextAccount);
 
       const controls = typeof resolveWorkerControls === 'function' ? (resolveWorkerControls() || {}) : {};
@@ -386,7 +411,12 @@ function createAutoCodeRefreshService(deps) {
         accountName: account.name,
       });
       return false;
+    } finally {
+      clearTimeout(timer);
+      if (operations.get(key) === operation) operations.delete(key);
     }
+    })();
+    return await operation.promise;
   }
 
   function scheduleAccount(accountId) {
@@ -396,6 +426,7 @@ function createAutoCodeRefreshService(deps) {
     if (!cfg.enabled) return;
 
     const account = findAccount(accountId);
+    if (usesGateway(account)) return;
     if (!account || !String(account.wxid || '').trim()) {
       log('系统', '自动刷新 Code 未启动: 账号缺少 wxid', {
         accountId: String(accountId),
@@ -405,7 +436,7 @@ function createAutoCodeRefreshService(deps) {
     }
 
     scheduler.setIntervalTask(taskName, cfg.intervalMinutes * 60000, () => {
-      refreshAccountCode(accountId, 'timer');
+      return refreshAccountCode(accountId, 'timer');
     }, { preventOverlap: true });
 
     log('系统', `自动刷新 Code 已启用: ${  account.name  }，间隔 ${  cfg.intervalMinutes  } 分钟`, {
@@ -425,6 +456,8 @@ function createAutoCodeRefreshService(deps) {
 
   function stopAccount(accountId) {
     scheduler.clear(getTaskName(accountId));
+    const operation = operations.get(String(accountId));
+    if (operation) operation.controller.abort(new Error('账号自动换码已取消'));
   }
 
   return {

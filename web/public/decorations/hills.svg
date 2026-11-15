@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 320" preserveAspectRatio="none">
+  <defs>
+    <linearGradient id="hillFar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#BFD8A8" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#9CC085" stop-opacity="0.75"/>
+    </linearGradient>
+    <linearGradient id="hillMid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8FB573" stop-opacity="0.7"/>
+      <stop offset="1" stop-color="#6FA35C" stop-opacity="0.85"/>
+    </linearGradient>
+    <linearGradient id="hillNear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5E8C5A" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#4A7048" stop-opacity="0.95"/>
+    </linearGradient>
+  </defs>
+  <!-- 远山：柔和起伏 -->
+  <path fill="url(#hillFar)" d="M0,210 C180,170 360,205 540,188 C760,166 920,210 1120,192 C1280,178 1360,200 1440,188 L1440,320 L0,320 Z"/>
+  <!-- 中景丘陵 -->
+  <path fill="url(#hillMid)" d="M0,252 C220,225 380,255 600,240 C840,223 1000,260 1220,242 C1340,232 1400,250 1440,244 L1440,320 L0,320 Z"/>
+  <!-- 近景田垄 -->
+  <path fill="url(#hillNear)" d="M0,288 C260,268 520,292 780,280 C1020,269 1240,294 1440,282 L1440,320 L0,320 Z"/>
+</svg>

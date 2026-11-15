@@ -132,6 +132,7 @@ function buildSettingsPayload(store, accountId, currentUser) {
         : 30,
     goldenBugKeepCount: Number(accountConfig.goldenBugKeepCount) || 0,
     goldenBugRoundLimit: Number(accountConfig.goldenBugRoundLimit) || 24,
+    friendBadRetryDate: String(accountConfig.friendBadRetryDate || ''),
     friendBadTargets: Array.isArray(accountConfig.friendBadTargets)
       ? accountConfig.friendBadTargets
       : [],

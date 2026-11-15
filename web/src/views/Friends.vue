@@ -2,9 +2,10 @@
 import type { FriendTabKey } from '@/components/friends/FriendsTabs.vue'
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
+import { useSlidingTabs } from '@/composables/useContentMotion'
 import FriendsFriendList from '@/components/friends/FriendsFriendList.vue'
 import FriendsPageHeader from '@/components/friends/FriendsPageHeader.vue'
 import FriendsSyncSettings from '@/components/friends/FriendsSyncSettings.vue'
@@ -14,6 +15,8 @@ import { useFriendStore } from '@/stores/friend'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
 import { formatGoldAmount } from '@/utils/number-format'
+import { feedbackForResult, operationFailure } from '@/utils/operation-result'
+import type { OperationFeedback } from '@/utils/operation-result'
 
 const GID_BATCH_SEPARATOR_RE = /[,，\s]+/
 
@@ -28,6 +31,7 @@ const {
   dogInfoLoading,
   friendLands,
   friendLandsLoading,
+  friendLandsError,
   blacklist,
   interactRecords,
   interactLoading,
@@ -37,6 +41,7 @@ const {
   friendsListCacheTtlSec,
   knownFriendSettingsLoading,
   knownFriendSettingsSaving,
+  operationStates,
 } = storeToRefs(friendStore)
 const { status, loading: statusLoading, realtimeConnected, currentStatusReady } = storeToRefs(statusStore)
 
@@ -47,10 +52,18 @@ const TABS = [
 ] as const
 
 const activeTab = ref<FriendTabKey>('friends')
+const friendsContent = ref<HTMLElement | null>(null)
+const { select: selectFriendTab, selected: selectedFriendTab } = useSlidingTabs(activeTab, () => friendsContent.value,
+  () => TABS.map(tab => tab.key), () => currentAccountId.value)
 const showConfirm = ref(false)
 const confirmMessage = ref('')
 const confirmLoading = ref(false)
 const pendingAction = ref<(() => Promise<any>) | null>(null)
+let pageEpoch = 0
+let disposed = false
+const operationFeedback = ref<OperationFeedback | null>(null)
+const operationLocked = computed(() => ['pending', 'unknown'].includes(operationStates.value[String(currentAccountId.value)] || ''))
+onBeforeUnmount(() => { disposed = true; pageEpoch++ })
 const avatarErrorKeys = ref<Set<string>>(new Set())
 const searchKeyword = ref('')
 const localKnownFriendGidSyncCooldownSec = ref(300)
@@ -147,28 +160,36 @@ function openGidListModal() {
 }
 
 function confirmAction(msg: string, action: () => Promise<any>) {
+  if (confirmLoading.value)
+    return
+  const id = String(currentAccountId.value || ''), epoch = pageEpoch
   confirmMessage.value = msg
-  pendingAction.value = action
+  pendingAction.value = () => !disposed && id === String(currentAccountId.value) && epoch === pageEpoch
+    ? action() : Promise.resolve({ ok: false, stale: true, sent: false })
   showConfirm.value = true
 }
 
 async function onConfirm() {
-  if (pendingAction.value) {
-    try {
-      confirmLoading.value = true
-      await pendingAction.value()
+  if (confirmLoading.value)
+    return
+  const action = pendingAction.value
+  const id = String(currentAccountId.value || ''), epoch = pageEpoch
+  const current = () => !disposed && epoch === pageEpoch && id === String(currentAccountId.value)
+  if (!action) { showConfirm.value = false; return }
+  confirmLoading.value = true
+  try { await action() }
+  catch (error: any) {
+    if (current()) {
+      const result = operationFailure(error)
+      operationFeedback.value = feedbackForResult(result, '操作结果未确认')
     }
-    catch (e: any) {
-      toast.error(e?.message || '操作失败')
-    }
-    finally {
+  }
+  finally {
+    if (current()) {
       confirmLoading.value = false
       pendingAction.value = null
       showConfirm.value = false
     }
-  }
-  else {
-    showConfirm.value = false
   }
 }
 
@@ -240,32 +261,29 @@ const filteredInteractRecords = computed(() => {
 const visibleInteractRecords = computed(() => filteredInteractRecords.value.slice(0, 50))
 
 async function loadData() {
-  if (currentAccountId.value) {
-    const acc = currentAccount.value
-    if (!acc)
-      return
-
-    if (!realtimeConnected.value) {
-      await statusStore.fetchStatus(currentAccountId.value)
-    }
-
-    if (acc.running) {
-      avatarErrorKeys.value.clear()
-      friendStore.fetchFriends(currentAccountId.value)
-      friendStore.fetchBlacklist(currentAccountId.value)
-      friendStore.fetchInteractRecords(currentAccountId.value)
-      if (isQqAccount.value) {
-        friendStore.fetchKnownFriendSettings(currentAccountId.value)
-      }
-    }
-    loadStealPlans()
+  const id = String(currentAccountId.value || ''), epoch = pageEpoch
+  const acc = currentAccount.value
+  if (!id || !acc || disposed) return
+  const current = () => !disposed && epoch === pageEpoch && id === String(currentAccountId.value)
+  if (!realtimeConnected.value)
+    await statusStore.fetchStatus(id)
+  if (!current()) return
+  if (acc.running) {
+    avatarErrorKeys.value.clear()
+    friendStore.fetchFriends(id)
+    friendStore.fetchBlacklist(id)
+    friendStore.fetchInteractRecords(id)
+    if (isQqAccount.value)
+      friendStore.fetchKnownFriendSettings(id)
   }
+  loadStealPlans()
 }
 
 async function loadStealPlans() {
-  if (!currentAccountId.value)
-    return
-  const plans = await friendStore.fetchStealPlans(currentAccountId.value)
+  const id = String(currentAccountId.value || ''), epoch = pageEpoch
+  if (!id || disposed) return
+  const plans = await friendStore.fetchStealPlans(id)
+  if (disposed || epoch !== pageEpoch || id !== String(currentAccountId.value)) return
   stealPlans.value = {}
   for (const p of plans) {
     if (p?.gid)
@@ -337,13 +355,19 @@ useIntervalFn(() => {
 }, 1000)
 
 watch(currentAccountId, (newId, oldId) => {
+  pageEpoch++
   expandedFriends.value.clear()
+  pendingAction.value = null
+  confirmLoading.value = false
+  showConfirm.value = false
+  operationFeedback.value = null
+  stealPlans.value = {}
   if (oldId !== undefined && newId !== oldId) {
     friendStore.clearFriendData()
     statusStore.clearAccountScopedData()
   }
   loadData()
-}, { immediate: true })
+}, { immediate: true, flush: 'sync' })
 
 watch(() => [currentAccount.value?.id, currentAccount.value?.running] as const, ([id, running], [oldId, oldRunning]) => {
   if (!id)
@@ -357,7 +381,7 @@ watch(() => [currentAccount.value?.id, currentAccount.value?.running] as const, 
 })
 
 async function handleRefreshFriends() {
-  if (!currentAccountId.value)
+  if (!currentAccountId.value || operationLocked.value)
     return
   try {
     await api.post('/api/friends/clear-cache', {}, {
@@ -371,7 +395,7 @@ async function handleRefreshFriends() {
 }
 
 async function handleFetchDogInfo() {
-  if (!currentAccountId.value)
+  if (!currentAccountId.value || operationLocked.value)
     return
   if (friends.value.length === 0) {
     toast.error('好友列表为空，请先刷新好友列表')
@@ -391,13 +415,14 @@ async function handleFetchDogInfo() {
 }
 
 function toggleFriend(friendId: string) {
+  friendId = String(friendId)
   if (expandedFriends.value.has(friendId)) {
     expandedFriends.value.delete(friendId)
   }
   else {
     expandedFriends.value.clear()
     expandedFriends.value.add(friendId)
-    if (currentAccountId.value && currentAccount.value?.running) {
+    if (currentAccountId.value && currentAccount.value?.running && !operationLocked.value) {
       friendStore.fetchFriendLands(currentAccountId.value, friendId)
     }
   }
@@ -405,46 +430,31 @@ function toggleFriend(friendId: string) {
 
 async function handleOp(friendId: string, type: string, e: Event) {
   e.stopPropagation()
-  if (!currentAccountId.value)
+  if (!currentAccountId.value || operationLocked.value || confirmLoading.value)
     return
-
-  const opNames: Record<string, string> = {
-    steal: '偷取',
-    farming: '一键务农',
-    bad: '捣乱',
-  }
-
-  if (type === 'bad') {
-    confirmAction('确定对好友执行捣乱操作吗?', async () => {
-      toast.info('已在捣乱中，间隔较长，请稍后返回好友土地查看')
-      friendStore.operate(currentAccountId.value!, friendId, type)
-      return { ok: true }
-    })
-  }
-  else if (type === 'farming') {
-    confirmAction('确定对好友执行一键务农吗？将一次完成浇水、除草、除虫。', async () => {
-      const result = await friendStore.operate(currentAccountId.value!, friendId, type)
-      if (result?.ok) {
-        toast.success(result.message || '一键务农完成')
-      }
-      else {
-        toast.error(result?.message || '一键务农失败')
-      }
-      return result
-    })
-  }
-  else {
-    confirmAction(`确定对好友执行${opNames[type] || type}操作吗?`, async () => {
-      const result = await friendStore.operate(currentAccountId.value!, friendId, type)
-      if (result?.ok) {
-        toast.success(result.message || `${opNames[type] || type}完成`)
-      }
-      else {
-        toast.error(result?.message || `${opNames[type] || type}失败`)
-      }
-      return result
-    })
-  }
+  const id = String(currentAccountId.value), epoch = pageEpoch
+  const current = () => !disposed && id === String(currentAccountId.value) && epoch === pageEpoch
+  const names: Record<string, string> = { steal: '偷取', farming: '一键务农', bad: '捣乱' }
+  if (!names[type]) return
+  const target = String(friendId)
+  const message = type === 'farming' ? '将一次完成浇水、除草、除虫。' : type === 'bad' ? '间隔较长，请等待真实结果。' : ''
+  confirmAction(`确定对好友 GID ${target} 执行${names[type]}？${message}\n本次只提交一次，结果未确认时不重试。`, async () => {
+    if (!current()) return { ok: false, stale: true, sent: false }
+    operationFeedback.value = { state: 'pending', message: `${names[type]}处理中，请等待回包。`, action: type, target }
+    const result = await friendStore.operate(id, target, type)
+    if (!current() || result?.stale) return result
+    const feedback = feedbackForResult(result, `${names[type]}结果未确认`)
+    operationFeedback.value = { ...feedback, action: type, target }
+    if (feedback.state === 'success') toast.success(feedback.message)
+    else if (feedback.state === 'error') toast.error(feedback.message)
+    // Reuse the existing list refresh, but do not auto-enter the friend's
+    // farm again merely to display an animation or confirmation badge.
+    if (result?.ok === true && feedback.state !== 'unknown') {
+      try { await friendStore.fetchFriends(id) }
+      catch { if (current()) operationFeedback.value = { ...operationFeedback.value!, message: `${feedback.message}；列表刷新失败，保留当前资料。` } }
+    }
+    return result
+  })
 }
 
 async function handleToggleBlacklist(friend: any, e: Event) {
@@ -726,11 +736,18 @@ async function handleBatchAddKnownFriendGids() {
     />
 
     <FriendsTabs
-      v-model:active-tab="activeTab"
+      :active-tab="selectedFriendTab"
+      @update:active-tab="selectFriendTab"
       :tabs="TABS"
       :blacklist-count="blacklist.length"
     />
 
+    <div v-if="operationLocked || operationFeedback" class="friend-operation-feedback" :data-state="operationStates[String(currentAccountId)] === 'unknown' ? 'unknown' : operationFeedback?.state || 'pending'" role="status">
+      {{ operationStates[String(currentAccountId)] === 'unknown' ? '上次好友操作结果未确认，请核对已有日志；本账号不再重复提交或自动访问好友土地。' : operationFeedback?.message || '好友操作处理中，请等待实际结果。' }}
+    </div>
+
+    <div ref="friendsContent" class="tab-motion-viewport">
+      <div data-motion-entry>
     <div v-if="showInitialLoading" class="flex justify-center py-12">
       <div class="i-svg-spinners-90-ring-with-bg text-4xl text-blue-500" />
     </div>
@@ -811,7 +828,7 @@ async function handleBatchAddKnownFriendGids() {
             <div class="flex-1" />
             <button
               class="rounded bg-gray-100 px-3 py-1.5 text-sm text-gray-600 transition dark:bg-gray-700 hover:bg-gray-200 dark:text-gray-300 disabled:opacity-50 dark:hover:bg-gray-600"
-              :disabled="loading"
+              :disabled="loading || operationLocked"
               @click="handleRefreshFriends"
             >
               <div v-if="loading" class="i-svg-spinners-90-ring-with-bg mr-1 inline-block align-text-bottom" />
@@ -819,7 +836,7 @@ async function handleBatchAddKnownFriendGids() {
             </button>
             <button
               class="rounded bg-blue-100 px-3 py-1.5 text-sm text-blue-700 transition dark:bg-blue-900/30 hover:bg-blue-200 dark:text-blue-400 disabled:opacity-50 dark:hover:bg-blue-900/50"
-              :disabled="dogInfoLoading || friends.length === 0"
+              :disabled="operationLocked || dogInfoLoading || friends.length === 0"
               @click="handleFetchDogInfo"
             >
               <div v-if="dogInfoLoading" class="i-svg-spinners-90-ring-with-bg mr-1 inline-block align-text-bottom" />
@@ -838,6 +855,7 @@ async function handleBatchAddKnownFriendGids() {
             :expanded-friends="expandedFriends"
             :friend-lands="friendLands"
             :friend-lands-loading="friendLandsLoading"
+            :friend-lands-error="friendLandsError"
             :is-qq-account="isQqAccount"
             :can-show-friend-avatar="canShowFriendAvatar"
             :get-friend-avatar="getFriendAvatar"
@@ -847,6 +865,8 @@ async function handleBatchAddKnownFriendGids() {
             :get-friend-status-text="getFriendStatusText"
             :get-friend-status-hint="getFriendStatusHint"
             :steal-plans="stealPlans"
+            :operation-locked="operationLocked"
+            :operation-target="operationFeedback?.state === 'pending' ? operationFeedback.target : ''"
             @toggle-friend="toggleFriend"
             @operate="handleOp"
             @schedule-steal="openStealPlanModal"
@@ -1057,6 +1077,8 @@ async function handleBatchAddKnownFriendGids() {
         </div>
       </div>
     </template>
+      </div>
+    </div>
 
     <ConfirmModal
       :show="showConfirm"
@@ -1275,3 +1297,10 @@ async function handleBatchAddKnownFriendGids() {
     </Teleport>
   </div>
 </template>
+
+<style scoped>
+.friend-operation-feedback { margin: 0 0 16px; padding: 12px 14px; border: 1px solid var(--surface-border); border-left: 3px solid var(--status-info); border-radius: var(--radius-control); background: var(--surface-1); color: var(--theme-text); font-size: 13px; line-height: 1.6; }
+.friend-operation-feedback[data-state='unknown'] { border-left-color: var(--status-warning); }
+.friend-operation-feedback[data-state='success'] { border-left-color: var(--status-success); }
+.friend-operation-feedback[data-state='error'] { border-left-color: var(--status-danger); }
+</style>

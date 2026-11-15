@@ -128,6 +128,25 @@ function registerAdminFriendRoutes({
     }
   });
 
+  // 运维一次性补完旧场景清理；所有游戏状态证据由worker核验，HTTP不能强制清锁。
+  app.post("/api/friends/visit/recover", async (req, res) => {
+    if (!['admin', 'super_admin'].includes(req.currentUser?.role)) {
+      return res.status(403).json({ ok: false, error: "旧访友场景恢复需要管理员权限" });
+    }
+    const accountId = getAccountOrRespond(req, res, access);
+    if (!accountId) return;
+    const body = req.body || {};
+    if (body.dryRun === false && body.confirm !== "COMPLETE_ORIGINAL_LEAVE_ONCE") {
+      return res.status(400).json({ ok: false, error: "缺少单次离场确认", errorCode: "VISIT_RECOVERY_CONFIRMATION_REQUIRED" });
+    }
+    try {
+      const data = await provider.recoverLegacyFriendVisit(accountId, {
+        dryRun: body.dryRun !== false, evidenceId: body.evidenceId, stateSha256: body.stateSha256,
+      });
+      res.json({ ok: true, data });
+    } catch (error) { sendProviderError(res, error); }
+  });
+
   // ===== 预约偷取计划 =====
   // GET /api/steal-plans - 获取计划列表
   app.get("/api/steal-plans", (req, res) => {
@@ -161,24 +180,30 @@ function registerAdminFriendRoutes({
 
     try {
       const name = String((req.body || {}).name || "").slice(0, 60);
-      // 查询好友土地，获取最早成熟倒计时，计算执行时间 = 成熟时间 + 延迟秒数
+      // 成熟时间必须来自本次已完成的好友访问；失败、畸形数据不能默认成“立即成熟”。
+      if (!provider || typeof provider.getFriendLands !== "function") {
+        throw Object.assign(new Error("好友土地查询不可用，未创建预约计划"), { errorCode: "FRIEND_LANDS_UNAVAILABLE", sent: false });
+      }
+      const landsData = await provider.getFriendLands(accountId, gid);
+      if (!Array.isArray(landsData?.lands) || landsData?.ok === false || landsData?.resultState === 'unknown') {
+        throw Object.assign(new Error("好友土地响应不完整，未创建预约计划"), { errorCode: "FRIEND_LANDS_INVALID_RESPONSE", sent: false });
+      }
       let executeAt = 0;
       let matureInSec = -1;
-      try {
-        if (provider && typeof provider.getFriendLands === "function") {
-          const landsData = await provider.getFriendLands(accountId, gid);
-          const lands = (landsData && landsData.lands) || [];
-          for (const land of lands) {
-            const sec = Number(land && land.matureInSec);
-            if (Number.isFinite(sec) && sec > 0) {
-              if (matureInSec < 0 || sec < matureInSec) matureInSec = sec;
-            }
-          }
+      for (const land of landsData.lands) {
+        if (land?.status === "locked" || land?.status === "empty" || land?.status === "dead") continue;
+        const value = land?.matureInSec;
+        const sec = typeof value === "number" ? value : NaN;
+        if (!['growing', 'stealable', 'harvested'].includes(land?.status) || !Number.isSafeInteger(sec) || sec < 0
+          || (sec === 0 && land?.status !== "stealable" && land?.status !== "harvested")) {
+          throw Object.assign(new Error("好友作物成熟时间尚未确认，未创建预约计划"), { errorCode: "FRIEND_MATURITY_UNKNOWN", sent: false });
         }
-      } catch {
-        // 查询失败时按立即成熟处理
+        if (matureInSec < 0 || sec < matureInSec) matureInSec = sec;
       }
-      const base = matureInSec > 0 ? matureInSec : 0;
+      if (matureInSec < 0) {
+        return res.json({ ok: false, skipped: true, reason: "friend_no_crop", error: "好友暂无可确认成熟时间的作物，未创建预约计划" });
+      }
+      const base = matureInSec;
       const createdAt = Date.now();
       // 盯守时长：作物没熟 / 时间算偏时不会「错过一次就作废」，会持续重排直到该截止时间
       const watchHours = Math.max(1, Math.min(72, Number((req.body || {}).watchHours) || 24));

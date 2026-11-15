@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import BaseButton from '@/components/ui/BaseButton.vue'
+import { vSlidingTabs } from '@/composables/useContentMotion'
 
 type ShopTab = 'seed' | 'pet' | 'decoration' | 'mall' | 'mystery'
 
@@ -36,23 +37,18 @@ const tabs: Array<{ value: ShopTab, label: string }> = [
   { value: 'mystery', label: L.mystery },
 ]
 
-function tabClasses(active: boolean) {
-  return active
-    ? 'text-white shadow-sm'
-    : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700'
-}
 </script>
 
 <template>
   <div class="min-w-0 w-full flex flex-wrap items-center gap-2 xl:w-auto xl:justify-end">
     <div class="max-w-full min-w-0 w-full flex-none overflow-x-auto pb-1 xl:w-auto">
-      <div class="h-9 min-w-max inline-flex overflow-hidden border border-gray-200 rounded-lg bg-white p-0.5 dark:border-gray-700 dark:bg-gray-800">
+      <div v-sliding-tabs class="ui-tabs min-w-max" style="flex-wrap: nowrap" aria-label="商店分类">
         <button
           v-for="item in tabs"
           :key="item.value"
-          class="min-w-20 shrink-0 rounded-md px-3 text-sm font-medium transition"
-          :class="tabClasses(tab === item.value)"
-          :style="tab === item.value ? { backgroundColor: 'var(--theme-primary)' } : {}"
+          data-motion-nav
+          type="button" class="ui-tab min-w-20 shrink-0"
+          :data-active="tab === item.value" :aria-pressed="tab === item.value"
           @click="emit('update:tab', item.value)"
         >
           {{ item.label }}

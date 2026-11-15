@@ -2,16 +2,17 @@
  * 访客互动记录服务 - 获取和解析好友互动记录
  *
  * 功能：
- * - 多 RPC 路由尝试获取访客记录
+ * - 主 RPC 获取访客记录，失败停止路由并保留原错误
  * - 互动类型识别（偷取/帮忙/捣乱）
  * - 作物名称解析
  */
 const { getFruitName, getPlantByFruitId, getPlantById, getPlantName } = require('../config/gameConfig');
 const { sendMsgAsync } = require('../utils/network');
 const { types } = require('../utils/proto');
+const { throwIfRequestCancelled } = require('../utils/request-priority');
 const { logWarn, toNum, toTimeSec, sleep } = require('../utils/utils');
 
-// ---- RPC 路由候选（按优先级尝试） ----
+// ---- 主 RPC 路由（没有明确不可用码证据，不探测其他方法） ----
 
 const RPC_CANDIDATES = [
   ['gamepb.interactpb.InteractService', 'InteractRecords'],
@@ -22,7 +23,10 @@ const RPC_CANDIDATES = [
 
 // ---- 并发锁与最小间隔 ----
 
-let fetchInteractLock = false;
+let fetchInteractFlight = null;
+let resolvedRoute = RPC_CANDIDATES[0];
+// 尚无服务/方法不存在错误码证据，只调用主方法；成功后记忆实际可用路由。
+const lastRecordsByAccount = new Map();
 let lastFetchInteractTime = 0;
 
 // 两次请求最小间隔：500ms
@@ -138,17 +142,22 @@ function normalizeInteractRecord(raw, index) {
 // ---- RPC 调用 ----
 
 /**
- * 获取互动记录（多路由尝试）
+ * 获取互动记录（并发共享一次主方法调用）
  */
-async function fetchInteractReply() {
+function fetchInteractReply() {
+  if (fetchInteractFlight) return fetchInteractFlight;
+  const flight = fetchInteractReplyOnce().finally(() => {
+    if (fetchInteractFlight === flight) fetchInteractFlight = null;
+  });
+  fetchInteractFlight = flight;
+  return flight;
+}
+
+async function fetchInteractReplyOnce() {
   if (!types.InteractRecordsRequest || !types.InteractRecordsReply) {
     throw new Error('访客记录 proto 未加载');
   }
 
-  // 并发锁
-  while (fetchInteractLock) {
-    await sleep(100);
-  }
 
   // 最小间隔检查
   const now = Date.now();
@@ -157,44 +166,21 @@ async function fetchInteractReply() {
     await sleep(FETCH_INTERACT_MIN_INTERVAL_MS - elapsed);
   }
 
-  fetchInteractLock = true;
+  throwIfRequestCancelled();
   lastFetchInteractTime = Date.now();
-
+  const request = types.InteractRecordsRequest.encode(types.InteractRecordsRequest.create({})).finish();
+  const [service, method] = resolvedRoute;
   try {
-    const request = types.InteractRecordsRequest.encode(
-      types.InteractRecordsRequest.create({})
-    ).finish();
-
-    const errors = [];
-
-    for (let i = 0; i < RPC_CANDIDATES.length; i++) {
-      const [service, method] = RPC_CANDIDATES[i];
-      try {
-        // 非首个请求间隔 500ms
-        if (i > 0) await sleep(500);
-        const { body } = await sendMsgAsync(service, method, request);
-        return types.InteractRecordsReply.decode(body);
-      } catch (err) {
-        const msg = err && err.message ? err.message : String(err || 'unknown');
-        errors.push(`${service}.${method}: ${msg}`);
-
-        // 服务端返回了业务错误码（如 code=1020002 网络繁忙），
-        // 说明该接口存在于服务端但被拒绝了，不必继续尝试其他路由
-        if (msg.includes('code=')) {
-          break;
-        }
-      }
-    }
-
-    logWarn('好友', `访客记录接口调用失败: ${errors.join(' | ')}`, {
-      module: 'friend',
-      event: 'interact_records',
-      result: 'error',
+    const { body } = await sendMsgAsync(service, method, request);
+    throwIfRequestCancelled();
+    const reply = types.InteractRecordsReply.decode(body);
+    resolvedRoute = [service, method];
+    return reply;
+  } catch (error) {
+    logWarn('好友', `访客记录接口调用失败: ${service}.${method}: ${error.message}`, {
+      module: 'friend', event: 'interact_records', result: 'error',
     });
-
-    throw new Error('访客记录接口调用失败，请确认服务名和方法名是否与当前版本一致');
-  } finally {
-    fetchInteractLock = false;
+    throw error;
   }
 }
 
@@ -208,7 +194,7 @@ async function getInteractRecords() {
   const reply = await fetchInteractReply();
   const records = Array.isArray(reply && reply.records) ? reply.records : [];
 
-  return records
+  const normalized = records
     .map((raw, idx) => normalizeInteractRecord(raw, idx))
     .sort(
       (a, b) =>
@@ -216,8 +202,11 @@ async function getInteractRecords() {
         b.visitorGid - a.visitorGid ||
         b.actionType - a.actionType
     );
+  lastRecordsByAccount.set(String(process.env.FARM_ACCOUNT_ID || ''), normalized);
+  return normalized.map(record => ({ ...record }));
 }
 
 module.exports = {
   getInteractRecords,
+  getInteractRecordsCache: () => (lastRecordsByAccount.get(String(process.env.FARM_ACCOUNT_ID || '')) || null)?.map(record => ({ ...record })) ?? null,
 };

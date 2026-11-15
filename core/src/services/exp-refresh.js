@@ -35,7 +35,7 @@ function writeBackExp(exp, level) {
         const us = typeof network.getUserState === 'function' ? network.getUserState() : null;
         if (!us) return false;
         let changed = false;
-        if (exp > 0 && Number(us.exp) !== exp) { us.exp = exp; changed = true; }
+        if (Number.isSafeInteger(exp) && exp >= 0 && Number(us.exp) !== exp) { us.exp = exp; changed = true; }
         if (level > 0 && Number(us.level) !== level) { us.level = level; changed = true; }
         return changed;
     } catch {
@@ -45,8 +45,11 @@ function writeBackExp(exp, level) {
 
 /** 最小刷新间隔：3 分钟。收获通常几分钟一批，合并后不会额外放大请求。 */
 const MIN_REFRESH_GAP_MS = 3 * 60 * 1000;
-/** 单次请求超时（毫秒）——避免拖住农场主循环 */
-const REFRESH_TIMEOUT_MS = 15000;
+// 请求沿用传输层有界超时，单飞保留至真实请求结束，不制造孤儿查询。
+let connectionEpoch = 0;
+if (network.networkEvents && typeof network.networkEvents.on === 'function') {
+    network.networkEvents.on('disconnect', () => { connectionEpoch += 1; });
+}
 
 let lastRefreshAt = 0;
 let inflight = null;
@@ -68,20 +71,26 @@ async function refreshExpAfterHarvest(opts = {}) {
     // 已有请求在飞：直接复用，避免并发打同一接口
     if (inflight) return inflight;
 
-    const gid = opts.gid;
-    if (!gid) return { skipped: true, reason: 'no-gid' };
-
+    const gid = Number(opts.gid);
+    if (!Number.isSafeInteger(gid) || gid <= 0) return { skipped: true, reason: 'no-gid' };
+    if (Number(network.getUserState().gid) !== gid || !network.isConnected()) {
+        return { skipped: true, reason: 'not-current-session' };
+    }
+    const epoch = connectionEpoch;
     lastRefreshAt = now;
     inflight = (async () => {
         try {
-            const info = await Promise.race([
-                getCareerInfo(gid),
-                new Promise((_, reject) => setTimeout(
-                    () => reject(new Error(`经验刷新超时 ${REFRESH_TIMEOUT_MS}ms`)), REFRESH_TIMEOUT_MS)),
-            ]);
-            const exp = Number(info && info.exp) || 0;
+            const info = await getCareerInfo(gid);
+            if (epoch !== connectionEpoch || !network.isConnected()
+                || Number(network.getUserState().gid) !== gid || Number(info?.gid) !== gid) {
+                return { skipped: true, reason: 'session-changed' };
+            }
+            const exp = Number(info && info.exp);
             const level = Number(info && info.level) || 0;
-            if (exp > 0) {
+            if (info?.expAvailable !== true || !Number.isSafeInteger(exp) || exp < 0) {
+                return { skipped: true, reason: 'exp-not-confirmed' };
+            }
+            if (exp >= 0) {
                 // 写入 stats：updateStats 内部会触发 noteExpObservation 维护速率
                 stats.updateStats(undefined, exp);
                 // ⭐ 必须同时写回 userState，否则面板的 status.exp 不会变

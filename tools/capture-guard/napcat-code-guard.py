@@ -47,31 +47,23 @@ import urllib.error
 import urllib.request
 
 # ---- 默认配置（可被 .napcat-guard-config.json 覆盖） ----
-# 所有环境相关的值都从环境变量读取，仓库里只保留占位符与示例。
-# 部署时把它们写进 .env / 系统环境变量 / .napcat-guard-config.json 即可，
-# 不要把真实地址和口令提交回仓库。
-PANEL = os.environ.get('FARM_PANEL', 'http://127.0.0.1:3007')
-USER = os.environ.get('FARM_PANEL_USER', 'admin')
+PANEL = os.environ.get('FARM_PANEL', '')
+USER = os.environ.get('FARM_PANEL_USER', '')
 PASS = os.environ.get('FARM_PANEL_PASS', '')
-NAPCAT_BASE = os.environ.get('NAPCAT_BASE', 'http://127.0.0.1:6099')
-NAPCAT_WEBUI_PWD = os.environ.get('NAPCAT_WEBUI_PWD', '')   # 不含 .napcat 后缀，代码自动 sha256 拼接
+NAPCAT_BASE = 'http://127.0.0.1:6099'
+NAPCAT_WEBUI_PWD = os.environ.get('NAPCAT_WEBUI_PWD', '')
 NAPCAT_PLUGIN_TOKEN = os.environ.get('NAPCAT_PLUGIN_TOKEN', '')
 APP_ID = '1112386029'
-# 账号 ID → QQ 号（uin）。按需替换为你自己的映射；键是 farm 面板里的账号 id。
-ACCOUNT_UIN = {
-    '1': int(os.environ.get('FARM_ACCOUNT_1_UIN', '0') or 0),
-    '10': int(os.environ.get('FARM_ACCOUNT_10_UIN', '0') or 0),
-}
-# 去掉未配置的项，避免用 0 去切号
-ACCOUNT_UIN = {k: v for k, v in ACCOUNT_UIN.items() if v}
+ACCOUNT_UIN = {str(i): int(os.environ['FARM_ACCOUNT_' + str(i) + '_UIN'])
+    for i in (1, 10) if os.environ.get('FARM_ACCOUNT_' + str(i) + '_UIN', '').isdigit()}
 
 # ---- 补完码即"让出"指定账号（把 NapCat 登录态还给用户）----
 # 背景：farm 端账号在线是靠服务端会话维持的，注入 code 后即 running=True，
 # 并不需要本机 NapCat 持续登录该号。因此补完码后应把 NapCat 切走，
 # 释放该 QQ 号的登录态，让用户能用自己的 QQ 客户端正常登录聊天/传文件。
-# releaseAfterFix: 需要"补完即让出"的 farm 账号 id 列表（填你自己的日常号 id）
-# releaseTargetUin: 让出后 NapCat 驻留到哪个 uin（填纯 bot 号的 QQ 号）
-RELEASE_AFTER_FIX = [x for x in os.environ.get('FARM_RELEASE_AFTER_FIX', '').split(',') if x.strip()]
+# releaseAfterFix: 需要"补完即让出"的 farm 账号 id 列表（账号甲=1 是用户日常号）
+# releaseTargetUin: 让出后 NapCat 驻留到哪个 uin（默认账号乙，纯 bot 号）
+RELEASE_AFTER_FIX = ['1']
 RELEASE_TARGET_UIN = int(os.environ.get('FARM_RELEASE_TARGET_UIN', '0') or 0)
 
 # 记录"跳过补码"日志的上次时间，避免每轮刷屏（每小时最多记一次）
@@ -83,7 +75,7 @@ _last_no_drop_log = [0.0]
 # ---- 暂停补码的账号（把这些 farm 账号完全让给用户使用）----
 # 用途：当某个 QQ 号用户要亲自登录聊天/传文件时，把它从自动补码链路里摘掉，
 # 守护不再为它切号、不再重启宿主（避免黑窗频现 + 避免与用户客户端互踢）。
-# 填 farm 账号 id 列表，例如 ["1"] 表示罗辑号完全归用户，farm 不再自动补它。
+# 填 farm 账号 id 列表，例如 ["1"] 表示账号甲号完全归用户，farm 不再自动补它。
 SKIP_ACCOUNT_IDS = ['1']
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -107,15 +99,15 @@ SWITCH_FAIL_TO_MANUAL = 2          # 连续切号失败 N 次 → 标记"需人�
 STORM_WINDOW = 600.0               # 全局风暴窗口（秒）
 STORM_MAX_TRY = 6                  # 窗口内补码尝试上限（成功+失败都计）
 STORM_PAUSE = 3600.0               # 触发风暴后整体暂停（秒）
-PUSHPLUS_URL = 'http://www.pushplus.plus/send/6d26a43bb7b544c0acfa6a8815bb90e1'  # 置空则关闭推送
+PUSHPLUS_URL = os.environ.get('PUSHPLUS_URL', '')
 CIRCUIT_FILE = os.path.join(DIR, '.napcat-guard-circuit.json')
 
 # ---- 宿主自愈（NapCat webui 不可达时自动拉起宿主）----
 AUTO_RELAUNCH_HOST = True        # 总开关：宿主失联自动重拉起
 # NapCat 自启 bat（与 napcat-autostart.bat 一致，纯 ASCII，需管理员注入）
-NAPCAT_AUTOSTART_BAT = r'D:\小工具\_napcat\napcat\napcat-autostart.bat'
+NAPCAT_AUTOSTART_BAT = os.environ.get('NAPCAT_AUTOSTART_BAT', '')
 NAPCAT_QQ_PATH = r'C:\Program Files\Tencent\QQNT\QQ.exe'
-NAPCAT_DIR = r'D:\小工具\_napcat\napcat'
+NAPCAT_DIR = os.environ.get('NAPCAT_DIR', '')
 NAPSA_LAUNCH_COOLDOWN = 150.0    # 距上次拉起至少间隔秒数（避免频繁重试）
 
 # ---- 内存管控（标准版） ----
@@ -132,14 +124,14 @@ HOST_PORT = 6099
 # 面板上「QQ 扫码」标签页建的扫码任务，由本守护轮询领取：
 #   出二维码 → 等用户手机扫码 → loginWithAppId 换农场 code → 回填服务器 → 面板自动建号。
 # 服务器侧只做任务中转（本机 NapCat 在 NAT 后，服务器内存也放不下 NapCat）。
-# RELAY_TOKEN 必须与环境变量 NAPCAT_RELAY_TOKEN（或服务端同名配置）一致。
+# RELAY_TOKEN 必须与服务器 docker-compose.yml 的 NAPCAT_RELAY_TOKEN 一致。
 RELAY_ENABLED = True
 RELAY_URL = PANEL                       # 默认与面板同源
 RELAY_TOKEN = os.environ.get('NAPCAT_RELAY_TOKEN', '')
 RELAY_POLL = 3.0                        # 扫码任务处理中/扫码等待时的心跳间隔（秒，需灵敏）
 RELAY_IDLE_POLL = 30.0                  # 空闲心跳间隔（秒）：无扫码任务时，避免每 3s 刷一次面板
                                         # 背景：relay_thread 原每 3s 发一次 heartbeat≈28800 次/天，
-                                        # 全部打到远端面板造成 CF 海量短连接。
+                                        # 全部打到 Azure 面板(192.0.2.1)造成 CF 海量短连接。
                                         # 空闲时降到 30s，日请求≈2900，扫码仍保持 3s 灵敏。
 RELAY_SCAN_TIMEOUT = 150.0              # 等待用户扫码的最长时间（秒）
 RELAY_RESTORE_RESIDENT = True            # 扫码完成后把宿主切回驻留号（避免与用户客户端互踢）
@@ -435,7 +427,7 @@ def handle_singleton():
 # ---------- HTTP ----------
 # 强制绕过系统/环境代理（2026-10-14 修复）：本机开着 Clash 等代理
 # （WinINET 127.0.0.1:7897 / 环境变量 HTTP_PROXY=127.0.0.1:7899），裸
-# urllib.request.urlopen 会继承它们，导致对远端面板的请求
+# urllib.request.urlopen 会继承它们，导致对服务器面板 192.0.2.1:3007
 # 的请求被代理拦截返回 502，守护误判「面板不可达」而整条补码链路瘫痪。
 # 面板与 NapCat webui 都是直连可达的（实测直连 200 / 0.33s），故一律 no-proxy。
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -636,7 +628,7 @@ def launch_napcat_host(force=True, quick_uin=None):
     env['NAPCAT_LOAD_PATH'] = load
     env['NAPCAT_INJECT_PATH'] = inject
     env['NAPCAT_LAUNCHER_PATH'] = os.path.join(NAPCAT_DIR, 'NapCatWinBootMain.exe')
-    env['NAPCAT_MAIN_PATH'] = 'D:/小工具/_napcat/napcat/napcat.mjs'  # 正斜杠，匹配 loadNapCat.js
+    env['NAPCAT_MAIN_PATH'] = os.path.join(NAPCAT_DIR, 'napcat.mjs').replace(os.sep, '/')  # 正斜杠，匹配 loadNapCat.js
     # ⭐ 显式指定快捷登录号：绕过 getQQQuickLoginList() 冷启动为空导致的"自动登录不触发"。
     # 未显式传入时回落到 webui.json 的 autoLoginAccount（守护的 SetQuickLoginQQ 一直在维护它），
     # 与"上次切到哪个号"保持一致，避免自愈拉起后登录到意外的号。
@@ -663,6 +655,13 @@ def launch_napcat_host(force=True, quick_uin=None):
             creationflags=flags,
             close_fds=True,
             startupinfo=si)
+        # ⭐ 2026-11-06 修复：宿主的"父进程"是本守护自己，Popen 早于其余子进程返回，
+        # 此刻首次 napcat_alive() 必然 False。旧实现这里直接 return True，调用方
+        # （ensure_host_awake / switch_to_account）会把 False 当"唤醒失败"或继续往下走，
+        # 而空闲停机线程看到的 _host_busy_ts 仍是上次使用时间（可能已过 10 分钟），
+        # 于是在新宿主刚起 17 秒就把它当空闲杀掉 —— 表现为切号/清常驻等待 180s 超时，
+        # 被误记成"票据失效"并打进 manual。这里返回前必须刷新活跃时间。
+        mark_host_busy()
         log('2026-09-28 宿主自愈：已尝试拉起 NapCat 宿主（源头隐藏）')
         return True
     except Exception as e:
@@ -707,11 +706,16 @@ def ensure_host_awake(timeout=45.0):
     left = host_wake_cooldown_left()
     if left > 0:
         return napcat_alive()
-    launch_napcat_host(force=True)
+    if not launch_napcat_host(force=True):
+        return False
     mark_host_woken()
+    # ⭐ 2026-11-06：Popen 返回≠webui 就绪，而空闲停机线程可能在就绪前把新宿主判成
+    # "空闲"杀掉；等待期间持续刷新活跃时间。
     deadline = time.time() + timeout
     while time.time() < deadline:
+        mark_host_busy()
         if napcat_alive():
+            mark_host_busy()
             return True
         time.sleep(0.5)
     return napcat_alive()
@@ -730,6 +734,12 @@ def host_idle_thread():
     while not _host_thread_stop[0]:
         try:
             time.sleep(30)
+            # ⭐ 2026-11-06：正被补码/扫码占用就整轮跳过，连"是否在线"都不评估。
+            # 旧实现只在满足空闲阈值后才看占用闸门，而 _host_busy_ts 若是上一轮留下的
+            # 旧值，会在 restarts 期间直接杀掉刚拉起的宿主。
+            if _host_busy_now():
+                _host_idle_stopped_logged[0] = False
+                continue
             if not HOST_HIBERNATE:
                 continue
             # 电池供电：宿主已在主循环被停掉，这里无需再评估，拉长间隔省电
@@ -747,12 +757,18 @@ def host_idle_thread():
             if idle_s < HOST_IDLE_STOP_MIN * 60:
                 _host_idle_stopped_logged[0] = False
                 continue
-            # 正在补码/扫码绝不杀
+            # 正在补码/扫码绝不杀（上面已判过，这里为二次确认，防评估期间状态变化）
             if _host_busy_now():
                 _host_idle_stopped_logged[0] = False
                 continue
             # 距上次冷唤醒太近则再等等（避免刚拉起就杀掉）
             if host_wake_cooldown_left() > 0:
+                continue
+            # ⭐ 2026-11-06 根因修复：必须在真正停宿主前再确认一次"占用闸门"。
+            # 实测 15:24:05 拉起宿主、15:24:22（17s）就被杀：停之前若调用方还在
+            # 切号/等登录，闸门已置位，此时绝不能再杀。
+            if _host_busy_now():
+                _host_idle_stopped_logged[0] = False
                 continue
             if not _host_idle_stopped_logged[0]:
                 _host_idle_stopped_logged[0] = True
@@ -1012,7 +1028,7 @@ def panel_stop_account(token, account_id):
 #   2) 取二维码回填服务器（回传原始 qrcodeurl，服务器用 qrcode 包渲染成图片）
 #   3) 轮询 CheckLoginStatus 等用户手机扫码确认，超时前定期刷码
 #   4) 插件 loginWithAppId 直取农场 code → 回填 → 面板自动建号
-#   5) 恢复本机驻留号（默认希恩斯），把 QQ 登录态还给用户
+#   5) 恢复本机驻留号（默认账号乙），把 QQ 登录态还给用户
 #
 # 与补码主循环互斥：_relay_busy / _scan_busy 两个闸门。
 # ⚠️ 全程绝不调用 RestartNapCat（QQ 9.9.33 下会杀宿主进程树致宿主崩，见记忆）。
@@ -1117,6 +1133,9 @@ def napcat_enter_scan_mode():
     成功标志是 CheckLoginStatus 既非 isLogin 也非 isOffline（无会话）。
     兜底：插件登出不可用时，停宿主并用已清空的 autoLogin 重新拉起（宿主起来即
     未登录状态、可出二维码），**不用 RestartNapCat**。"""
+    # 本段全程要占用宿主：先刷新活跃时间，避免它刚被拉起就被空闲停机线程杀掉
+    # （2026-11-06 实测：清常驻后重启宿主，17 秒即被空闲线程误杀 → 取码等待直到超时）。
+    mark_host_busy()
     st = napcat_login_state()
     if st is None:
         return False, 'NapCat 登录状态查询失败'
@@ -1669,6 +1688,7 @@ def switch_to_account(uin):
     # 否则 SetQuickLoginQQ 会因连不上而失败，被误判"票据失效"冻结进 manual。
     if cur is None and not napcat_alive():
         log('  宿主休眠中，先唤醒再切号 target={}'.format(uin))
+        # 预热冷却时间戳，避免 ensure_host_awake 刚拉起宿主后又被首轮探测误判为"仍在冷却"
         mark_host_busy()
         if not ensure_host_awake(timeout=45.0):
             log('  唤醒宿主失败，取消本次切号')
@@ -1707,7 +1727,7 @@ def _release_account(aid):
     """补码成功后把 NapCat 登录态从该账号"让出"（用户诉求）。
 
     farm 端账号在线由服务端会话维持（注入 code 后即 running=True），本机 NapCat
-    无需持续登录该号。因此补完码后把宿主切到驻留号（默认希恩斯，纯 bot 号），
+    无需持续登录该号。因此补完码后把宿主切到驻留号（默认账号乙，纯 bot 号），
     释放该 QQ 号的登录态，用户便能用自己的 QQ 客户端正常登录聊天/传文件。
     仅对 RELEASE_AFTER_FIX 列表内的账号生效；宿主当前若已不在该号则跳过。
     """

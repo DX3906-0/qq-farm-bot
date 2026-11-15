@@ -18,7 +18,7 @@ const {
   sleep,
 } = require('../utils/utils');
 const { getUserState } = require('../utils/network');
-const { runWithRequestPriority } = require('../utils/request-priority');
+const { runWithRequestPriority, throwIfRequestCancelled } = require('../utils/request-priority');
 const {
   getPlantBlacklist,
   getFriendBlacklist,
@@ -28,6 +28,11 @@ const {
 const {
   enterFriendFarm,
   leaveFriendFarm,
+  withFriendVisitSession,
+  assertFriendVisitActive,
+  getCurrentKnownGids,
+  getFriendMutationGeneration,
+  filterCurrentFriendGids,
   getDogName,
   handleFriendEnterError,
 } = require('./friend-api');
@@ -124,16 +129,12 @@ function analyzeFriendLands(lands, myGid, friendName = '', options = {}) {
     const bugByTime = toTimeSec(currentPhase.insect_time) > 0 && toTimeSec(currentPhase.insect_time) <= serverTimeSec;
     if ((plant.insect_owners && plant.insect_owners.length > 0) || bugByTime) result.needBug.push(landId);
 
-    // Can put weed / bug (limit: max 2 owners, and we haven't put one yet)
-    if (phase !== PlantPhase.MATURE) {
-      const weedOwners = plant.weed_owners || [];
-      const bugOwners = plant.insect_owners || [];
-      const alreadyPutWeed = weedOwners.some(owner => toNum(owner) === myGid);
-      const alreadyPutBug = bugOwners.some(owner => toNum(owner) === myGid);
-
-      if (weedOwners.length < 2 && !alreadyPutWeed) result.canPutWeed.push(landId);
-      if (bugOwners.length < 2 && !alreadyPutBug) result.canPutBug.push(landId);
-    }
+    // 官方 PlantModel.canAddGrass/canAddBug：生长中且对应 owners 长度 < 1。
+    // 0 也是自然虫草占位，不能因不是自己的 GID 或只有一份就再投放。
+    const weedOwners = Array.isArray(plant.weed_owners) ? plant.weed_owners : [];
+    const bugOwners = Array.isArray(plant.insect_owners) ? plant.insect_owners : [];
+    if (weedOwners.length === 0) result.canPutWeed.push(landId);
+    if (bugOwners.length === 0) result.canPutBug.push(landId);
   }
 
   return result;
@@ -183,7 +184,7 @@ async function getFriendDogInfo(gid, friendName = '') {
     });
     // failed=true：把「查询失败」与「真的没养狗」区分开，否则批量统计会把
     // 13 个失败报成「无狗 13 个」（2026-10-22 实测的误导来源）。
-    return { dogId: 0, dogName: '无狗', failed: true };
+    throw err;
   }
 }
 
@@ -224,8 +225,10 @@ async function batchGetFriendDogInfo(friends) {
   });
 
   for (let i = 0; i < entries.length; i++) {
+    throwIfRequestCancelled();
     const entry = entries[i];
     const gid = entry.gid;
+    if (!filterCurrentFriendGids([{ gid }]).length) continue;
 
     if (blacklist.has(gid)) {
       blacklistCount++;
@@ -233,7 +236,7 @@ async function batchGetFriendDogInfo(friends) {
       continue;
     }
 
-    const dogInfo = await getFriendDogInfo(gid, entry.name);
+    const dogInfo = await withFriendVisitSession(gid, () => getFriendDogInfo(gid, entry.name));
     if (dogInfo.failed) failCount++;
     else if (dogInfo.dogId > 0) dogCount++;
     else noDogCount++;
@@ -272,6 +275,11 @@ async function batchGetFriendDogInfo(friends) {
 
 // ===== Friends list =====
 let friendsListCache = null;
+let friendsListFlight = null;
+let dogInfoFlight = null;
+let cacheGeneration = 0;
+let friendsListCachedAt = 0;
+const FRIENDS_LIST_CACHE_TTL_MS = 30 * 1000;
 // 「昵称为小小农夫」的好友集合指纹：仅在集合变化时记一次诊断日志，避免刷屏
 let lastNpcSuspectKey = '';
 
@@ -281,9 +289,22 @@ let lastNpcSuspectKey = '';
  * ⚠️ 不再按昵称剔除好友（见下方 filter 内注释）：昵称「小小农夫」可能是**真实玩家**，
  * 旧逻辑把它当假 NPC 直接删掉，导致此类好友彻底从面板消失、且自动偷取/帮忙全部跳过。
  */
-async function getFriendsList(forceRefresh = false) {
+function getFriendsList(forceRefresh = false) {
+  const options = typeof forceRefresh === 'object' && forceRefresh !== null ? { ...forceRefresh } : { force: forceRefresh === true };
+  const refresh = options.force === true;
+  if (!refresh && friendsListCache && Date.now() - friendsListCachedAt < FRIENDS_LIST_CACHE_TTL_MS) return Promise.resolve(getFriendsListCache());
+  if (friendsListFlight) return friendsListFlight;
+  const flight = getFriendsListOnce(options).finally(() => {
+    if (friendsListFlight === flight) friendsListFlight = null;
+  });
+  friendsListFlight = flight;
+  return flight;
+}
+
+async function getFriendsListOnce(options = {}) {
+  const generation = cacheGeneration;
+  const startedGids = getCurrentKnownGids();
   try {
-    if (!forceRefresh && friendsListCache) return friendsListCache;
 
     log('好友', '开始获取好友列表', {
       module: 'friend',
@@ -291,8 +312,9 @@ async function getFriendsList(forceRefresh = false) {
     });
 
     const { getAllFriends } = require('./friend-api');
-    const allFriendsReply = await getAllFriends(forceRefresh);
-    const rawFriends = allFriendsReply.game_friends || [];
+    const allFriendsReply = await getAllFriends({ ...options, discover: false });
+    throwIfRequestCancelled();
+    const rawFriends = filterCurrentFriendGids(allFriendsReply.game_friends || [], startedGids);
     const userState = getUserState();
     const accountId = process.env.FARM_ACCOUNT_ID || '';
     const dogInfoCache = accountId ? readFriendDogInfoCache(accountId) : null;
@@ -364,7 +386,10 @@ async function getFriendsList(forceRefresh = false) {
       lastNpcSuspectKey = '';
     }
 
-    friendsListCache = friends;
+    if (generation === cacheGeneration) {
+      friendsListCache = friends;
+      friendsListCachedAt = Date.now();
+    }
 
     const cachedDogCount = dogInfoCache ? Object.keys(dogInfoCache).length : 0;
     log('好友',
@@ -379,7 +404,7 @@ async function getFriendsList(forceRefresh = false) {
       }
     );
 
-    return friends;
+    return getFriendsListCache() || filterCurrentFriendGids(friends, startedGids);
   } catch (err) {
     log('好友', `获取好友列表失败: ${err.message}`, {
       module: 'friend',
@@ -387,7 +412,7 @@ async function getFriendsList(forceRefresh = false) {
       result: 'error',
       error: err.message,
     });
-    return [];
+    throw err;
   }
 }
 
@@ -395,9 +420,21 @@ async function getFriendsList(forceRefresh = false) {
  * Fetch dog info for all friends in the list.
  * Caches guard dog (护主犬, id=90021) info locally.
  */
-async function fetchFriendsDogInfo() {
+function fetchFriendsDogInfo() {
+  if (dogInfoFlight) return dogInfoFlight;
+  const flight = fetchFriendsDogInfoOnce().finally(() => {
+    if (dogInfoFlight === flight) dogInfoFlight = null;
+  });
+  dogInfoFlight = flight;
+  return flight;
+}
+
+async function fetchFriendsDogInfoOnce() {
+  const generation = cacheGeneration;
+  const startedGids = getCurrentKnownGids();
+  const mutationGeneration = getFriendMutationGeneration();
   const accountId = process.env.FARM_ACCOUNT_ID || '';
-  let friends = friendsListCache;
+  let friends = getFriendsListCache();
 
   if (!friends || friends.length === 0) {
     friends = await getFriendsList(true);
@@ -414,10 +451,12 @@ async function fetchFriendsDogInfo() {
 
   const { map: dogMap, failCount, noDogCount, dogCount, blacklistCount } = await runWithRequestPriority('background', () => batchGetFriendDogInfo(dogTargets));
 
+  throwIfRequestCancelled();
+  friends = filterCurrentFriendGids((friendsListCache || friends).map(friend => ({ ...friend })), startedGids);
   const guardDogFriends = {};
   for (const friend of friends) {
     const dogInfo = dogMap.get(friend.gid);
-    if (dogInfo) {
+    if (dogInfo && !dogInfo.failed) {
       friend.dogId = dogInfo.dogId;
       friend.dogName = dogInfo.dogName;
       friend.blacklisted = dogInfo.blacklisted || false;
@@ -430,11 +469,24 @@ async function fetchFriendsDogInfo() {
     }
   }
 
-  friendsListCache = friends;
+  const canCommit = generation === cacheGeneration && mutationGeneration === getFriendMutationGeneration()
+    && startedGids.length === getCurrentKnownGids().length
+    && startedGids.every((gid, index) => gid === getCurrentKnownGids()[index]);
+  if (canCommit) friendsListCache = friends;
 
-  // Persist guard dog info to disk cache
-  if (accountId && Object.keys(guardDogFriends).length > 0) {
-    writeFriendDogInfoCache(accountId, guardDogFriends);
+  // 没有 store 删除版本时，期间 GID 发生任何变化就拒绝旧批次提交。
+  if (accountId && canCommit) {
+    const latestDogCache = { ...(readFriendDogInfoCache(accountId) || {}) };
+    for (const friend of friends) {
+      const info = dogMap.get(friend.gid);
+      if (!info || info.failed) continue;
+      if (info.dogId === 90021) latestDogCache[friend.gid] = { dogId: info.dogId, dogName: info.dogName };
+      else delete latestDogCache[friend.gid];
+    }
+    for (const gid of Object.keys(latestDogCache)) {
+      if (!filterCurrentFriendGids([{ gid: Number(gid) }], startedGids).length) delete latestDogCache[gid];
+    }
+    if (generation === cacheGeneration) writeFriendDogInfoCache(accountId, latestDogCache);
     log('好友',
       `已保存 ${Object.keys(guardDogFriends).length} 个护主犬好友信息到本地缓存`,
       {
@@ -628,29 +680,31 @@ async function getFriendLandsDetail(gid) {
     }
 
     return { lands: detailLands, summary: analysis };
-  } catch {
-    return { lands: [], summary: {} };
+  } catch (error) {
+    throw error;
   }
 }
 
 // ===== Cache accessors =====
 
 function getFriendsListCache() {
-  return friendsListCache;
+  return friendsListCache ? filterCurrentFriendGids(friendsListCache).map(friend => ({ ...friend, plant: friend.plant ? { ...friend.plant } : null })) : null;
 }
 
 function setFriendsListCache(cache) {
-  friendsListCache = cache;
+  cacheGeneration++;
+  friendsListCachedAt = cache ? Date.now() : 0;
+  friendsListCache = cache ? filterCurrentFriendGids(cache).map(friend => ({ ...friend })) : null;
 }
 
 // ===== Exports =====
 module.exports = {
   analyzeFriendLands,
-  getFriendDogInfo,
+  getFriendDogInfo: (gid, name) => withFriendVisitSession(gid, () => getFriendDogInfo(gid, name)),
   batchGetFriendDogInfo,
   getFriendsList,
   fetchFriendsDogInfo,
-  getFriendLandsDetail,
+  getFriendLandsDetail: gid => withFriendVisitSession(gid, () => getFriendLandsDetail(gid)),
   getFriendsListCache,
   setFriendsListCache,
 };

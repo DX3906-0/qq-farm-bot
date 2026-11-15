@@ -14,6 +14,7 @@ import ShopAccountHeader from '@/components/shop/ShopAccountHeader.vue'
 import ShopEmptyState from '@/components/shop/ShopEmptyState.vue'
 import ShopTabToolbar from '@/components/shop/ShopTabToolbar.vue'
 import { createShopAvailability } from '@/composables/shop/useShopAvailability'
+import { useSlidingTabs } from '@/composables/useContentMotion'
 import { useAccountStore } from '@/stores/account'
 import { useShopStore } from '@/stores/shop'
 import { useStatusStore } from '@/stores/status'
@@ -34,6 +35,7 @@ const {
   pets,
   decorations,
   mallGoods,
+  mallCategories,
   mysteryOffer,
   loading,
   petLoading,
@@ -50,6 +52,38 @@ const {
 
 const tab = ref<'seed' | 'pet' | 'decoration' | 'mall' | 'mystery'>('seed')
 const ascending = ref(true)
+const shopContent = ref<HTMLElement | null>(null)
+const { select: selectShopTab, selected: selectedShopTab } = useSlidingTabs(tab, () => shopContent.value,
+  () => ['seed', 'pet', 'decoration', 'mall', 'mystery'], () => currentAccountId.value)
+
+// 商城品类筛选（2026-11-02）：null = 全部
+const mallCategoryFilter = ref<number | null>(null)
+
+/** 品类名：优先按商品名关键词推断，推不出就用「其他」。 */
+function getMallCategoryLabel(type: number): string {
+  const items = mallGoods.value.filter(g => g.type === type)
+  const text = items.map(g => String(g.name || '')).join(' ')
+  if (!text)
+    return type === 0 ? '未分类' : '其他'
+  if (/化肥|有机肥/.test(text)) return '化肥'
+  if (/种子/.test(text)) return '种子'
+  if (/宠物|狗|猫/.test(text)) return '宠物'
+  if (/装扮|头像|框|皮肤/.test(text)) return '装扮'
+  if (/礼包|福袋|宝箱/.test(text)) return '礼包'
+  if (/点券|金豆|钻石/.test(text)) return '货币'
+  return type === 0 ? '未分类' : '其他'
+}
+
+const filteredMallGoods = computed(() => {
+  if (mallCategoryFilter.value === null)
+    return mallGoods.value
+  return mallGoods.value.filter(g => g.type === mallCategoryFilter.value)
+})
+
+// 切换账号时重置筛选，避免停留在空分类上
+watch(() => accountStore.currentAccountId, () => {
+  mallCategoryFilter.value = null
+})
 const FERTILIZER_MALL_GOODS_IDS = new Set([1002, 1003])
 const SHOP_TABS = new Set(['seed', 'pet', 'decoration', 'mall', 'mystery'])
 const mysteryAutoBuyEnabled = ref(false)
@@ -135,7 +169,9 @@ const activeEmptyMessage = computed(() => {
     case 'mall':
       return '暂无道具商品。'
     case 'mystery':
-      return '神秘商人暂未出现，请稍后刷新看看。'
+      if (mysteryError.value) return '神秘商人状态读取失败，暂无法确认是否在期。'
+      if (mysteryLoading.value) return '正在确认神秘商人状态…'
+      return mysteryOffer.value?.statusLabel || '神秘商人暂未出现，请稍后刷新看看。'
   }
   return '暂无商品。'
 })
@@ -378,7 +414,8 @@ onMounted(() => {
         />
 
         <ShopTabToolbar
-          v-model:tab="tab"
+          :tab="selectedShopTab"
+          @update:tab="selectShopTab"
           :ascending="ascending"
           :loading="isAnyLoading"
           :disabled="!currentAccountId"
@@ -387,6 +424,8 @@ onMounted(() => {
         />
       </div>
 
+      <div ref="shopContent" class="tab-motion-viewport">
+        <div data-motion-entry>
       <div v-if="!currentAccountId" class="rounded-lg bg-gray-50 p-8 text-center text-sm text-gray-500 dark:bg-gray-900/40 dark:text-gray-400">
         请先选择账号，再查看商城。
       </div>
@@ -459,10 +498,37 @@ onMounted(() => {
         <div v-if="mallError" class="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-400">
           {{ mallError }}
         </div>
-        <ShopEmptyState v-if="!mallGoods.length" :message="activeEmptyMessage" />
+
+        <!-- 品类筛选：按服务端下发的 type 分组，商品数量随服务端变化自动跟随 -->
+        <div v-if="mallCategories.length > 1" class="flex flex-wrap items-center gap-2">
+          <button
+            class="rounded-full px-3 py-1 text-xs font-medium transition"
+            :class="mallCategoryFilter === null
+              ? 'bg-blue-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600'"
+            type="button"
+            @click="mallCategoryFilter = null"
+          >
+            全部 {{ mallGoods.length }}
+          </button>
+          <button
+            v-for="cat in mallCategories"
+            :key="cat.type"
+            class="rounded-full px-3 py-1 text-xs font-medium transition"
+            :class="mallCategoryFilter === cat.type
+              ? 'bg-blue-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600'"
+            type="button"
+            @click="mallCategoryFilter = mallCategoryFilter === cat.type ? null : cat.type"
+          >
+            {{ getMallCategoryLabel(cat.type) }} {{ cat.count }}
+          </button>
+        </div>
+
+        <ShopEmptyState v-if="!filteredMallGoods.length" :message="activeEmptyMessage" />
         <div class="grid grid-cols-[repeat(auto-fill,minmax(156px,1fr))] gap-3">
           <MallGoodsCard
-            v-for="item in mallGoods"
+            v-for="item in filteredMallGoods"
             :key="item.goodsId"
             :item="item"
             :can-afford="canAffordMall(item)"
@@ -497,6 +563,8 @@ onMounted(() => {
           @buy="confirmBuyMysteryGoods"
           @abandon="confirmAbandonMysteryMerchant"
         />
+      </div>
+        </div>
       </div>
     </div>
 

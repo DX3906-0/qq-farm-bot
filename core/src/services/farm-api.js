@@ -6,6 +6,16 @@ const { toLong, sleep, log } = require('../utils/utils');
 const NORMAL_FERTILIZER_ID = 1011;
 /** 有机化肥 ID */
 const ORGANIC_FERTILIZER_ID = 1012;
+const FARM_OPERATION_YIELD = Symbol.for('farm.manualHarvestPriority');
+
+// 成功回调先保存已完成计数，再在 RPC 完成边界让位；不打断在途请求。
+async function runFarmCall(call, options = {}, onSuccess) {
+  options.checkpoint?.();
+  const result = await call();
+  onSuccess?.(result);
+  options.checkpoint?.();
+  return result;
+}
 
 // ─── 操作次数限制回调 ───
 
@@ -81,7 +91,7 @@ async function insecticide(landIds) {
  * @param {number} fertilizerId - 化肥类型（默认普通化肥）
  * @returns {number} 成功施肥次数
  */
-async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
+async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID, options = {}) {
   let successCount = 0;
   for (const landId of landIds) {
     try {
@@ -89,14 +99,18 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
         land_ids: [toLong(landId)],
         fertilizer_id: toLong(fertilizerId)
       })).finish();
-      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload);
-      successCount++;
-    } catch {
+      await runFarmCall(() => sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload), options, () => {
+        successCount++;
+        options.onSuccess?.(landId);
+      });
+    } catch (err) {
+      if (err === FARM_OPERATION_YIELD) throw err;
+      options.onError?.(err);
       break;
     }
     // 多地施肥时加入间隔避免请求过快
     if (landIds.length > 1) {
-      await sleep(200, 600);
+      await (options.delay || sleep)(200, 600);
     }
   }
   return successCount;
@@ -176,6 +190,8 @@ async function buyGoods(goodsId, num, price) {
 }
 
 module.exports = {
+  FARM_OPERATION_YIELD,
+  runFarmCall,
   NORMAL_FERTILIZER_ID,
   ORGANIC_FERTILIZER_ID,
   setOperationLimitsCallback,

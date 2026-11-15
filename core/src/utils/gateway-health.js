@@ -10,11 +10,21 @@ function evaluateGatewayHealth(input = {}) {
   const oldestPendingAgeMs = Math.max(0, Number(input.oldestPendingAgeMs) || 0);
   const heartbeatLimitMs = Math.max(1000, Number(input.heartbeatLimitMs) || 30000);
   const pendingLimitMs = Math.max(1000, Number(input.pendingLimitMs) || 5000);
+  const businessAgeMs = Math.max(0, Number(input.businessAgeMs) || 0);
+  const businessLimitMs = Math.max(1000, Number(input.businessLimitMs) || 210000);
 
-  if (!connected) return { healthy: false, reason: 'disconnected' };
-  if (heartbeatAgeMs > heartbeatLimitMs) return { healthy: false, reason: 'heartbeat_stale' };
-  if (oldestPendingAgeMs > pendingLimitMs) return { healthy: false, reason: 'request_stuck' };
-  return { healthy: true, reason: 'ok' };
+  const linkHealthy = connected && heartbeatAgeMs <= heartbeatLimitMs;
+  const businessHealthy = connected && input.businessObserved !== false
+    && input.businessDegraded !== true && oldestPendingAgeMs <= pendingLimitMs
+    && businessAgeMs <= businessLimitMs;
+  const result = (healthy, reason) => ({ healthy, reason, linkHealthy, businessHealthy });
+  if (!connected) return result(false, 'disconnected');
+  if (!linkHealthy) return result(false, 'heartbeat_stale');
+  if (input.businessObserved === false) return result(false, 'business_unobserved');
+  if (input.businessDegraded === true) return result(false, 'business_degraded');
+  if (businessAgeMs > businessLimitMs) return result(false, 'business_stale');
+  if (oldestPendingAgeMs > pendingLimitMs) return result(false, 'request_stuck');
+  return result(true, 'ok');
 }
 
 function nextBusinessBackoffMs(previousMs = 0, minimumMs = 30000, maximumMs = 60000) {

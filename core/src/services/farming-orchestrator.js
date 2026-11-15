@@ -1,12 +1,13 @@
-const { CONFIG } = require('../config/config');
+const { CONFIG, PlantPhase } = require('../config/config');
 const { getUserState, isConnected, networkEvents } = require('../utils/network');
-const { toNum, log, logWarn, randomDelay } = require('../utils/utils');
+const { runWithRequestPriority } = require('../utils/request-priority');
+const { toNum, log, logWarn } = require('../utils/utils');
 const { isAutomationOn, getAutomation, getPrioritize2x2Crops, getHarvestPacing, setHarvestPacing } = require('../models/store');
 const { getCanGetHelpExp } = require('./friend-operation-limits');
 const { recordOperation } = require('./stats');
 const { createScheduler } = require('./scheduler');
 const { getAllLands, harvest, farming, unlockLand, upgradeLand } = require('./farm-api');
-const { analyzeLands, resolveRemovableHarvestedLands } = require('./farm-land-analyzer');
+const { analyzeLands, resolveRemovableHarvestedLands, getCurrentPhase, buildLandMap } = require('./farm-land-analyzer');
 const { runFertilizerByConfig } = require('./farm-fertilizer');
 const { autoPlantEmptyLands } = require('./planting-service');
 const { startFertilizerBuyCheckTimer, stopFertilizerBuyCheckTimer } = require('./farm-scheduler');
@@ -56,6 +57,75 @@ const UNIFIED_WAIT_LOG_FALLBACK_MS = 10 * 60 * 1000;
 const UNIFIED_MAX_WAIT_MS = 6 * 60 * 60 * 1000;
 
 const farmScheduler = createScheduler('farm');
+
+// 每个账号 worker 独立持有队列。只在已完成的调用边界让位，绝不打断在途 RPC。
+const farmOperationQueue = [];
+let farmOperationRunning = false;
+let wakeFarmOperation = null;
+const MANUAL_FARM_PRIORITY = Symbol.for('farm.manualHarvestPriority');
+const harvestedCycles = new Map();
+
+function harvestCycle(land) {
+  const plant = land && land.plant;
+  const phase = plant && plant.phases && plant.phases[0];
+  return `${toNum(plant && plant.id)}:${toNum(plant && plant.season)}:${String(phase && phase.begin_time || 0)}`;
+}
+
+function hasPendingManualHarvest() {
+  return farmOperationQueue.some(item => item.manualHarvest);
+}
+
+function farmOperationResult(state) {
+  return {
+    hadWork: state.actions.length > 0,
+    actions: state.actions,
+    success: state.actions.length > 0 && state.errors.length === 0,
+    harvestedLands: state.harvestedLands,
+    errors: state.errors,
+  };
+}
+
+async function drainFarmOperations() {
+  if (farmOperationRunning) return;
+  farmOperationRunning = true;
+  try {
+    while (farmOperationQueue.length > 0) {
+      const priorityIndex = farmOperationQueue.findIndex(item => item.manualHarvest);
+      const [item] = farmOperationQueue.splice(priorityIndex >= 0 ? priorityIndex : 0, 1);
+      const state = { actions: [], harvestedLands: [], errors: [] };
+      const checkpoint = () => {
+        if (item.source === 'auto' && hasPendingManualHarvest()) throw MANUAL_FARM_PRIORITY;
+      };
+      const delay = async (min, max) => {
+        checkpoint();
+        if (item.manualHarvest) return;
+        // 仅取消人为 timer，始终等待真实 RPC 完成。
+        await new Promise(resolve => {
+          const finish = () => {
+            clearTimeout(timer);
+            wakeFarmOperation = null;
+            resolve();
+          };
+          const timer = setTimeout(finish, min + Math.floor(Math.random() * (max - min + 1)));
+          wakeFarmOperation = finish;
+        });
+        checkpoint();
+      };
+      try {
+        await runWithRequestPriority(item.source === 'auto' ? 'farm' : 'foreground', () =>
+          executeFarmOperation(item.opType, item.source, state, checkpoint, delay));
+        item.resolve(farmOperationResult(state));
+      } catch (err) {
+        if (err === MANUAL_FARM_PRIORITY) item.resolve(farmOperationResult(state));
+        else item.reject(err);
+      } finally {
+        if (state.upgradedCount) recordOperation('upgrade', state.upgradedCount);
+      }
+    }
+  } finally {
+    farmOperationRunning = false;
+  }
+}
 
 // ─── 延迟收获「静默去抖 + 上限」节奏工具 ───
 
@@ -130,7 +200,7 @@ async function checkFarm() {
 
   isCheckingFarm = true;
   try {
-    const result = await runFarmOperation('all');
+    const result = await runFarmOperation('all', { source: 'auto' });
     isFirstFarmCheck = false;
     return !!(result && result.hadWork);
   } catch (err) {
@@ -146,16 +216,36 @@ async function checkFarm() {
 /**
  * 执行农场操作
  * @param {string} opType - 操作类型：'all' | 'harvest' | 'plant' | 'clear' | 'upgrade'
+ * @param {{ source?: 'manual' | 'auto' }} options - 外部操作默认手动；巡田显式传 auto。
  */
-async function runFarmOperation(opType) {
+function runFarmOperation(opType, options = {}) {
+  const source = options.source === 'auto' ? 'auto' : 'manual';
+  const manualHarvest = source === 'manual' && (opType === 'all' || opType === 'harvest');
+  return new Promise((resolve, reject) => {
+    farmOperationQueue.push({ opType, source, manualHarvest, resolve, reject });
+    if (manualHarvest && wakeFarmOperation) wakeFarmOperation();
+    void drainFarmOperations();
+  });
+}
+
+async function executeFarmOperation(opType, source, state, checkpoint, delay) {
+  checkpoint();
   const landsReply = await getAllLands();
+  checkpoint();
   if (!landsReply.lands || landsReply.lands.length === 0) {
     if (opType !== 'all') log('农场', '没有土地数据');
-    return { hadWork: false, actions: [] };
+    return farmOperationResult(state);
   }
 
   const lands = landsReply.lands;
   const analysis = analyzeLands(lands, isFirstFarmCheck);
+  const landMap = buildLandMap(lands);
+  for (const [id, cycle] of harvestedCycles) {
+    const land = landMap.get(id);
+    if (land && harvestCycle(land) !== cycle) harvestedCycles.delete(id);
+  }
+  analysis.harvestable = [...new Set(analysis.harvestable.map(toNum).filter(Boolean))]
+    .filter(id => harvestedCycles.get(id) !== harvestCycle(landMap.get(id)));
   const labels = [];
 
   // 构建状态标签
@@ -170,10 +260,35 @@ async function runFarmOperation(opType) {
   if (analysis.upgradable.length) labels.push(`升:${  analysis.upgradable.length}`);
   labels.push(`长:${  analysis.growing.length}`);
 
-  const actions = [];
+  const { actions } = state;
+  const cooperative = {
+    checkpoint, delay,
+    onError: (err, operation = 'plant') => state.errors.push({ operation, message: err.message }),
+    onRemoved: count => {
+      state.removedCount = (state.removedCount || 0) + count;
+      const index = actions.findIndex(action => /^铲除\d+$/.test(action));
+      if (index < 0) actions.push(`铲除${count}`);
+      else actions[index] = `铲除${state.removedCount}`;
+    },
+    onPlanted: count => {
+      state.plantedCount = (state.plantedCount || 0) + count;
+      const index = actions.findIndex(action => /^种植\d+$/.test(action));
+      if (index < 0) actions.push(`种植${count}`);
+      else actions[index] = `种植${state.plantedCount}`;
+      recordOperation('plant', count);
+    },
+    onFertilized: type => {
+      const label = type === 'organic' ? '有机肥' : '普通肥';
+      state[type] = (state[type] || 0) + 1;
+      const index = actions.findIndex(action => action.startsWith(label));
+      if (index < 0) actions.push(`${label}1`);
+      else actions[index] = `${label}${state[type]}`;
+    },
+  };
 
   // ── 一键务农（浇水/除草/除虫）──
-  if (opType === 'all' || opType === 'clear') {
+  async function performFarming() {
+    if (opType !== 'all' && opType !== 'clear') return;
     // 不除自己草虫：默认「总是跳过」(skip_own_weed_bug)；
     // 若开启「经验满不除自己草虫」(skip_own_weed_bug_when_exp_full)，则当帮助经验已达上限
     // (getCanGetHelpExp 为 false，与好友「经验满只帮护主犬」同一状态) 时才跳过，未达上限仍照常除。
@@ -190,6 +305,7 @@ async function runFarmOperation(opType) {
     const farmingLandIds = [...new Set([...ordinaryLandIds, ...goldenBugLandIds])];
 
     if (farmingLandIds.length > 0) {
+      checkpoint();
       try {
         await farming(farmingLandIds);
         const parts = [];
@@ -209,19 +325,78 @@ async function runFarmOperation(opType) {
         }
         actions.push(`一键务农${parts.join('/')}`);
         recordOperation('farming', farmingLandIds.length);
-      } catch (err) { logWarn('一键务农', err.message); }
+      } catch (err) {
+        state.errors.push({ operation: 'farming', message: err.message });
+        logWarn('一键务农', err.message);
+      }
+      checkpoint();
     }
   }
+  if (source === 'auto') await performFarming();
 
   // ── 收获 ──
   let harvestedLands = [];
   let harvestResult = null;
   let removeResult = null;
 
+  async function collectHarvest(ids, message, reason) {
+    checkpoint();
+    try {
+      const reply = await harvest(ids);
+      if (!reply || reply.success === false) throw new Error('收获失败，未返回成功响应');
+      const replyMap = buildLandMap(reply.land);
+      if (ids.some(id => !replyMap.has(id))) {
+        try {
+          const fresh = await getAllLands();
+          for (const land of fresh.lands || []) {
+            const id = toNum(land.id);
+            if (!replyMap.has(id)) replyMap.set(id, land);
+          }
+        } catch (err) {
+          logWarn('收获', `收获结果补拉失败: ${err.message}`);
+        }
+      }
+      const confirmed = ids.filter(id => {
+        const land = replyMap.get(id);
+        if (!land) return false;
+        const plant = land.plant;
+        if (!plant || !Array.isArray(plant.phases) || plant.phases.length === 0) return true;
+        const phase = getCurrentPhase(plant.phases, false, '', plant.id);
+        return phase && phase.phase !== PlantPhase.UNKNOWN && (
+          phase.phase !== PlantPhase.MATURE ||
+          harvestCycle(land) !== harvestCycle(landMap.get(id)) ||
+          toNum(plant.fruit_num) < toNum(landMap.get(id)?.plant?.fruit_num)
+        );
+      });
+      if (confirmed.length !== ids.length) {
+        state.errors.push({ operation: 'harvest', message: '部分地块未确认收获成功',
+          landIds: ids.filter(id => !confirmed.includes(id)) });
+      }
+      if (confirmed.length === 0) return;
+      harvestResult = { ...reply, land: [...replyMap.values()] };
+      harvestedLands = confirmed;
+      state.harvestedLands.push(...confirmed);
+      for (const id of confirmed) harvestedCycles.set(id, harvestCycle(landMap.get(id)));
+      actions.push(`收获${confirmed.length}`);
+      recordOperation('harvest', confirmed.length);
+      scheduleExpRefresh('一键收获');
+      log('收获', `${message} ${confirmed.length} 块土地`, {
+        module: 'farm', event: '收获作物', result: 'ok',
+        count: confirmed.length, landIds: confirmed, reason,
+      });
+      networkEvents.emit('farmHarvested', { count: confirmed.length, landIds: [...confirmed], opType });
+    } catch (err) {
+      state.errors.push({ operation: 'harvest', message: err.message });
+      logWarn('收获', err.message, { module: 'farm', event: '收获作物', result: 'error' });
+    }
+    checkpoint();
+  }
+
   if (opType === 'all' || opType === 'harvest') {
+    checkpoint();
     const now = Date.now();
-    const delayMin = toNum(getAutomation()?.harvest_delay_min || 0);
-    const unifiedActive = isUnifiedHarvestActive();
+    const delayMin = source === 'auto' ? toNum(getAutomation()?.harvest_delay_min || 0) : 0;
+    const unifiedActive = source === 'auto' && isUnifiedHarvestActive();
 
     // ── 统一时间收获：先等「当前所有土地中最后一块地成熟」 ──
     // lastMatureAt=0 表示已经没有在长的作物，无需再等。
@@ -307,28 +482,10 @@ async function runFarmOperation(opType) {
 
         if (silenceMet || capMet) {
           // 到点 → 一键收全部（is_all 自动含期间新成熟的）
-          try {
-            harvestResult = await harvest(currentIds);
-            log('收获', capMet ? `到达留田上限 ${delayMin + 30}min，强制一键收获 ${currentIds.length} 块`
-                               : `静默 ${Math.round(pendingSilenceSec / 60)}min 无新成熟，一键收获 ${currentIds.length} 块`, {
-              module: 'farm', event: '收获作物', result: 'ok',
-              count: currentIds.length, landIds: currentIds, reason: capMet ? 'cap' : 'silence'
-            });
-            actions.push(`收获${currentIds.length}`);
-            recordOperation('harvest', currentIds.length);
-            scheduleExpRefresh('一键收获');
-            harvestedLands = [...currentIds];
-
-            networkEvents.emit('farmHarvested', {
-              count: currentIds.length,
-              landIds: [...currentIds],
-              opType
-            });
-          } catch (err) {
-            logWarn('收获', err.message, { module: 'farm', event: '收获作物', result: 'error' });
-            // 收割失败不清空 pacing，下轮重试（此时 silenceMet/capMet 仍满足）
-          }
-          if (harvestResult) {
+          await collectHarvest(currentIds, capMet
+            ? `到达留田上限 ${delayMin + 30}min，强制一键收获`
+            : `静默 ${Math.round(pendingSilenceSec / 60)}min 无新成熟，一键收获`, capMet ? 'cap' : 'silence');
+          if (harvestedLands.length === currentIds.length) {
             setHarvestPacing(null);   // 清空节奏，进入下一周期（重新抖动）
           }
         } else {
@@ -354,36 +511,20 @@ async function runFarmOperation(opType) {
           }
         }
       } else {
-        // 未开启延迟（delay_min=0）：保持老行为，立即一键收获
-        try {
-          harvestResult = await harvest(analysis.harvestable);
-          log('收获', unifiedActive
-            ? `统一时间收获：全部作物已成熟，一键收获 ${analysis.harvestable.length} 块土地`
-            : `收获完成 ${analysis.harvestable.length} 块土地`, {
-            module: 'farm', event: '收获作物', result: 'ok',
-            count: analysis.harvestable.length, landIds: [...analysis.harvestable],
-            ...(unifiedActive ? { reason: 'unified' } : {})
-          });
-          actions.push(`收获${analysis.harvestable.length}`);
-          recordOperation('harvest', analysis.harvestable.length);
-          scheduleExpRefresh('农场循环收获');
-          harvestedLands = [...analysis.harvestable];
-
-          networkEvents.emit('farmHarvested', {
-            count: analysis.harvestable.length,
-            landIds: [...analysis.harvestable],
-            opType
-          });
-        } catch (err) {
-          logWarn('收获', err.message, { module: 'farm', event: '收获作物', result: 'error' });
-        }
-        // 统一时间收获是一次性任务：收完就退出，回到常规节奏
-        if (harvestResult && unifiedActive) {
+        // 手动只收已成熟地块，不读取或清空自动收获节奏。
+        await collectHarvest(currentIds, unifiedActive
+          ? '统一时间收获：全部作物已成熟，一键收获'
+          : '收获完成', source === 'manual' ? 'manual' : unifiedActive ? 'unified' : 'auto');
+        // 自动统一时间收获是一次性任务：全部收完才退出。
+        if (harvestedLands.length === currentIds.length && unifiedActive) {
           setHarvestPacing(null);
         }
       }
     }
   }
+
+  if (source === 'manual') await performFarming();
+  checkpoint();
 
   // ── 种植 ──
   if (opType === 'all' || opType === 'plant') {
@@ -392,29 +533,31 @@ async function runFarmOperation(opType) {
 
     // 收获后检查可铲除的地块
     if (opType === 'all' && harvestedLands.length > 0) {
-      await randomDelay(200, 800);
+      await delay(200, 800);
       removeResult = await resolveRemovableHarvestedLands(harvestedLands, harvestResult);
+      checkpoint();
       deadLands = [...new Set([...deadLands, ...removeResult.removable])];
     }
 
     const shouldRefresh2x2 = shouldRefresh2x2Plan && getPrioritize2x2Crops();
     if (deadLands.length > 0 || emptyLands.length > 0 || shouldRefresh2x2) {
+      checkpoint();
       try {
-        const plantResult = await autoPlantEmptyLands(deadLands, emptyLands, lands);
+        const beforeRemoved = state.removedCount || 0;
+        const beforePlanted = state.plantedCount || 0;
+        const plantResult = await autoPlantEmptyLands(deadLands, emptyLands, lands, cooperative);
         const removedCount = Number(plantResult && plantResult.removedCount) || 0;
         const plantedCount = Number(plantResult && (plantResult.occupiedCount || plantResult.plantedCount)) || 0;
-        if (removedCount > 0) {
-          actions.push(`铲除${  removedCount}`);
-        }
-        if (plantedCount > 0) {
-          actions.push(`种植${  plantedCount}`);
-          recordOperation('plant', plantedCount);
-        }
+        if (removedCount > 0 && (state.removedCount || 0) === beforeRemoved) cooperative.onRemoved(removedCount);
+        if (plantedCount > 0 && (state.plantedCount || 0) === beforePlanted) cooperative.onPlanted(plantedCount);
+        shouldRefresh2x2Plan = false;
       } catch (err) {
+        if (err === MANUAL_FARM_PRIORITY) throw err;
+        state.errors.push({ operation: 'plant', message: err.message });
         logWarn('种植', err.message);
-      } finally {
         shouldRefresh2x2Plan = false;
       }
+      checkpoint();
     }
   }
 
@@ -430,9 +573,12 @@ async function runFarmOperation(opType) {
         module: 'farm', event: '多季节施肥', result: 'trigger',
         count: multiSeasonLands.length, landIds: multiSeasonLands
       });
+      checkpoint();
       try {
-        await runFertilizerByConfig(multiSeasonLands, { reason: 'multi_season' });
+        await runFertilizerByConfig(multiSeasonLands, { ...cooperative, reason: 'multi_season' });
       } catch (err) {
+        if (err === MANUAL_FARM_PRIORITY) throw err;
+        state.errors.push({ operation: 'fertilize', message: err.message });
         logWarn('施肥', `多季补肥执行失败: ${err.message}`, {
           module: 'farm', event: '多季节施肥', result: 'error'
         });
@@ -440,66 +586,71 @@ async function runFarmOperation(opType) {
     }
   }
 
+  checkpoint();
   // ── 土地升级/解锁 ──
   const shouldUpgrade = opType === 'all' && isAutomationOn('land_upgrade');
   if (shouldUpgrade || opType === 'upgrade') {
     // 解锁土地
     if (analysis.unlockable.length > 0) {
-      let unlockedCount = 0;
       for (const landId of analysis.unlockable) {
+        checkpoint();
         try {
           await unlockLand(landId, false);
           log('解锁', `土地#${landId} 解锁成功`, {
             module: 'farm', event: '解锁土地', result: 'ok', landId
           });
-          unlockedCount++;
+          const index = actions.findIndex(action => /^解锁\d+$/.test(action));
+          if (index < 0) actions.push('解锁1');
+          else actions[index] = `解锁${Number(actions[index].slice(2)) + 1}`;
         } catch (err) {
+          state.errors.push({ operation: 'unlock', message: err.message, landId });
           logWarn('解锁', `土地#${landId} 解锁失败: ${err.message}`, {
             module: 'farm', event: '解锁土地', result: 'error', landId
           });
         }
-        await randomDelay(200, 500);
+        await delay(200, 500);
       }
-      if (unlockedCount > 0) actions.push(`解锁${  unlockedCount}`);
     }
 
     // 升级土地
     if (analysis.upgradable.length > 0) {
-      let upgradedCount = 0;
       for (const landId of analysis.upgradable) {
+        checkpoint();
         try {
           const result = await upgradeLand(landId);
           const newLevel = result.land ? toNum(result.land.level) : '?';
           log('升级', `土地#${landId} 升级成功 → 等级${newLevel}`, {
             module: 'farm', event: '升级土地', result: 'ok', landId, level: newLevel
           });
-          upgradedCount++;
+          const index = actions.findIndex(action => /^升级\d+$/.test(action));
+          if (index < 0) actions.push('升级1');
+          else actions[index] = `升级${Number(actions[index].slice(2)) + 1}`;
+          state.upgradedCount = (state.upgradedCount || 0) + 1;
         } catch (err) {
+          state.errors.push({ operation: 'upgrade', message: err.message, landId });
           log('升级', `土地#${landId} 升级失败: ${err.message}`, {
             module: 'farm', event: '升级土地', result: 'error', landId
           });
         }
-        await randomDelay(200, 500);
-      }
-      if (upgradedCount > 0) {
-        actions.push(`升级${  upgradedCount}`);
-        recordOperation('upgrade', upgradedCount);
+        await delay(200, 500);
       }
     }
   }
 
+  checkpoint();
   // ── 智能施肥（巡田时触发）──
   if (opType === 'all') {
     const fertilizerMode = getAutomation().fertilizer || 'none';
     if (fertilizerMode === 'smart' || fertilizerMode === 'smart_only' || fertilizerMode === 'smart_normal' ||
         fertilizerMode === 'final_normal' || fertilizerMode === 'final_organic') {
       try {
-        const fertResult = await runFertilizerByConfig([], { skipNormal: true });
-        if (fertResult.organic > 0) actions.push(`有机肥${  fertResult.organic}`);
-        else if (fertResult.normal > 0) actions.push(`普通肥${  fertResult.normal}`);
+        await runFertilizerByConfig([], { ...cooperative, skipNormal: true });
       } catch (err) {
+        if (err === MANUAL_FARM_PRIORITY) throw err;
+        state.errors.push({ operation: 'fertilize', message: err.message });
         logWarn('施肥', `巡田时施肥失败: ${err.message}`);
       }
+      checkpoint();
     }
   }
 
@@ -511,7 +662,7 @@ async function runFarmOperation(opType) {
     });
   }
 
-  return { hadWork: actions.length > 0, actions };
+  return farmOperationResult(state);
 }
 
 // ── 定时巡田循环 ──

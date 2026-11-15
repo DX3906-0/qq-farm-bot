@@ -49,6 +49,9 @@ function createDataProvider(deps) {
 
     // 超时配置
     const FRIEND_TIMEOUT = { _timeoutMs: 180000 };       // 3分钟
+    // 好友土地要完成排队 + Enter + Leave；不能被默认10秒截断，也不能当普通安全读重放。
+    const FRIEND_LANDS_TIMEOUT = { _timeoutMs: 90000 };
+    const MYSTERY_SHOP_TIMEOUT = { _timeoutMs: 60000 };
     const SYNC_TIMEOUT = { _timeoutMs: 180000 };          // 3分钟
     const DOG_INFO_TIMEOUT = { _timeoutMs: 600000 };     // 10分钟
 
@@ -141,9 +144,18 @@ function createDataProvider(deps) {
         getSeeds: (ref) => callWorkerApi(resolveAccountId(ref), 'getSeeds'),
         getBag: (ref) => callWorkerApi(resolveAccountId(ref), 'getBag'),
         // 装扮/皮肤：读概览 + 手动换装
-        getSkins: (ref) => callWorkerApi(resolveAccountId(ref), 'getSkins'),
-        // 换装是写操作，游戏侧回包比读接口慢，放宽到 60s（默认 10s 会超时）
-        equipSkin: (ref, skinId, slotType) => callWorkerApi(resolveAccountId(ref), 'equipSkin', skinId, slotType, { _timeoutMs: 60000 }),
+        getSkins: (ref) => callWorkerApi(resolveAccountId(ref), 'getSkins', { _timeoutMs: 65000 }),
+        // 多阶段确认的游戏scope上限60s；IPC/HTTP留余量，不提前误判在途结果。
+        equipSkin: (ref, skinId, slotType, expected) => callWorkerApi(resolveAccountId(ref), 'equipSkin', skinId, slotType, expected, { _timeoutMs: 65000 }),
+        getAvatarFrames: (ref) => callWorkerApi(resolveAccountId(ref), 'getAvatarFrames', { _timeoutMs: 65000 }),
+        operateAvatarFrame: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'operateAvatarFrame', action, input, { _timeoutMs: 65000 }),
+        getSolarTermsInfo: (ref) => callWorkerApi(resolveAccountId(ref), 'getSolarTermsInfo', { _timeoutMs: 65000 }),
+        getSolarCalendar: (ref) => callWorkerApi(resolveAccountId(ref), 'getSolarCalendar', { _timeoutMs: 65000 }),
+        getSolarQuestion: (ref, id) => callWorkerApi(resolveAccountId(ref), 'getSolarQuestion', id, { _timeoutMs: 65000 }),
+        operateSolarCalendar: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'operateSolarCalendar', action, input, { _timeoutMs: 65000 }),
+        setItemsLocked: (ref, itemUids, locked) => callWorkerApi(resolveAccountId(ref), 'setItemsLocked', itemUids, locked, { _timeoutMs: 65000 }),
+        getOpenServerGifts: (ref) => callWorkerApi(resolveAccountId(ref), 'getOpenServerGifts', { _timeoutMs: 65000 }),
+        claimOpenServerGift: (ref, id) => callWorkerApi(resolveAccountId(ref), 'claimOpenServerGift', id, { _timeoutMs: 65000 }),
         getBagSeeds: (ref) => callWorkerApi(resolveAccountId(ref), 'getBagSeeds'),
         getDogSkillGiftStatus: (ref) => callWorkerApi(resolveAccountId(ref), 'getDogSkillGiftStatus'),
         claimDogSkillGifts: (ref) => callWorkerApi(resolveAccountId(ref), 'claimDogSkillGifts'),
@@ -159,7 +171,7 @@ function createDataProvider(deps) {
         getMilkTeaActivity: (ref, page, input) => callWorkerApi(resolveAccountId(ref), 'getMilkTeaActivity', page, input),
         operateMilkTeaActivity: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'operateMilkTeaActivity', action, input),
         getProtectLogs: (ref) => callWorkerApi(resolveAccountId(ref), 'getProtectLogs'),
-        doFarmOp: (ref, op) => callWorkerApi(resolveAccountId(ref), 'doFarmOp', op),
+        doFarmOp: (ref, op) => callWorkerApi(resolveAccountId(ref), 'doFarmOp', op, { _timeoutMs: 120000 }),
         setUnifiedHarvest: (ref, enabled) => callWorkerApi(resolveAccountId(ref), 'setUnifiedHarvest', enabled !== false),
         getUnifiedHarvest: (ref) => callWorkerApi(resolveAccountId(ref), 'getUnifiedHarvest'),
         buyFertilizer: (ref, type, count) => callWorkerApi(resolveAccountId(ref), 'buyFertilizer', type, count),
@@ -178,7 +190,8 @@ function createDataProvider(deps) {
             force ? FRIEND_TIMEOUT : undefined),
         clearFriendsCache: (ref) => callWorkerApi(resolveAccountId(ref), 'clearFriendsCache'),
         getInteractRecords: (ref) => callWorkerApi(resolveAccountId(ref), 'getInteractRecords'),
-        getFriendLands: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getFriendLands', gid),
+        getFriendLands: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getFriendLands', gid, FRIEND_LANDS_TIMEOUT),
+        recoverLegacyFriendVisit: (ref, options) => callWorkerApi(resolveAccountId(ref), 'recoverLegacyFriendVisit', options, FRIEND_LANDS_TIMEOUT),
         doFriendOp: (ref, gid, op) => callWorkerApi(resolveAccountId(ref), 'doFriendOp', gid, op),
         getFriendDogInfo: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getFriendDogInfo', gid),
         batchGetFriendDogInfo: (ref, gids) => callWorkerApi(resolveAccountId(ref), 'batchGetFriendDogInfo', gids),
@@ -187,16 +200,16 @@ function createDataProvider(deps) {
         delFriend: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'delFriend', gid),
 
         // ========== 仓库 ==========
-        useItem: (ref, itemId, count) => callWorkerApi(resolveAccountId(ref), 'useItem', itemId, count),
+        useItem: (ref, itemId, count, uid) => callWorkerApi(resolveAccountId(ref), 'useItem', itemId, count, uid, { _timeoutMs: 65000 }),
         sellItems: (ref, items) => callWorkerApi(resolveAccountId(ref), 'sellItems', items),
 
         // ========== 每日礼包 ==========
         getDailyGifts: (ref) => callWorkerApi(resolveAccountId(ref), 'getDailyGiftOverview'),
 
         // ========== Mall ==========
-        getMallGoods: (ref) => callWorkerApi(resolveAccountId(ref), 'getMallGoods'),
+        getMallGoods: (ref, slotType) => callWorkerApi(resolveAccountId(ref), 'getMallGoods', slotType),
         buyMallGoods: (ref, goodsId, count) => callWorkerApi(resolveAccountId(ref), 'buyMallGoods', goodsId, count),
-        getMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'getMysteryShop'),
+        getMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'getMysteryShop', MYSTERY_SHOP_TIMEOUT),
         buyMysteryShopGoods: (ref, npcId) => callWorkerApi(resolveAccountId(ref), 'buyMysteryShopGoods', npcId),
         abandonMysteryShop: (ref) => callWorkerApi(resolveAccountId(ref), 'abandonMysteryShop'),
 
@@ -241,13 +254,32 @@ function createDataProvider(deps) {
         getFriendDogInfo: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getFriendDogInfo', gid),
 
         // ========== Illustrated ==========
-        getIllustratedList: (ref, type, level) => callWorkerApi(resolveAccountId(ref), 'getIllustratedList', type, level),
+        // 2026-11-02：参数语义改为 (rarity, illustratedType)。
+        // 注意：路由层历史签名是 (refresh, illustratedType)，refresh 已废弃
+        // （官方 request 没有 refresh 字段，field 1 是 rarity），故首位当 rarity 用，
+        // 布尔值会被 Number() 转成 0/1，0 恰好等于"全部"，行为安全。
+        getIllustratedList: (ref, rarity, illustratedType) => callWorkerApi(resolveAccountId(ref), 'getIllustratedList', rarity, illustratedType),
+        // 藏品（collectionpb，2026-11-03 新增；公告 26110102 的「果冻花园」）
+        getCollections: (ref, categories) => callWorkerApi(resolveAccountId(ref), 'getCollections', categories),
+        upgradeCollection: (ref, category, collectionId, expected) => callWorkerApi(resolveAccountId(ref), 'upgradeCollection', category, collectionId, expected, { _timeoutMs: 90000 }),
+        claimCollectionReward: (ref, category) => callWorkerApi(resolveAccountId(ref), 'claimCollectionReward', category, { _timeoutMs: 65000 }),
+        setCollectionDisplay: (ref, input) => callWorkerApi(resolveAccountId(ref), 'setCollectionDisplay', input, { _timeoutMs: 65000 }),
         claimIllustratedRewards: (ref, type) => callWorkerApi(resolveAccountId(ref), 'claimIllustratedRewards', type),
 
         // ========== Career ==========
         getCareerInfo: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getCareerInfo', gid),
 
         // ========== 配置 ==========
+        resumeFriendBad: async (ref) => {
+            const id = resolveAccountId(ref);
+            if (!id || !store.isAutomationOn('friend_bad', id)) throw new Error('当前账号未开启自动放虫放草');
+            const previousRetryDate = store.getFriendBadRetryDate(id);
+            store.applyConfigSnapshot({ friendBadRetryDate: '' }, { accountId: id });
+            const rev = nextConfigRevision();
+            broadcastConfigToWorkers(id);
+            return { accountId: id, friendBadRetryDate: store.getFriendBadRetryDate(id), previousRetryDate,
+                configRevision: rev, gameRpcSent: false, budgetReset: false };
+        },
         setAutomation: async (ref, key, value) => {
             const id = resolveAccountId(ref);
             if (!id) throw new Error('Missing x-account-id');
@@ -392,6 +424,18 @@ function createDataProvider(deps) {
         },
 
         getRunningAccountCount: () => Object.keys(workers).length,
+
+        getManagerDiagnostics: (ref) => typeof callWorkerApi.getDiagnostics === 'function'
+            ? callWorkerApi.getDiagnostics(resolveAccountId(ref)) : null,
+
+        // worker 负责脱敏传输诊断；manager 只附带本地有界计数与迟到状态，不保存业务回包。
+        getTransportDiagnostics: async (ref) => {
+            const id = resolveAccountId(ref);
+            const worker = await callWorkerApi(id, 'getTransportDiagnostics');
+            const manager = typeof callWorkerApi.getDiagnostics === 'function'
+                ? callWorkerApi.getDiagnostics(id) : null;
+            return { worker, manager };
+        },
 
         // ========== 调度器状态 ==========
         getSchedulerStatus: async (ref) => {

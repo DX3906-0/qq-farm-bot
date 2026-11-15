@@ -363,7 +363,30 @@ function analyzeLands(lands, debug = false) {
 
   result.lastMatureAt = lastMatureAt;
 
+  // 服务端 could_upgrade 已综合判断角色等级、同级土地数量、金币/金豆等条件。
+  // 只在“服务端已允许”的集合内稳定排序：当前 5 级（下一步=蓝晶 6 级）优先。
+  // 没有 5 级候选时顺序完全不变，因此不会为了等蓝晶而阻塞可立即升级的紫晶土地。
+  result.upgradable = prioritizeBlueCrystalUpgrades(result.upgradable, lands);
+
   return result;
+}
+
+/**
+ * 将已获服务端准入的 5→6 蓝晶升级放到前面；不新增、不移除任何候选。
+ * 同一优先级保持服务端原顺序。
+ */
+function prioritizeBlueCrystalUpgrades(upgradableIds, lands) {
+  const ids = Array.isArray(upgradableIds) ? [...upgradableIds] : [];
+  if (ids.length <= 1) return ids;
+  const landMap = buildLandMap(lands);
+  const blue = [];
+  const others = [];
+  for (const id of ids) {
+    const land = landMap.get(toNum(id));
+    if (toNum(land?.level) === 5) blue.push(id);
+    else others.push(id);
+  }
+  return blue.length > 0 ? [...blue, ...others] : ids;
 }
 
 // ─── 收获后地块分类 ───
@@ -466,6 +489,7 @@ async function resolveRemovableHarvestedLands(harvestedLandIds, harvestResult) {
 
 function getLandTypeByLevel(level) {
   const lv = toNum(level);
+  if (lv === 6) return 'blue-crystal';
   if (lv === 5) return 'purple';
   if (lv === 4) return 'gold';
   if (lv === 3) return 'black';
@@ -475,7 +499,8 @@ function getLandTypeByLevel(level) {
 
 function getLandTypeNameByLevel(level) {
   const typeMap = {
-    purple: '紫土地',
+    'blue-crystal': '蓝晶土地',
+    purple: '紫晶土地',
     gold: '金土地',
     black: '黑土地',
     red: '红土地',
@@ -647,6 +672,7 @@ module.exports = {
   getDisplayLandContext,
   isOccupiedSlaveLand,
   analyzeLands,
+  prioritizeBlueCrystalUpgrades,
   resolveRemovableHarvestedLands,
   getLandsDetail,
   hasQixiDew,

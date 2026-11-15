@@ -12,7 +12,9 @@ message Item {
     int64 uid = 6;          // UID
     bool is_new = 7;        // 是否新获得
     repeated int64 mutant_types = 8; // 变异类型
-    // ItemShow show = 100;  // 展示信息 (略)
+    bool locked = 9;                 // 官方物品锁定标志
+    ItemSourceInfo source_info = 10;
+    ItemShow show = 100;
 }
 
 // 背包（物品列表）
@@ -24,4 +26,31 @@ message ItemBag {
 message ItemChg {
     Item item = 1;          // 物品信息
     int64 delta = 2;        // 变化量 (正数增加, 负数减少)
+}
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message ItemShowRestriction {
+    string text = 1;
+    string activity_id = 2;
+}
+
+message ItemShow {
+    ItemShowRestriction restriction = 3;
+    Item sell_price = 4; // Currency and amount shown as the item's sale value.
+    Item exchange_price = 5;
+}
+
+message ItemSourceInfo {
+    string sender_name = 1;
+    int64 sent_at = 2;
+    int64 source_type = 3;
+}
+
+message BuffEffect {
+    int64 attr_id = 1;
+    int64 attr_value = 2;
+    int64 extra_info = 3;
 }

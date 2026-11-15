@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import api from '@/api'
+import { ref, watch } from 'vue'
+import api, { isReadCanceled } from '@/api'
 import { useAccountStore } from '@/stores/account'
+import { operationFailure, resultIsUnknown } from '@/utils/operation-result'
 
 export interface BlacklistItem {
   gid: number
@@ -21,6 +22,11 @@ export const useFriendStore = defineStore('friend', () => {
   const dogInfoLoading = ref(false)
   const friendLands = ref<Record<string, any[]>>({})
   const friendLandsLoading = ref<Record<string, boolean>>({})
+  const friendLandsError = ref<Record<string, string>>({})
+  const friendLandFlights = new Map<string, Promise<void>>()
+  const operationFlights = new Map<string, Promise<any>>()
+  const operationStates = ref<Record<string, 'pending' | 'unknown' | 'idle'>>({})
+  let friendDataEpoch = 0
   const blacklist = ref<BlacklistItem[]>([])
   const interactRecords = ref<any[]>([])
   const interactLoading = ref(false)
@@ -33,9 +39,11 @@ export const useFriendStore = defineStore('friend', () => {
   const knownFriendSettingsSaving = ref(false)
 
   function clearFriendData() {
+    friendDataEpoch++
     friends.value = []
     friendLands.value = {}
     friendLandsLoading.value = {}
+    friendLandsError.value = {}
     blacklist.value = []
     interactRecords.value = []
     interactError.value = ''
@@ -43,6 +51,9 @@ export const useFriendStore = defineStore('friend', () => {
     knownFriendGidSyncCooldownSec.value = 600
     friendsListCacheTtlSec.value = 60
   }
+
+  const accountStore = useAccountStore()
+  watch(() => String(accountStore.currentAccountId || ''), () => clearFriendData(), { flush: 'sync' })
 
   function isCurrentAccount(accountId: string) {
     const accountStore = useAccountStore()
@@ -103,20 +114,22 @@ export const useFriendStore = defineStore('friend', () => {
     if (!accountId)
       return
     const requestedId = String(accountId)
+    const epoch = friendDataEpoch
+    const current = () => epoch === friendDataEpoch && isCurrentAccount(requestedId)
     loading.value = true
     try {
       const res = await api.get('/api/friends', {
         headers: { 'x-account-id': accountId },
         params: forceSync ? { forceSync: 'true' } : {},
       })
-      if (!isCurrentAccount(requestedId))
+      if (!current())
         return
       if (res.data.ok) {
         friends.value = res.data.data || []
       }
     }
     finally {
-      loading.value = false
+      if (current()) loading.value = false
     }
   }
 
@@ -223,26 +236,44 @@ export const useFriendStore = defineStore('friend', () => {
     }
   }
 
-  async function fetchFriendLands(accountId: string, friendId: string) {
+  function fetchFriendLands(accountId: string, friendId: string): Promise<void> {
     if (!accountId || !friendId)
-      return
-    const requestedId = String(accountId)
+      return Promise.resolve()
+    // 同一账号/GID的在途访问不重复发起Enter；清缓存或切页也不取消已发送的访问事务。
+    const key = JSON.stringify([String(accountId), String(friendId)])
+    const existing = friendLandFlights.get(key)
+    if (existing) return existing
+    const flight = readFriendLands(String(accountId), String(friendId)).finally(() => {
+      if (friendLandFlights.get(key) === flight) friendLandFlights.delete(key)
+    })
+    friendLandFlights.set(key, flight)
+    return flight
+  }
+
+  async function readFriendLands(accountId: string, friendId: string) {
+    const epoch = friendDataEpoch
+    const current = () => epoch === friendDataEpoch && isCurrentAccount(accountId)
+    if (!current()) return
     friendLandsLoading.value[friendId] = true
+    friendLandsError.value[friendId] = ''
     try {
       const res = await api.get(`/api/friend/${friendId}/lands`, {
-        headers: { 'x-account-id': accountId },
+        headers: { 'x-account-id': accountId }, timeout: 95000,
       })
-      if (!isCurrentAccount(requestedId))
-        return
-      if (res.data.ok) {
-        const lands = res.data.data.lands || []
-        const summary = res.data.data.summary || null
-        friendLands.value[friendId] = lands
-        syncFriendPlantSummary(friendId, lands, summary)
+      if (!current()) return
+      if (!res.data?.ok || !Array.isArray(res.data?.data?.lands)) {
+        throw new Error(res.data?.error || '好友土地响应不完整')
       }
+      const lands = res.data.data.lands
+      friendLands.value[friendId] = lands
+      syncFriendPlantSummary(friendId, lands, res.data.data.summary || null)
+    }
+    catch (error: any) {
+      if (!current() || isReadCanceled(error)) return
+      friendLandsError.value[friendId] = error?.response?.data?.error || error?.message || '读取好友土地失败'
     }
     finally {
-      friendLandsLoading.value[friendId] = false
+      if (current()) friendLandsLoading.value[friendId] = false
     }
   }
 
@@ -291,23 +322,39 @@ export const useFriendStore = defineStore('friend', () => {
     }
   }
 
-  async function operate(accountId: string, friendId: string, opType: string) {
-    if (!accountId || !friendId)
-      return { ok: false, message: '参数无效' }
-    try {
-      const res = await api.post(`/api/friend/${friendId}/op`, { opType }, {
-        headers: { 'x-account-id': accountId },
-      })
-      const result = res.data?.data || res.data || {}
-      await fetchFriends(accountId)
-      if (friendLands.value[friendId]) {
-        await fetchFriendLands(accountId, friendId)
-      }
-      return result
-    }
-    catch (e: any) {
-      return { ok: false, message: e?.response?.data?.error || e?.message || '操作失败' }
-    }
+  function operate(accountId: string, friendId: string, opType: string): Promise<any> {
+    const id = String(accountId || '')
+    if (!id || !friendId)
+      return Promise.resolve({ ok: false, sent: false, resultState: 'not_sent', message: '参数无效' })
+    // One manual visit transaction per account. A second click can subscribe
+    // to the existing result, never send another Enter or an operation.
+    if (operationFlights.has(id))
+      return operationFlights.get(id)!
+    if (operationStates.value[id] === 'unknown')
+      return Promise.resolve({ ok: false, resultState: 'unknown', outcomeUnknown: true, message: '上次好友操作结果未确认，请只核对已有日志，不重复提交' })
+    if (!isCurrentAccount(id))
+      return Promise.resolve({ ok: false, stale: true, sent: false, resultState: 'not_sent' })
+    const epoch = friendDataEpoch
+    const current = () => epoch === friendDataEpoch && isCurrentAccount(id)
+    operationStates.value[id] = 'pending'
+    const flight = api.post(`/api/friend/${friendId}/op`, { opType }, {
+      headers: { 'x-account-id': id }, skipErrorToast: true,
+    } as any).then(({ data }) => {
+      let result = data?.ok === true ? data.data || data : operationFailure(data, '好友操作未确认')
+      if (resultIsUnknown(data) || resultIsUnknown(result))
+        result = { ...result, ok: false, outcomeUnknown: true, resultState: 'unknown' }
+      operationStates.value[id] = resultIsUnknown(result) ? 'unknown' : 'idle'
+      return { ...result, stale: !current() }
+    }).catch((error) => {
+      const result = operationFailure(error, '好友操作结果未确认')
+      operationStates.value[id] = result.outcomeUnknown ? 'unknown' : 'idle'
+      return { ...result, stale: !current() }
+    }).finally(() => {
+      if (operationFlights.get(id) === flight)
+        operationFlights.delete(id)
+    })
+    operationFlights.set(id, flight)
+    return flight
   }
 
   function applyKnownFriendSettings(data: KnownFriendSettings | null | undefined) {
@@ -418,6 +465,7 @@ export const useFriendStore = defineStore('friend', () => {
     dogInfoLoading,
     friendLands,
     friendLandsLoading,
+    friendLandsError,
     blacklist,
     interactRecords,
     interactLoading,
@@ -439,6 +487,7 @@ export const useFriendStore = defineStore('friend', () => {
     addStealPlan,
     removeStealPlan,
     operate,
+    operationStates,
     fetchKnownFriendSettings,
     saveKnownFriendSettings,
     removeKnownFriendGid,

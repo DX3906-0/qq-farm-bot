@@ -136,20 +136,22 @@ watch(() => props.currentAccountId, ensureFriends)
         <input
           v-model="settings.friendQuietHours.start"
           type="time"
-          class="w-20 border border-[#ECE5D6] rounded-lg bg-[#FCFBF6] px-2 py-1 text-xs dark:border-[#32362B] dark:bg-[#1E211A] dark:text-white"
+          aria-label="静默开始时间"
+          class="w-24 border border-[var(--surface-border-strong)] rounded-lg bg-[var(--input-bg)] px-2 py-2 text-xs text-[var(--theme-text)]"
           :disabled="!settings.friendQuietHours.enabled"
         >
         <span class="text-xs text-gray-500">-</span>
         <input
           v-model="settings.friendQuietHours.end"
           type="time"
-          class="w-20 border border-[#ECE5D6] rounded-lg bg-[#FCFBF6] px-2 py-1 text-xs dark:border-[#32362B] dark:bg-[#1E211A] dark:text-white"
+          aria-label="静默结束时间"
+          class="w-24 border border-[var(--surface-border-strong)] rounded-lg bg-[var(--input-bg)] px-2 py-2 text-xs text-[var(--theme-text)]"
           :disabled="!settings.friendQuietHours.enabled"
         >
       </div>
     </div>
 
-    <div v-if="settings.friendQuietHours.enabled" class="space-y-2 rounded-2xl border border-[#ECE5D6] bg-[#F7F2E7]/70 p-3 dark:border-[#32362B] dark:bg-[#262B20]/70">
+    <div v-if="settings.friendQuietHours.enabled" class="ui-subtle-panel space-y-2 rounded-lg p-3">
       <div class="flex items-center justify-between gap-2">
         <span class="text-sm font-medium text-gray-900 dark:text-gray-100">静默时段豁免好友</span>
         <button

@@ -3,6 +3,8 @@ import axios from 'axios'
 import NProgress from 'nprogress'
 import { createRouter, createWebHistory } from 'vue-router'
 import { menuRoutes } from './menu'
+import { cancelContentMotion } from '@/composables/useContentMotion'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import 'nprogress/nprogress.css'
 
 NProgress.configure({ showSpinner: false })
@@ -43,11 +45,15 @@ const router = createRouter({
     {
       path: '/',
       component: () => import('@/layouts/DefaultLayout.vue'),
-      children: menuRoutes.map(route => ({
-        path: route.path,
-        name: route.name,
-        component: route.component,
-      })),
+      children: [
+        ...menuRoutes.map(route => ({
+          path: route.path,
+          name: route.name,
+          component: route.component,
+        })),
+        // Preserve bookmarks without mounting a second solar component/read.
+        { path: 'solar-calendar', name: 'solar-calendar', redirect: { name: 'activity', query: { section: 'notes' } } },
+      ],
     },
     {
       path: '/login',
@@ -63,7 +69,15 @@ const router = createRouter({
 })
 
 router.beforeEach(async (to) => {
+  // Stop the previous painted transition before auth/lazy navigation can wait.
+  cancelContentMotion('navigation')
   NProgress.start()
+
+  if (LOCAL_UI_READONLY) {
+    if (to.name === 'login' || to.name === 'renewal')
+      return { name: 'dashboard' }
+    return true
+  }
 
   if (to.name === 'renewal') {
     if (!adminToken.value) {

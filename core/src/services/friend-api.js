@@ -2,14 +2,245 @@ const protobuf = require('protobufjs/minimal');
 const { parentPort } = require('node:worker_threads');
 const { CONFIG } = require('../config/config');
 const {
-  getKnownFriendGids,
+  getConfigSnapshot,
   applyConfigSnapshot,
   getFriendBlacklist,
   removeFriendFromCache,
 } = require('../models/store');
-const { sendMsgAsync, getUserState } = require('../utils/network');
+const network = require('../utils/network');
+const { sendMsgAsync, getUserState } = network;
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { getRequestContext, runWithRequestContext, requestError, throwIfRequestCancelled } = require('../utils/request-priority');
+const {
+  acquireFriendVisitSession, releaseFriendVisitSession, markFriendVisitSessionUnknown,
+  getFriendVisitSessionSnapshot, observeFriendVisitTransport, confirmFriendVisitSessionLeft,
+  getLegacyFriendVisitRecoveryPlan, beginLegacyFriendVisitRecovery, finishLegacyFriendVisitRecovery,
+} = require('./friend-visit-session');
+const visitContext = new AsyncLocalStorage();
+
+function getFriendTransportEpoch() {
+  // 只采用网关公开的真实游戏代际；connectionEpoch/sessionEpoch可能只是IPC detach代际。
+  const value = network.getDiagnosticSnapshot?.()?.remoteGeneration;
+  if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value))) return null;
+  const epoch = Number(value);
+  return Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : null;
+}
+
+function isFriendCleanupTransportCurrent(token) {
+  const snapshot = network.getDiagnosticSnapshot?.();
+  const accountId = String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '');
+  return accountId === token.accountId && token.epoch != null
+    && getFriendTransportEpoch() === token.epoch
+    && snapshot.detached !== true && snapshot.loggedIn !== false && snapshot.connected === true;
+}
+
+function assertFriendVisitActive(gid = visitContext.getStore()?.token.gid) {
+  const session = visitContext.getStore();
+  if (!session || session.token.released || session.finalizing || !session.reply || session.token.gid !== toNum(gid)
+    || session.token.accountId !== String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '')) {
+    throw requestError('好友访问必须通过 withFriendVisitSession(gid, operation)', { errorCode: 'VISIT_SESSION_REQUIRED', stage: 'visit' });
+  }
+  const epoch = getFriendTransportEpoch();
+  if (epoch != null && session.token.epoch != null && epoch !== session.token.epoch) {
+    throw requestError('好友访问游戏连接代际已变化', { errorCode: 'VISIT_EPOCH_CHANGED', stage: 'visit' });
+  }
+  if (session.failure) throw session.failure;
+  throwIfRequestCancelled(session.context);
+  return session;
+}
+
+function isUncertainFriendVisitError(error) {
+  if (error.resultState === 'unknown' || error.outcomeUnknown === true) return true;
+  if (error.sent === false || error.resultState === 'not_sent') return false;
+  // 仅可信服务端拒绝阶段是结算证据；decode/transport上的false标志不能确认写副作用。
+  return !['remote', 'game_request'].includes(error.stage);
+}
+
+async function runFriendVisitOperation(gid, operation) {
+  const session = assertFriendVisitActive(gid);
+  const pending = Promise.resolve().then(() => {
+    assertFriendVisitActive(gid);
+    return operation();
+  });
+  session.pending.add(pending);
+  let result;
+  try {
+    result = await pending;
+  } catch (error) {
+    session.failure ||= error;
+    if (error !== session.context.signal?.reason && isUncertainFriendVisitError(error)) {
+      session.uncertain = true;
+    }
+    throw error;
+  } finally {
+    session.pending.delete(pending);
+  }
+  assertFriendVisitActive(gid);
+  return result;
+}
+
+async function withFriendVisitSession(gid, operation) {
+  const numericGid = toNum(gid);
+  if (!numericGid || typeof operation !== 'function') throw new TypeError('好友 GID 和访问操作无效');
+  const inherited = visitContext.getStore();
+  if (inherited) {
+    assertFriendVisitActive(numericGid);
+    return runFriendVisitOperation(numericGid, () => operation(inherited.reply));
+  }
+  const context = getRequestContext();
+  const accountId = String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '');
+  const token = await acquireFriendVisitSession(numericGid, {
+    accountId, epoch: getFriendTransportEpoch(), signal: context.signal, deadline: context.deadline,
+  });
+  // HostType只取服务端好友列表，未知沿用官方REAL=0；同次Enter/Leave固定同值。
+  token.hostType = friendHostTypes.get(`${accountId}:${numericGid}`) ?? 0;
+  token.reason = 2;
+  const controller = new AbortController();
+  const sessionContext = { ...context, signal: controller.signal, deadline: token.deadline };
+  const session = { token, context: sessionContext, reply: null, failure: null, uncertain: false, pending: new Set(), finalizing: false };
+  const abort = () => controller.abort(context.signal?.reason);
+  context.signal?.addEventListener('abort', abort, { once: true });
+  if (context.signal?.aborted) abort();
+  let rejectCaller;
+  const cancelled = new Promise((_, reject) => { rejectCaller = reject; });
+  const onAbort = () => {
+    const originalReason = controller.signal.reason;
+    const reason = originalReason?.resultState !== undefined ? originalReason
+      : requestError(originalReason?.message || '好友访问已取消', {
+        errorCode: 'VISIT_CANCELLED', stage: 'visit', resultState: 'unknown', processing: true, cause: originalReason,
+      });
+    markFriendVisitSessionUnknown(token, reason);
+    reportUnknownVisit(reason, token);
+    rejectCaller(reason);
+  };
+  controller.signal.addEventListener('abort', onAbort, { once: true });
+  if (controller.signal.aborted) onAbort();
+  const timer = setTimeout(() => controller.abort(requestError('好友访问事务超时，底层仍执行时保持互斥', {
+    errorCode: 'VISIT_TIMEOUT', stage: 'visit', resultState: 'unknown', processing: true, holdUntilTransportEpochChanged: true,
+  })), Math.max(0, token.deadline - Date.now()));
+  const processing = visitContext.run(session, () => runWithRequestContext(sessionContext, async () => {
+    let entered = false;
+    let error;
+    try {
+      throwIfRequestCancelled(session.context);
+      const epoch = getFriendTransportEpoch();
+      if (epoch != null && token.epoch != null && epoch !== token.epoch) {
+        throw requestError('排队后好友访问游戏代际已变化', { errorCode: 'VISIT_EPOCH_CHANGED', stage: 'visit', sent: false });
+      }
+      try {
+        session.reply = await enterFriendFarmRpc(numericGid);
+        entered = true;
+      } catch (enterError) {
+        enterError.visitStage = 'enter';
+        enterError.friendEnterHandling ||= handleFriendEnterError(numericGid, '', enterError);
+        if (!session.entered && isUncertainFriendVisitError(enterError)) session.uncertain = true;
+        throw enterError;
+      }
+      assertFriendVisitActive(numericGid);
+      const result = await operation(session.reply);
+      assertFriendVisitActive(numericGid);
+      return result;
+    } catch (caught) {
+      error = caught;
+      if (caught !== controller.signal.reason && (caught.resultState === 'unknown' || caught.outcomeUnknown === true)) session.uncertain = true;
+      throw caught;
+    } finally {
+      session.finalizing = true;
+      await Promise.allSettled([...session.pending]);
+      entered ||= session.entered === true;
+      try {
+        if (entered && !session.uncertain && isFriendCleanupTransportCurrent(token)) {
+          // 已确认 Enter 后必须独立清理；页面取消不会取消 Leave，且只发送一次。
+          const cleanupDeadline = Date.now() + 30000;
+          await runWithRequestContext({ signal: undefined, deadline: cleanupDeadline }, () => leaveFriendFarmRpc(numericGid));
+          confirmFriendVisitSessionLeft(token);
+        } else if (entered || session.uncertain) {
+          const unknownError = error || session.failure || requestError('访问连接状态不可确认', { resultState: 'unknown', stage: 'visit' });
+          markFriendVisitSessionUnknown(token, unknownError);
+          reportUnknownVisit(unknownError, token);
+          if (!error) throw unknownError;
+        } else {
+          confirmFriendVisitSessionLeft(token, 'not_entered');
+        }
+      } catch (leaveError) {
+        leaveError.visitStage = 'leave';
+        markFriendVisitSessionUnknown(token, leaveError);
+        reportUnknownVisit(leaveError, token);
+        if (error) {
+          error.leaveError = leaveError;
+          error.holdUntilTransportEpochChanged = true;
+        } else throw leaveError;
+      } finally {
+        clearTimeout(timer);
+        context.signal?.removeEventListener('abort', abort);
+        controller.signal.removeEventListener('abort', onAbort);
+        token.settled = true;
+        releaseFriendVisitSession(token);
+      }
+    }
+  }));
+  return Promise.race([processing, cancelled]);
+}
+
+async function recoverLegacyFriendVisit(options = {}) {
+  const accountId = String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '');
+  const epoch = getFriendTransportEpoch();
+  const snapshot = network.getDiagnosticSnapshot?.() || {};
+  throwIfRequestCancelled(getRequestContext());
+  if (snapshot.connected !== true || snapshot.detached === true || snapshot.loggedIn === false || snapshot.quiescing === true
+    || Number(snapshot.pending || 0) > 0 || Number(snapshot.pendingWrites || 0) > 0 || Number(snapshot.queue?.queued || 0) > 0) {
+    throw requestError('游戏连接或在途写不满足旧场景恢复条件', { errorCode: 'VISIT_RECOVERY_TRANSPORT_BUSY', stage: 'visit' });
+  }
+  const plan = getLegacyFriendVisitRecoveryPlan(accountId, epoch);
+  if (plan.eligible && plan.ownerGid !== toNum(getUserState()?.gid)) {
+    throw requestError('恢复证据的游戏用户不匹配', { errorCode: 'VISIT_RECOVERY_OWNER_MISMATCH', stage: 'visit' });
+  }
+  if (options.dryRun !== false || !plan.eligible) return { ...plan, dryRun: true, gameRpcSent: false };
+  if (visitContext.getStore()) throw requestError('不能在访友事务中恢复旧场景', { errorCode: 'VISIT_RECOVERY_BUSY', stage: 'visit' });
+  const token = beginLegacyFriendVisitRecovery(accountId, epoch, options);
+  if (!token) return { skipped: true, reason: 'already_left', gameRpcSent: false };
+  try {
+    if (!isFriendCleanupTransportCurrent(token)) throw requestError('恢复前真实游戏代际变化，未发送Leave', {
+      errorCode: 'VISIT_EPOCH_CHANGED', stage: 'visit', sent: false,
+    });
+    // 只补完证据中尚未发送的唯一Leave，绝不重放Enter/Harvest；HTTP取消不打断已发清理。
+    await runWithRequestContext({ signal: undefined, deadline: token.deadline }, () => leaveFriendFarmRpc(token.gid, token.hostType));
+    if (!isFriendCleanupTransportCurrent(token)) throw requestError('Leave确认时真实游戏代际变化，保留未知', {
+      errorCode: 'VISIT_EPOCH_CHANGED', stage: 'visit', resultState: 'unknown',
+    });
+    finishLegacyFriendVisitRecovery(token);
+    return { recovered: true, accountId, gid: token.gid, epoch, proof: 'leave_confirmed',
+      leaveSentOnce: true, enterSent: false };
+  } catch (error) {
+    error.visitStage = 'leave';
+    finishLegacyFriendVisitRecovery(token, error);
+    throw error;
+  }
+}
+
+async function enterFriendFarm(gid) {
+  const reply = await Promise.resolve(assertFriendVisitActive(gid).reply);
+  assertFriendVisitActive(gid);
+  return reply;
+}
+
+async function leaveFriendFarm(gid) {
+  // 访问入口的 finally 是 Leave 唯一所有者，子调用不能提前退出会话。
+  assertFriendVisitActive(gid);
+  await Promise.resolve();
+  assertFriendVisitActive(gid);
+}
+
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, randomDelay } = require('../utils/utils');
+function reportUnknownVisit(error, token) {
+  error.holdUntilTransportEpochChanged = true;
+  logWarn('好友', `好友访问状态未知，暂停后续访问: ${error.message}`, {
+    module: 'friend', event: 'visit_state_unknown', result: 'unknown', friendGid: token.gid,
+    transportEpoch: token.epoch, errorCode: error.errorCode, holdUntilTransportEpochChanged: true,
+    stage: error.stage, visitStage: error.visitStage, sent: error.sent, outcomeUnknown: error.outcomeUnknown,
+  });
+}
 const { getInteractRecords } = require('./interact');
 
 // ===== Constants =====
@@ -21,6 +252,7 @@ const SYSTEM_NPC_FRIENDS = [
   { gid: 10001, name: '小果', remark: '小果', level: 1 },
 ];
 const SYSTEM_NPC_GIDS = new Set(SYSTEM_NPC_FRIENDS.map(f => f.gid));
+const friendHostTypes = new Map();
 
 // ===== Dog names mapping =====
 // ⚠️ 这只是**兜底小表**。狗名以游戏配置（ItemInfo，type=8 为宠物）为准——
@@ -45,6 +277,51 @@ let lastVisitorGidSyncAt = 0;
 // QQ（尤其 NapCat 扫码）登录后仅引导同步一次好友 GID
 let hasBootstrappedQqFriendGids = false;
 const invalidKnownFriendGidCooldownUntil = new Map();
+const removedGidsByAccount = new Map();
+const observedGidsByAccount = new Map();
+let visitorSyncFlight = null;
+const allFriendsFlights = new Map();
+const friendMutationGeneration = new Map();
+
+function getFriendMutationGeneration(accountId = process.env.FARM_ACCOUNT_ID || '') {
+  getCurrentKnownGids(accountId);
+  return friendMutationGeneration.get(accountId) || 0;
+}
+
+function noteFriendGidDeleted(gid, accountId = process.env.FARM_ACCOUNT_ID || '') {
+  getCurrentKnownGids(accountId);
+  removedGidsByAccount.get(accountId).add(toNum(gid));
+  friendMutationGeneration.set(accountId, (friendMutationGeneration.get(accountId) || 0) + 1);
+}
+
+function sameFriendGids(left, right) {
+  return left.length === right.length && left.every((gid, index) => gid === right[index]);
+}
+
+function getCurrentKnownGids(accountId = process.env.FARM_ACCOUNT_ID || '') {
+  const current = normalizeFriendGids(getConfigSnapshot(accountId).knownFriendGids);
+  const previous = observedGidsByAccount.get(accountId) || current;
+  const removed = removedGidsByAccount.get(accountId) || new Set();
+  if (!sameFriendGids(previous, current)) {
+    friendMutationGeneration.set(accountId, (friendMutationGeneration.get(accountId) || 0) + 1);
+  }
+  for (const gid of previous) if (!current.includes(gid)) removed.add(gid);
+  removedGidsByAccount.set(accountId, removed);
+  observedGidsByAccount.set(accountId, current);
+  return current;
+}
+
+function filterCurrentFriendGids(friends, startedGids = []) {
+  const accountId = process.env.FARM_ACCOUNT_ID || '';
+  const current = new Set(getCurrentKnownGids(accountId));
+  const removed = removedGidsByAccount.get(accountId);
+  const blacklist = new Set(getFriendBlacklist(accountId));
+  return friends.filter(friend => {
+    const gid = toNum(friend.gid);
+    return SYSTEM_NPC_GIDS.has(gid) || (!blacklist.has(gid) && !removed?.has(gid)
+      && (!startedGids.includes(gid) || current.has(gid)));
+  });
+}
 
 // ===== Dog Name =====
 /**
@@ -250,9 +527,15 @@ function normalizeFriendGids(rawGids) {
 
 /** Extract game_friends array from the reply object (supports both snake_case and camelCase). */
 function extractReplyFriends(reply) {
-  if (Array.isArray(reply && reply.game_friends)) return reply.game_friends;
-  if (Array.isArray(reply && reply.gameFriends)) return reply.gameFriends;
-  return [];
+  const friends = Array.isArray(reply?.game_friends) ? reply.game_friends
+    : Array.isArray(reply?.gameFriends) ? reply.gameFriends : [];
+  for (const friend of friends) {
+    const gid = toNum(friend?.gid);
+    const hostType = friend?.host_type ?? friend?.hostType;
+    const accountId = String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '');
+    if (gid > 0 && [0, 1, 3].includes(hostType)) friendHostTypes.set(`${accountId}:${gid}`, hostType);
+  }
+  return friends;
 }
 
 /** Deduplicate friend list by GID, keeping first occurrence. */
@@ -275,15 +558,21 @@ function buildFriendReply(friends) {
 }
 
 /** Sync known friend GIDs into config and notify master process. */
-function syncKnownFriendGidsFromFriends(friends) {
+function syncKnownFriendGidsFromFriends(friends, options = {}) {
+  const accountId = process.env.FARM_ACCOUNT_ID || '';
+  const latestGids = getCurrentKnownGids(accountId);
+  if (options.baseGids && (!sameFriendGids(options.baseGids, latestGids)
+    || (options.generation !== undefined && options.generation !== getFriendMutationGeneration(accountId)))) {
+    return latestGids;
+  }
   const newGids = normalizeFriendGids(
-    (Array.isArray(friends) ? friends : []).map(f => f && f.gid)
+    filterCurrentFriendGids(Array.isArray(friends) ? friends : []).map(f => f && f.gid)
   );
   if (newGids.length === 0) return [];
 
   clearInvalidKnownFriendGidMarks(newGids);
 
-  const currentGids = normalizeFriendGids(getKnownFriendGids());
+  const currentGids = getCurrentKnownGids();
   const mergedGids = normalizeFriendGids([...currentGids, ...newGids]);
 
   // No change
@@ -294,11 +583,13 @@ function syncKnownFriendGidsFromFriends(friends) {
 
   // Persist (non-blocking via IPC)
   applyConfigSnapshot({ knownFriendGids: mergedGids }, { persist: false });
-  const synced = postToMaster({ type: 'known_friend_gids_sync', gids: mergedGids });
+  const synced = postToMaster({
+    type: 'known_friend_gids_merge', addedGids: newGids.filter(gid => !currentGids.includes(gid)),
+    baseGids: currentGids, requiresRemoveEpoch: true,
+  });
 
-  if (!synced) {
-    // Fallback to immediate persistence
-    applyConfigSnapshot({ knownFriendGids: mergedGids }, { persist: true });
+  if (!synced && options.persist === true) {
+    applyConfigSnapshot({ knownFriendGids: mergedGids }, { persist: true, accountId });
   }
   return mergedGids;
 }
@@ -307,8 +598,7 @@ function syncKnownFriendGidsFromFriends(friends) {
  * Get known QQ friend GIDs, excluding invalid and blacklisted ones.
  */
 function getEffectiveKnownQqFriendGids() {
-  const gids = normalizeFriendGids(getKnownFriendGids());
-  clearInvalidKnownFriendGidMarks(gids);
+  const gids = getCurrentKnownGids();
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   const invalidSet = getInvalidKnownFriendGidSet();
   const blacklist = new Set(getFriendBlacklist(accountId));
@@ -327,7 +617,16 @@ function getEffectiveKnownQqFriendGids() {
  * - 只做「并集」，绝不因访客为空而收缩已知 GID。
  * - 失败时按退避重试（30s~2min），避免把节流窗口顶满导致长时间不再重试。
  */
-async function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
+function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
+  if (visitorSyncFlight) return visitorSyncFlight;
+  const flight = syncKnownFriendGidsFromRecentVisitors(force).finally(() => {
+    if (visitorSyncFlight === flight) visitorSyncFlight = null;
+  });
+  visitorSyncFlight = flight;
+  return flight;
+}
+
+async function syncKnownFriendGidsFromRecentVisitors(force = false) {
   const now = Date.now();
   if (!force && lastVisitorGidSyncAt > 0
       && now - lastVisitorGidSyncAt < DEFAULT_QQ_VISITOR_GID_SYNC_INTERVAL_MS) {
@@ -335,7 +634,8 @@ async function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
   }
 
   const accountId = process.env.FARM_ACCOUNT_ID || '';
-  const existingGids = normalizeFriendGids(getKnownFriendGids());
+  const existingGids = getCurrentKnownGids();
+  const generation = getFriendMutationGeneration(accountId);
 
   try {
     if (!hasInitializedFromVisitors) {
@@ -346,6 +646,7 @@ async function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
     }
 
     const interactRecords = await getInteractRecords();
+    throwIfRequestCancelled();
     const invalidSet = getInvalidKnownFriendGidSet(now);
     const visitorGids = normalizeFriendGids(
       (Array.isArray(interactRecords) ? interactRecords : [])
@@ -364,25 +665,13 @@ async function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
       return getEffectiveKnownQqFriendGids();
     }
 
-    const mergedGids = normalizeFriendGids([...existingGids, ...visitorGids]);
-    const addedCount = mergedGids.length - existingGids.length;
+    const latestGids = getCurrentKnownGids(accountId);
+    if (!sameFriendGids(existingGids, latestGids) || generation !== getFriendMutationGeneration(accountId)) {
+      return getEffectiveKnownQqFriendGids();
+    }
+    const mergedGids = syncKnownFriendGidsFromFriends(visitorGids.map(gid => ({ gid })), { baseGids: existingGids, generation });
+    const addedCount = mergedGids.length - latestGids.length;
     if (addedCount > 0) {
-      applyConfigSnapshot({ knownFriendGids: mergedGids }, {
-        persist: false,
-        accountId,
-      });
-
-      const synced = postToMaster({
-        type: 'known_friend_gids_sync',
-        gids: mergedGids,
-      });
-
-      if (!synced) {
-        applyConfigSnapshot({ knownFriendGids: mergedGids }, {
-          persist: true,
-          accountId,
-        });
-      }
 
       log('好友', `已从最近访客补充 ${addedCount} 个好友GID，当前已知好友 GID 共 ${mergedGids.length} 个`, {
         module: 'friend',
@@ -405,14 +694,12 @@ async function syncKnownFriendGidsFromRecentVisitorsOnce(force = false) {
       event: '同步好友GID',
       result: 'error',
     });
-    return getEffectiveKnownQqFriendGids();
+    throw err;
   }
 }
 
 /**
- * Best-effort QQ friend GID bootstrap for login flows that do not provide
- * platform openids (notably NapCat QR login). Every source is independent so
- * one unavailable legacy RPC does not prevent visitor/application discovery.
+ * QQ 好友 GID 引导同步；每个来源出错即停止，不以网络超时触发后续探测。
  *
  * 好友列表接口（GetGameFriends）只按「已知 GID」拉取，因此新增好友必须先被发现
  * 并写进 knownFriendGids，否则永远不出现在好友列表里。这里把三条发现路径
@@ -423,6 +710,8 @@ async function bootstrapQqFriendGids() {
   if (hasBootstrappedQqFriendGids) return { skipped: true, reason: 'already_bootstrapped' };
   hasBootstrappedQqFriendGids = true;
 
+  const startedGids = getCurrentKnownGids();
+  const generation = getFriendMutationGeneration();
   const discovered = [];
   const sourceCounts = { legacy: 0, applications: 0, visitors: 0 };
   const errors = [];
@@ -432,7 +721,8 @@ async function bootstrapQqFriendGids() {
     sourceCounts.legacy = friends.length;
     discovered.push(...friends.map(friend => toNum(friend && friend.gid)));
   } catch (err) {
-    errors.push(`legacy: ${err.message}`);
+    hasBootstrappedQqFriendGids = false;
+    throw err;
   }
 
   try {
@@ -441,7 +731,8 @@ async function bootstrapQqFriendGids() {
     sourceCounts.applications = applications.length;
     discovered.push(...applications.map(application => toNum(application && application.gid)));
   } catch (err) {
-    errors.push(`applications: ${err.message}`);
+    hasBootstrappedQqFriendGids = false;
+    throw err;
   }
 
   try {
@@ -453,13 +744,14 @@ async function bootstrapQqFriendGids() {
     discovered.push(...visitorGids);
     hasInitializedFromVisitors = true;
   } catch (err) {
-    errors.push(`visitors: ${err.message}`);
+    hasBootstrappedQqFriendGids = false;
+    throw err;
   }
 
   const ownGid = toNum(getUserState().gid);
-  const gids = normalizeFriendGids(discovered).filter(gid => gid !== ownGid);
+  const gids = filterCurrentFriendGids(normalizeFriendGids(discovered).filter(gid => gid !== ownGid).map(gid => ({ gid })), startedGids).map(friend => friend.gid);
   const before = getEffectiveKnownQqFriendGids();
-  if (gids.length > 0) syncKnownFriendGidsFromFriends(gids.map(gid => ({ gid })));
+  if (gids.length > 0) syncKnownFriendGidsFromFriends(gids.map(gid => ({ gid })), { baseGids: startedGids, generation });
   const after = getEffectiveKnownQqFriendGids();
 
   let verifiedCount = 0;
@@ -467,9 +759,10 @@ async function bootstrapQqFriendGids() {
     try {
       const verified = await fetchQqFriendsByKnownGids();
       verifiedCount = verified.length;
-      syncKnownFriendGidsFromFriends(verified);
+      // 验证只更新返回值，不把旧验证快照重新提交到 store。
     } catch (err) {
-      errors.push(`verify: ${err.message}`);
+      hasBootstrappedQqFriendGids = false;
+      throw err;
     }
   }
 
@@ -495,9 +788,10 @@ function removeKnownFriendGid(gid, friendName, reason = '') {
   const numericGid = toNum(gid);
   if (!numericGid) return false;
 
-  const currentGids = normalizeFriendGids(getKnownFriendGids());
+  const currentGids = getCurrentKnownGids();
   const filteredGids = currentGids.filter(g => g !== numericGid);
   markKnownFriendGidInvalid(numericGid);
+  noteFriendGidDeleted(numericGid);
 
   if (filteredGids.length !== currentGids.length) {
     applyConfigSnapshot({ knownFriendGids: filteredGids }, { persist: false });
@@ -526,18 +820,26 @@ function removeKnownFriendGid(gid, friendName, reason = '') {
   return true;
 }
 
-/** Check if the error indicates the user is banned from entering the farm. */
-function isEnterFarmBannedError(err) {
-  const msg = String((err && err.message) || err || '');
-  if (!msg) return false;
-  return msg.includes('1002003');
+/** 只采用真实服务端失败回执；日志文案或 transport 上的同码不是拒绝证据。 */
+function isConfirmedFriendRefusal(error) {
+  return error?.sent !== false && error?.outcomeUnknown !== true && error?.resultState === 'failed'
+    && ['remote', 'game_request'].includes(error?.stage)
+    && !error?.holdUntilTransportEpochChanged && !error?.leaveError;
 }
 
-/** Extract the RPC error code from an error message. */
+/** Extract the exact RPC error code, preferring transport metadata. */
 function parseRpcErrorCode(err) {
+  const raw = err?.errorCode;
+  if (typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && /^\d+$/.test(raw) && Number.isSafeInteger(Number(raw))) return Number(raw);
   const msg = String((err && err.message) || err || '');
-  const match = msg.match(/code=(\d+)/i);
+  const match = msg.match(/\bcode\s*=\s*(\d+)\b/i);
   return match ? Number.parseInt(match[1], 10) || 0 : 0;
+}
+
+/** Official ErrorCode.VisitAccountBanned. */
+function isEnterFarmBannedError(err) {
+  return isConfirmedFriendRefusal(err) && parseRpcErrorCode(err) === 1002003;
 }
 
 /** Check if the error is a transient network error (retryable). */
@@ -554,16 +856,9 @@ function isTransientNetworkError(err) {
   ].some(keyword => msg.includes(keyword));
 }
 
-/** Check if the error is due to an invalid friend relationship. */
+/** Official VisitNotFriend / VisitAccountDeleted / VisitNotPlatFriend. */
 function isInvalidFriendAccessError(err) {
-  const msg = String((err && err.message) || err || '');
-  if (!msg || isEnterFarmBannedError(err) || isTransientNetworkError(err)) return false;
-
-  const lower = msg.toLowerCase();
-  const matched = ['无效', '不存在', '删除', '关系', 'not found', 'invalid', 'not friend', 'friend']
-    .some(kw => lower.includes(kw.toLowerCase()));
-
-  return matched && parseRpcErrorCode(err) > 0;
+  return isConfirmedFriendRefusal(err) && [1002002, 1002004, 1002005].includes(parseRpcErrorCode(err));
 }
 
 /** Add a friend to the blacklist via IPC to master process. */
@@ -632,6 +927,7 @@ async function fetchQqFriendsByKnownGids() {
 
   const allFriends = [];
   for (let i = 0; i < gids.length; i += QQ_FRIEND_LIST_BATCH_SIZE) {
+    throwIfRequestCancelled();
     const batch = gids.slice(i, i + QQ_FRIEND_LIST_BATCH_SIZE);
     const payload = types.GetGameFriendsRequest.encode(
       types.GetGameFriendsRequest.create({ gids: batch.map(g => toLong(g)) })
@@ -643,8 +939,9 @@ async function fetchQqFriendsByKnownGids() {
         'GetGameFriends',
         payload
       );
+      throwIfRequestCancelled();
       const reply = types.GetAllFriendsReply.decode(body);
-      allFriends.push(...extractReplyFriends(reply));
+      allFriends.push(...extractReplyFriends(reply).filter(friend => batch.includes(toNum(friend.gid))));
     } catch (err) {
       logWarn('好友',
         `QQ 新好友接口分批请求失败(${i + 1}-${i + batch.length}/${gids.length}): ${err.message}`,
@@ -656,6 +953,7 @@ async function fetchQqFriendsByKnownGids() {
           batchSize: batch.length,
         }
       );
+      throw err;
     }
 
     if (i + QQ_FRIEND_LIST_BATCH_SIZE < gids.length) {
@@ -663,56 +961,39 @@ async function fetchQqFriendsByKnownGids() {
     }
   }
 
-  return dedupeFriendsByGid(allFriends);
+  return filterCurrentFriendGids(dedupeFriendsByGid(allFriends), gids);
 }
 
-/** Fetch QQ friends via legacy methods: SyncAll first, then GetAll as fallback. */
+/** 旧版引导来源只发一次 SyncAll；未知错误不尝试 GetAll。 */
 async function fetchQqFriendsByLegacyMethod() {
-  const errors = [];
-
-  // Try SyncAll
-  try {
-    const SyncAllReq = types.SyncAllRequest || types.SyncAllFriendsRequest;
-    const SyncAllRep = types.SyncAllReply || types.SyncAllFriendsReply;
-    if (!SyncAllReq || !SyncAllRep) throw new Error('SyncAll 接口类型未加载');
-
-    const payload = SyncAllReq.encode(SyncAllReq.create({ open_ids: [] })).finish();
-    const { body } = await sendMsgAsync(
-      'gamepb.friendpb.FriendService',
-      'SyncAll',
-      payload
-    );
-    return extractReplyFriends(SyncAllRep.decode(body));
-  } catch (err) {
-    errors.push(`SyncAll: ${err.message}`);
-  }
-
-  // Fallback: GetAll
-  try {
-    if (!types.GetAllFriendsRequest || !types.GetAllFriendsReply) {
-      throw new Error('GetAll 接口类型未加载');
-    }
-    const payload = types.GetAllFriendsRequest.encode(
-      types.GetAllFriendsRequest.create({})
-    ).finish();
-    const { body } = await sendMsgAsync(
-      'gamepb.friendpb.FriendService',
-      'GetAll',
-      payload
-    );
-    return extractReplyFriends(types.GetAllFriendsReply.decode(body));
-  } catch (err) {
-    errors.push(`GetAll: ${err.message}`);
-  }
-
-  throw new Error(errors.join(' | '));
+  const SyncAllReq = types.SyncAllRequest || types.SyncAllFriendsRequest;
+  const SyncAllRep = types.SyncAllReply || types.SyncAllFriendsReply;
+  if (!SyncAllReq || !SyncAllRep) throw new Error('SyncAll 接口类型未加载');
+  const startedGids = getCurrentKnownGids();
+  const payload = SyncAllReq.encode(SyncAllReq.create({ open_ids: [] })).finish();
+  const { body } = await sendMsgAsync('gamepb.friendpb.FriendService', 'SyncAll', payload);
+  return filterCurrentFriendGids(extractReplyFriends(SyncAllRep.decode(body)), startedGids);
 }
 
 /**
- * Get all friends. For QQ platform, try GetGameFriends first (with known GIDs),
- * then fall back to legacy methods. For WeChat, use GetAll directly.
+ * 获取好友列表：QQ 固定使用 GetGameFriends，微信固定使用 GetAll；失败不切方法。
  */
-async function getAllFriends(forceRefresh = false) {
+function getAllFriends(forceRefresh = false) {
+  const options = typeof forceRefresh === 'object' && forceRefresh !== null
+    ? { ...forceRefresh } : { force: forceRefresh === true, discover: forceRefresh === true };
+  const accountId = process.env.FARM_ACCOUNT_ID || '';
+  const key = JSON.stringify([accountId, options.discover === true]);
+  let flight = allFriendsFlights.get(key);
+  if (!flight) {
+    flight = getAllFriendsOnce(options).finally(() => {
+      if (allFriendsFlights.get(key) === flight) allFriendsFlights.delete(key);
+    });
+    allFriendsFlights.set(key, flight);
+  }
+  return flight.then(reply => buildFriendReply(filterCurrentFriendGids(extractReplyFriends(reply)).map(friend => ({ ...friend }))));
+}
+
+async function getAllFriendsOnce(options = {}) {
   const isQQ = CONFIG.platform === 'qq';
 
   /** 将系统 NPC 合并到好友列表中，已有真实数据的优先保留 */
@@ -724,65 +1005,12 @@ async function getAllFriends(forceRefresh = false) {
   }
 
   if (isQQ) {
-    await syncKnownFriendGidsFromRecentVisitorsOnce(forceRefresh);
+    if (options.discover === true) await syncKnownFriendGidsFromRecentVisitorsOnce(options.force === true);
 
-    // Try new API first（GetGameFriends：只按 knownFriendGids 拉取）
-    const knownFriends = await fetchQqFriendsByKnownGids();
+    // 普通 GET 只查询 owned GID，不发现访客、不提交 store、不持久化。
+    const friends = await fetchQqFriendsByKnownGids();
+    return buildFriendReply(mergeSystemNpcs(friends));
 
-    // 刷新（forceRefresh）时额外走一次 legacy 全量接口并取并集：
-    // GetGameFriends 只认 knownFriendGids，若好友是「刚加、还没进 knownFriendGids」，
-    // 或 knownFriendGids 里混入了已失效的 GID，单靠它会比真实好友数少。
-    // legacy（SyncAll/GetAll）是服务端全量列表，能补齐这部分并顺带把新 GID 落库。
-    // 非刷新路径保持原有行为（先 knownGids，为空才回退 legacy），避免每轮多打一次请求。
-    if (forceRefresh) {
-      let legacyFriends = [];
-      try {
-        legacyFriends = dedupeFriendsByGid(await fetchQqFriendsByLegacyMethod());
-      } catch (err) {
-        logWarn('好友', `刷新时 legacy 全量好友接口失败（忽略，继续用 knownGids 结果）: ${err.message}`, {
-          module: 'friend',
-          event: '好友列表接口',
-          result: 'error',
-          method: 'SyncAll/GetAll',
-        });
-      }
-
-      const merged = dedupeFriendsByGid([...knownFriends, ...legacyFriends]);
-      if (merged.length > 0) {
-        syncKnownFriendGidsFromFriends(merged);
-        return buildFriendReply(mergeSystemNpcs(merged));
-      }
-    }
-
-    if (knownFriends.length > 0) {
-      syncKnownFriendGidsFromFriends(knownFriends);
-      return buildFriendReply(mergeSystemNpcs(knownFriends));
-    }
-
-    // Fallback to legacy methods
-    try {
-      const fallbackFriends = dedupeFriendsByGid(await fetchQqFriendsByLegacyMethod());
-      if (fallbackFriends.length > 0) {
-        syncKnownFriendGidsFromFriends(fallbackFriends);
-      } else if (getEffectiveKnownQqFriendGids().length === 0) {
-        logWarn('好友',
-          'QQ 好友列表为空；若近期接口已切到 GetGameFriends，请先在好友页维护已知好友 GID 列表',
-          {
-            module: 'friend',
-            event: '好友列表接口',
-            result: 'empty',
-          }
-        );
-      }
-      return buildFriendReply(mergeSystemNpcs(fallbackFriends));
-    } catch (err) {
-      if (getEffectiveKnownQqFriendGids().length === 0) {
-        throw new Error(
-          `QQ 好友列表获取失败，请先在好友页维护已知好友 GID 列表。${err.message}`
-        );
-      }
-      throw err;
-    }
   }
 
   // WeChat platform: direct GetAll
@@ -840,6 +1068,9 @@ async function delFriend(gid) {
     payload
   );
   const reply = types.DelFriendReply.decode(body);
+  const currentGids = getCurrentKnownGids();
+  noteFriendGidDeleted(numericGid);
+  applyConfigSnapshot({ knownFriendGids: currentGids.filter(id => id !== numericGid) }, { persist: false, accountId: process.env.FARM_ACCOUNT_ID || '' });
 
   // Remove from local cache
   const accountId = process.env.FARM_ACCOUNT_ID || '';
@@ -857,15 +1088,17 @@ async function delFriend(gid) {
 }
 
 /** Enter a friend's farm. Visit reason = 2 (general visit). */
-async function enterFriendFarm(gid) {
+async function enterFriendFarmRpc(gid) {
   const payload = types.VisitEnterRequest.encode(
-    types.VisitEnterRequest.create({ host_gid: toLong(gid), reason: 2 })
+    types.VisitEnterRequest.create({ host_gid: toLong(gid), reason: visitContext.getStore().token.reason, host_type: visitContext.getStore().token.hostType })
   ).finish();
   const { body } = await sendMsgAsync(
     'gamepb.visitpb.VisitService',
     'Enter',
     payload
   );
+  // RPC 已明确成功，即使解码失败也需按实际已进入状态清理，而不是静默漏 Leave。
+  visitContext.getStore().entered = true;
   const reply = types.VisitEnterReply.decode(body);
 
   // 狗信息：proto 里 brief_dog_info 是结构化 BriefDogInfo，直接读 dog_id。
@@ -883,21 +1116,19 @@ async function enterFriendFarm(gid) {
 }
 
 /** Leave a friend's farm. */
-async function leaveFriendFarm(gid) {
+async function leaveFriendFarmRpc(gid, hostType = visitContext.getStore()?.token.hostType ?? 0) {
   const payload = types.VisitLeaveRequest.encode(
-    types.VisitLeaveRequest.create({ host_gid: toLong(gid) })
+    types.VisitLeaveRequest.create({ host_gid: toLong(gid), host_type: hostType })
   ).finish();
-  try {
-    await sendMsgAsync('gamepb.visitpb.VisitService', 'Leave', payload);
-  } catch (_) {
-    // Ignore leave errors
-  }
+  const { body } = await sendMsgAsync('gamepb.visitpb.VisitService', 'Leave', payload, { timeoutMs: 30000 });
+  // LeaveReply为空消息也必须有合法回包；不能把解码失败视作离场确认。
+  types.VisitLeaveReply.decode(body);
 }
 
 /** Check whether we can perform a remote operation on a friend's farm. */
 async function checkCanOperateRemote(gid, operationId) {
   if (!types.CheckCanOperateRequest || !types.CheckCanOperateReply) {
-    return { canOperate: true, canStealNum: 0 };
+    throw requestError('好友操作预检查类型未加载', { errorCode: 'FRIEND_CHECK_TYPE_MISSING', stage: 'visit' });
   }
 
   try {
@@ -905,6 +1136,9 @@ async function checkCanOperateRemote(gid, operationId) {
       types.CheckCanOperateRequest.create({
         host_gid: toLong(gid),
         operation_id: toLong(operationId),
+        // Official CheckCanOperateRequest field 3; freeze the same host type
+        // used by this visit's Enter/Leave rather than guessing from nickname.
+        host_type: visitContext.getStore()?.token.hostType ?? 0,
       })
     ).finish();
     const { body } = await sendMsgAsync(
@@ -917,9 +1151,101 @@ async function checkCanOperateRemote(gid, operationId) {
       canOperate: !!reply.can_operate,
       canStealNum: toNum(reply.can_steal_num),
     };
-  } catch (_) {
-    return { canOperate: true, canStealNum: 0 };
+  } catch (error) {
+    throw error;
   }
+}
+
+async function friendFarming(gid, landIds, checkExpLimit = false) {
+  return runFriendVisitOperation(gid, () => require('./friend-operation-limits').helpFarming(gid, landIds, checkExpLimit));
+}
+
+async function friendHarvestDetailed(gid, landIds) {
+  const reply = await runFriendVisitOperation(gid, () => require('./friend-operation-limits').stealHarvest(gid, landIds));
+  const harvested = [...new Set((reply.land || []).map(land => toNum(land.id)).filter(id => landIds.includes(id)))];
+  return { ok: harvested.length, harvested, error: '' };
+}
+
+function classifyBadOperationFailure(error) {
+  if (!isConfirmedFriendRefusal(error)) return null;
+  const code = parseRpcErrorCode(error);
+  // 官方 PlantCannotPut*/PlantAlreadyHas*/PlantMax*：仅本地块不可放。
+  // PlantOpreateTimesLimit 也不能误作全账号每日99；坏操作总上限另有1001047。
+  if ([1001034, 1001035, 1001036, 1001037, 1001038, 1001039].includes(code)) return 'target_unavailable';
+  if (code === 1001046) return 'operation_limit';
+  if ([1001041, 1001042].includes(code)) return 'no_eligible_land';
+  if (code === 1001048) return 'friend_unavailable';
+  if (code === 1001047) return 'daily_limit';
+  return null;
+}
+
+async function putFriendItemsDetailed(gid, landIds, method) {
+  if (method !== 'PutInsects' && method !== 'PutWeeds') throw new TypeError('不支持的好友捣乱方法');
+  const requestType = method === 'PutInsects' ? types.PutInsectsRequest : types.PutWeedsRequest;
+  const replyType = method === 'PutInsects' ? types.PutInsectsReply : types.PutWeedsReply;
+  const limits = require('./friend-operation-limits');
+  if (typeof limits.recordBadOperationSuccess !== 'function') {
+    throw requestError('捣乱预算所有者需导出 recordBadOperationSuccess 后才可安全写入', { errorCode: 'FRIEND_BUDGET_INTERFACE_REQUIRED', stage: 'visit' });
+  }
+  const ids = [...new Set((Array.isArray(landIds) ? landIds : []).map(toNum).filter(id => Number.isSafeInteger(id) && id > 0))];
+  const opType = method === 'PutInsects' ? 'putBug' : 'putWeed';
+  const token = assertFriendVisitActive(gid).token;
+  if (token.badFriendUnavailable) return { ok: 0, failed: [], skipped: true, reason: 'friend_unavailable' };
+  let ok = 0;
+  const failed = [];
+  for (const landId of ids) {
+    if (limits.getBadRemainingTimes() <= 0) break;
+    const result = await runFriendVisitOperation(gid, async () => {
+      const token = assertFriendVisitActive(gid).token;
+      const payload = requestType.encode(requestType.create({ land_ids: [toLong(landId)], host_gid: toLong(gid),
+        host_type: token.hostType, reason: token.reason })).finish();
+      let response;
+      try { response = await sendMsgAsync('gamepb.plantpb.PlantService', method, payload); }
+      catch (error) {
+        const reason = classifyBadOperationFailure(error);
+        if (reason) {
+          // Handle the definitive refusal inside the owned sub-operation, so
+          // a full target does not poison Leave or the next eligible target.
+          if (reason === 'daily_limit') limits.markBadDailyLimitReached?.();
+          if (reason === 'friend_unavailable') token.badFriendUnavailable = true;
+          return { refused: true, reason, errorCode: parseRpcErrorCode(error), message: error.message };
+        }
+        error.confirmedBadCounts = { ...(error.confirmedBadCounts || {}), [opType]: ok };
+        throw error;
+      }
+      const reply = replyType.decode(response.body);
+      limits.updateOperationLimits(reply.operation_limits);
+      const confirmed = (reply.land || []).some(land => toNum(land.id) === landId);
+      if (!confirmed) throw requestError('放虫放草回包未确认目标土地，请只核对，不重复提交', {
+        errorCode: 'FRIEND_BAD_RESULT_UNKNOWN', stage: 'response', sent: true,
+        resultState: 'unknown', outcomeUnknown: true, retryable: false, confirmedBadCounts: { [opType]: ok },
+      });
+      // Count each confirmed land immediately. A later rejection/Leave failure
+      // must not erase an earlier real placement from today's statistics.
+      require('./stats').recordOperation(opType, 1);
+      require('./stats').saveStats?.();
+      ok++;
+      try { limits.recordBadOperationSuccess(1); }
+      catch (cause) {
+        throw requestError('投放已确认，但预算保存失败，暂停后续写入', {
+          errorCode: 'FRIEND_BAD_BUDGET_SAVE_FAILED', stage: 'response', sent: true,
+          resultState: 'unknown', outcomeUnknown: true, retryable: false,
+          confirmedBadCounts: { [opType]: ok }, cause,
+        });
+      }
+      return { refused: false };
+    });
+    if (result.refused) {
+      failed.push({ landId, reason: result.message, kind: result.reason, errorCode: result.errorCode });
+      // 确认拒绝且只涉及本地块时，跳过它，不重发；其它已选地块和虫草类型仍独立。
+      // 全好友不可放/账号总额度拒绝则结束此类型，不能把后续地块作为重试。
+      if (result.reason !== 'target_unavailable') break;
+      if (landId !== ids.at(-1)) await require('../utils/utils').randomDelay(500, 1000);
+      continue;
+    }
+    if (ok > 0 && landId !== ids.at(-1)) await require('../utils/utils').randomDelay(500, 1000);
+  }
+  return { ok, failed };
 }
 
 // ===== Quiet hours =====
@@ -981,6 +1307,10 @@ module.exports = {
   SYSTEM_NPC_FRIENDS,
   SYSTEM_NPC_GIDS,
   getDogName,
+  getCurrentKnownGids,
+  getFriendMutationGeneration,
+  noteFriendGidDeleted,
+  filterCurrentFriendGids,
   postToMaster,
   normalizeFriendGids,
   extractReplyFriends,
@@ -988,8 +1318,11 @@ module.exports = {
   buildFriendReply,
   syncKnownFriendGidsFromFriends,
   getEffectiveKnownQqFriendGids,
+  getInvalidKnownFriendGidSet,
   isEnterFarmBannedError,
   parseRpcErrorCode,
+  isConfirmedFriendRefusal,
+  classifyBadOperationFailure,
   isTransientNetworkError,
   isInvalidFriendAccessError,
   addFriendToBlacklist,
@@ -1004,7 +1337,22 @@ module.exports = {
   delFriend,
   enterFriendFarm,
   leaveFriendFarm,
-  checkCanOperateRemote,
+  withFriendVisitSession,
+  runFriendVisitOperation,
+  recoverLegacyFriendVisit,
+  assertFriendVisitActive,
+  getFriendTransportEpoch,
+  getFriendVisitSessionSnapshot: (options = {}) => {
+    const accountId = String(process.env.FARM_ACCOUNT_ID || getUserState()?.accountId || '');
+    // 被动面板诊断不推进状态机/写盘；实际访问才观察真实代际并处理恢复。
+    if (options.observeTransport !== false) observeFriendVisitTransport(accountId, getFriendTransportEpoch());
+    return getFriendVisitSessionSnapshot(accountId);
+  },
+  observeFriendVisitTransport,
+  putFriendItemsDetailed,
+  friendFarming,
+  friendHarvestDetailed,
+  checkCanOperateRemote: (gid, operationId) => runFriendVisitOperation(gid, () => checkCanOperateRemote(gid, operationId)),
   parseBriefDogInfoBytes,
   extractVisitEnterBriefDogInfo,
   clearAllInvalidKnownFriendGidCooldown,

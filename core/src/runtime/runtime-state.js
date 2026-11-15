@@ -52,6 +52,9 @@ function createRuntimeState(deps) {
             friendQuietHours: store.getFriendQuietHours(accountId),
             friendBlacklist: store.getFriendBlacklist(accountId),
             friendBadTargets: typeof store.getFriendBadTargets === 'function' ? store.getFriendBadTargets(accountId) : [],
+            // This is independent of automation.friend_bad. Without it an
+            // accepted primary-store resume leaves the worker paused tomorrow.
+            friendBadRetryDate: typeof store.getFriendBadRetryDate === 'function' ? store.getFriendBadRetryDate(accountId) : '',
             plantBlacklist: store.getPlantBlacklist(accountId),
             knownFriendGids: store.getKnownFriendGids(accountId),
             bagSeedPriority: store.getBagSeedPriority(accountId),

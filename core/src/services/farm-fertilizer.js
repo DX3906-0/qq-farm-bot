@@ -4,7 +4,7 @@ const { PlantPhase } = require('../config/config');
 const { toNum, toTimeSec, getServerTimeSec, log, logWarn, randomDelay } = require('../utils/utils');
 const { getAutomation } = require('../models/store');
 const { recordOperation } = require('./stats');
-const { getAllLands, fertilize, harvest, NORMAL_FERTILIZER_ID, ORGANIC_FERTILIZER_ID } = require('./farm-api');
+const { getAllLands, fertilize, runFarmCall, FARM_OPERATION_YIELD, NORMAL_FERTILIZER_ID, ORGANIC_FERTILIZER_ID } = require('./farm-api');
 const { getCurrentPhase } = require('./farm-land-analyzer');
 const fs = require('fs');
 const path = require('path');
@@ -26,12 +26,13 @@ const rainPoemLandState = new Map(); // landId -> { sig, normalSeasonKey }
 
 // ─── 常量 ───
 
-/** 全部可施肥土地类型 */
-const ALL_FERTILIZER_LAND_TYPES = ['purple', 'gold', 'black', 'red', 'normal'];
+/** 全部可施肥土地类型（6=蓝晶，兼容上游最新映射） */
+const ALL_FERTILIZER_LAND_TYPES = ['blue-crystal', 'purple', 'gold', 'black', 'red', 'normal'];
 
 /** 土地类型中文标签 */
 const FERTILIZER_LAND_TYPE_LABELS = {
-  purple: '紫土地',
+  'blue-crystal': '蓝晶土地',
+  purple: '紫晶土地',
   gold: '金土地',
   black: '黑土地',
   red: '红土地',
@@ -54,7 +55,19 @@ function isTransientNetworkError(err) {
  * @param {number[]} landIds - 地块 ID 列表
  * @returns {number} 成功施肥次数
  */
-async function fertilizeOrganicLoop(landIds) {
+function fertilizerOptions(options, type, onSuccess) {
+  return {
+    ...options,
+    onError: err => options.onError?.(err, 'fertilize'),
+    onSuccess: landId => {
+      recordOperation('fertilize', 1);
+      onSuccess?.(landId);
+      options.onFertilized?.(type);
+    },
+  };
+}
+
+async function fertilizeOrganicLoop(landIds, options = {}) {
   const ids = (Array.isArray(landIds) ? landIds : []).filter(Boolean);
   if (ids.length === 0) return 0;
 
@@ -67,13 +80,16 @@ async function fertilizeOrganicLoop(landIds) {
         land_ids: [toNum(landId)],
         fertilizer_id: toNum(ORGANIC_FERTILIZER_ID)
       })).finish();
-      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload);
-      successCount++;
-    } catch {
+      await runFarmCall(() => sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload), options, () => {
+        successCount++;
+        options.onSuccess?.(landId);
+      });
+    } catch (err) {
+      if (err === FARM_OPERATION_YIELD) throw err;
       break;
     }
     index = (index + 1) % ids.length;
-    await randomDelay(200, 300);
+    await (options.delay || randomDelay)(200, 300);
   }
   return successCount;
 }
@@ -209,10 +225,11 @@ function getFinalStageLands(lands, options = {}) {
 /** 根据等级获取土地类型 */
 function getLandTypeByLevel(level) {
   const lv = toNum(level);
-  if (lv === 5) return 'purple';   // 紫土地
-  if (lv === 4) return 'gold';     // 金土地
-  if (lv === 3) return 'black';    // 黑土地
-  if (lv === 2) return 'red';      // 红土地
+  if (lv === 6) return 'blue-crystal';
+  if (lv === 5) return 'purple';
+  if (lv === 4) return 'gold';
+  if (lv === 3) return 'black';
+  if (lv === 2) return 'red';
   return 'normal';
 }
 
@@ -226,6 +243,7 @@ function normalizeFertilizerLandTypes(types) {
     if (result.includes(normalized)) continue;
     result.push(normalized);
   }
+  // 旧版全选迁移由 store 在读盘时执行一次；运行时必须尊重用户显式取消蓝晶。
   return result;
 }
 
@@ -260,11 +278,11 @@ function formatFertilizerLandTypes(types) {
  *
  * @returns {{ rainstorm: boolean, remainSec: number }}
  */
-async function getRainstormStatus() {
+async function getRainstormStatus(options = {}) {
   try {
     // 延迟 require，避免与 activity.js 形成循环依赖
     const { getOwnWeatherStatus } = require('./activity');
-    const status = await getOwnWeatherStatus();
+    const status = await runFarmCall(() => getOwnWeatherStatus(), options);
     if (!status) return { rainstorm: false, remainSec: 0 };
 
     const rainstorm = status.rainstorm === true
@@ -277,6 +295,7 @@ async function getRainstormStatus() {
     const remainSec = endSec > nowSec ? endSec - nowSec : 0;
     return { rainstorm: remainSec > 0, remainSec };
   } catch (err) {
+    if (err === FARM_OPERATION_YIELD) throw err;
     if (isTransientNetworkError(err)) {
       // 网络抖动：保持上一帧雷雨状态，避免误判「雷雨结束」触发提前下降沿把累计清零。
       // 返回 remainSec 较大值，使本帧按中段反应式处理（不强制收尾），等下一帧恢复真实剩余时间。
@@ -480,7 +499,7 @@ function parseLandPhase(land) {
  * @param {object} landTypeMap - 地块类型映射
  * @returns {{ normal: number, organic: number }}
  */
-async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
+async function runRainPoemFertilizer(automation, landTypes, landTypeMap, options = {}) {
   const endSeconds = Math.max(60, toNum(automation.fertilizer_rain_poem_end_seconds) || RAIN_POEM_END_SECONDS_DEFAULT);
   const organicGap = Math.max(30, toNum(automation.fertilizer_rain_poem_organic_gap) || RAIN_POEM_ORGANIC_GAP_DEFAULT);
   // 中段反应式施肥的「雷雨剩余下限」：作物触发下一阶段时立即施普通肥制造更多变异判定；
@@ -489,7 +508,7 @@ async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
 
   const accId = String(process.env.FARM_ACCOUNT_ID || '').trim();
   const prevRain = rainPushState.get(accId) || false;
-  const { rainstorm, remainSec } = await getRainstormStatus();
+  const { rainstorm, remainSec } = await getRainstormStatus(options);
   if (rainstorm && !prevRain) {
     // 上升沿：初始化本次窗口统计（从磁盘恢复则不重复推「雷雨来临」）
     const recovered = initRainWindow(accId);
@@ -508,7 +527,7 @@ async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
     return { normal: 0, organic: 0 };
   }
 
-  const landsReply = await getAllLands();
+  const landsReply = await runFarmCall(() => getAllLands(), options);
   const lands = Array.isArray(landsReply && landsReply.lands) ? landsReply.lands : [];
   if (lands.length === 0) return { normal: 0, organic: 0 };
 
@@ -553,6 +572,15 @@ async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
   const midNormalTargets = [];   // 中段反应式：作物触发下一阶段立即施
   const endNormalTargets = [];   // 收尾保底：中段未触发变换的地块
   const normalAppliedThisRound = new Set(); // 本轮已施普通肥的地块（有机肥去重用）
+  const normalProgress = key => fertilizerOptions(options, 'normal', id => {
+    normalAppliedThisRound.add(id);
+    addWin(accId, key, 1);
+    const info = candidates.find(item => item.landId === id);
+    rainPoemLandState.set(id, {
+      sig: info.sig, normalSeasonKey: `${info.plantId}-${info.season}`,
+      triggeredNextStage: info.triggeredNextStage,
+    });
+  });
 
   // ── 依据本轮状态决定普通肥目标 ──
   for (const info of candidates) {
@@ -581,31 +609,25 @@ async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
 
   // ① 中段反应式普通肥：作物自然变换瞬间立即补普通肥，制造又一次阶段变换（更多闪电变异判定机会）
   if (midNormalTargets.length > 0) {
-    const nowCount = await fertilize(midNormalTargets, NORMAL_FERTILIZER_ID);
+    const nowCount = await fertilize(midNormalTargets, NORMAL_FERTILIZER_ID, normalProgress('midNormal'));
     if (nowCount > 0) {
       normalCount += nowCount;
-      addWin(accId, 'midNormal', nowCount);
-      for (const id of midNormalTargets) normalAppliedThisRound.add(id);
       log('施肥', `雷雨天中段：为 ${nowCount} 块地补普通肥（自然触发下一阶段 / 主动强制变换），制造闪电变异判定（雷雨剩余 ${remainSec}s）`, {
         module: 'farm', event: '雷雨天施肥', result: 'ok', type: 'normal',
         count: nowCount, remainSec
       });
-      recordOperation('fertilize', nowCount);
     }
   }
 
   // ② 收尾保底普通肥：中段未触发变换（或已闪电变异）的地块，统一补一次普通肥
   if (isEnd && endNormalTargets.length > 0) {
-    const nowCount = await fertilize(endNormalTargets, NORMAL_FERTILIZER_ID);
+    const nowCount = await fertilize(endNormalTargets, NORMAL_FERTILIZER_ID, normalProgress('endNormal'));
     if (nowCount > 0) {
       normalCount += nowCount;
-      addWin(accId, 'endNormal', nowCount);
-      for (const id of endNormalTargets) normalAppliedThisRound.add(id);
       log('施肥', `雷雨天收尾：为 ${nowCount} 块地保底补普通肥（中段未触发变换），触发阶段变换判定（雷雨剩余 ${remainSec}s）`, {
         module: 'farm', event: '雷雨天施肥', result: 'ok', type: 'normal',
         count: nowCount, remainSec
       });
-      recordOperation('fertilize', nowCount);
     }
   }
 
@@ -621,14 +643,13 @@ async function runRainPoemFertilizer(automation, landTypes, landTypeMap) {
       organicTargets.push(info.landId);
     }
     if (organicTargets.length > 0) {
-      organicCount = await fertilizeOrganicLoop(organicTargets);
+      organicCount = await fertilizeOrganicLoop(organicTargets,
+        fertilizerOptions(options, 'organic', () => addWin(accId, 'organic', 1)));
       if (organicCount > 0) {
-        addWin(accId, 'organic', organicCount);
         log('施肥', `雷雨天收尾：按生长时间为 ${organicCount} 块地（未闪电变异）施有机肥催熟，触发阶段变换判定（雷雨剩余 ${remainSec}s）`, {
           module: 'farm', event: '雷雨天施肥', result: 'ok', type: 'organic',
           count: organicCount, remainSec
         });
-        recordOperation('fertilize', organicCount);
       }
     }
   }
@@ -708,7 +729,7 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
   let allLands = [];
   const landTypeMap = new Map();
   try {
-    const landsReply = await getAllLands();
+    const landsReply = await runFarmCall(() => getAllLands(), options);
     allLands = Array.isArray(landsReply && landsReply.lands) ? landsReply.lands : [];
     for (const land of allLands) {
       if (!land) continue;
@@ -717,6 +738,7 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
       landTypeMap.set(landId, getLandTypeByLevel(land.level));
     }
   } catch (err) {
+    if (err === FARM_OPERATION_YIELD) throw err;
     if (!isTransientNetworkError(err)) {
       logWarn('施肥', `${label}：获取土地信息失败，按已知地块继续: ${err.message}`, {
         module: 'farm', event: eventLabel, result: 'error', reason
@@ -744,18 +766,17 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
   // 雷雨天联动施肥：仅在雷雨期间施肥，自身决定是否施普通肥/有机肥，
   // 不受巡田传入的 skipNormal 影响（后者是针对常规策略的节流）
   if (mode === RAIN_POEM_MODE) {
-    return await runRainPoemFertilizer(automation, landTypes, landTypeMap);
+    return await runRainPoemFertilizer(automation, landTypes, landTypeMap, options);
   }
 
   // 普通化肥
   if (!skipNormal && (mode === 'normal' || mode === 'both' || mode === 'smart') && targetIds.length > 0) {
-    normalCount = await fertilize(targetIds, NORMAL_FERTILIZER_ID);
+    normalCount = await fertilize(targetIds, NORMAL_FERTILIZER_ID, fertilizerOptions(options, 'normal'));
     if (normalCount > 0) {
       log('施肥', `${label}：已为 ${normalCount}/${targetIds.length} 块地施普通化肥（范围: ${landTypeLabels.join('、')}）`, {
         module: 'farm', event: eventLabel, result: 'ok', reason, type: 'normal',
         count: normalCount, landTypes
       });
-      recordOperation('fertilize', normalCount);
     }
   }
 
@@ -768,13 +789,12 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
     if (landTypeMap.size > 0) {
       organicTargets = filterLandIdsByTypes(organicTargets, landTypeMap, landTypes);
     }
-    organicCount = await fertilizeOrganicLoop(organicTargets);
+    organicCount = await fertilizeOrganicLoop(organicTargets, fertilizerOptions(options, 'organic'));
     if (organicCount > 0) {
       log('施肥', `${label}：有机化肥循环施肥完成，共施 ${organicCount} 次（范围: ${landTypeLabels.join('、')}）`, {
         module: 'farm', event: eventLabel, result: 'ok', reason, type: 'organic',
         count: organicCount, landTypes
       });
-      recordOperation('fertilize', organicCount);
     }
   } else if (mode === 'smart' || mode === 'smart_only' || mode === 'smart_normal' ||
       mode === 'final_normal' || mode === 'final_organic') {
@@ -792,9 +812,10 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
       const smartSeconds = toNum(automation.fertilizer_smart_seconds) || 3600;
 
       try {
-        const landsReply = await getAllLands();
+        const landsReply = await runFarmCall(() => getAllLands(), options);
         targetFertilizerLands = getFastMatureLands(landsReply && landsReply.lands, smartSeconds);
       } catch (err) {
+        if (err === FARM_OPERATION_YIELD) throw err;
         if (!isTransientNetworkError(err)) {
           logWarn('施肥', `获取全农场地块失败: ${err.message}`);
         }
@@ -812,9 +833,9 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
       const modeLabel = isFinalStageMode ? '最终阶段' : '快成熟';
 
       if (useOrganic) {
-        organicCount = await fertilizeOrganicLoop(targetFertilizerLands);
+        organicCount = await fertilizeOrganicLoop(targetFertilizerLands, fertilizerOptions(options, 'organic'));
       } else {
-        normalCount = await fertilize(targetFertilizerLands, fertId);
+        normalCount = await fertilize(targetFertilizerLands, fertId, fertilizerOptions(options, 'normal'));
       }
 
       const totalCount = useOrganic ? organicCount : normalCount;
@@ -823,7 +844,6 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
           module: 'farm', event: '施肥', result: 'ok',
           type: useOrganic ? 'organic' : 'normal', count: totalCount
         });
-        recordOperation('fertilize', totalCount);
       }
     }
   }
@@ -834,5 +854,8 @@ async function runFertilizerByConfig(explicitLandIds = [], options = {}) {
 module.exports = {
   ALL_FERTILIZER_LAND_TYPES,
   FERTILIZER_LAND_TYPE_LABELS,
+  getLandTypeByLevel,
+  normalizeFertilizerLandTypes,
+  filterLandIdsByTypes,
   runFertilizerByConfig
 };

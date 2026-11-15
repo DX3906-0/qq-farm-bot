@@ -72,3 +72,12 @@ message BuyGoodsReply {
 message GoodsUnlockNotify {
     repeated GoodsInfo goods_list = 1;
 }
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message ShowCond {
+    string type = 1;
+    string params = 2;
+}

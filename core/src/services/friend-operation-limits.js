@@ -3,9 +3,9 @@ const { getUserState } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { sendMsgAsync } = require('../utils/network');
 const { toLong } = require('../utils/utils');
-const { recordOperation: recordStatOp } = require('./stats');
 const fs = require('fs');
 const path = require('path');
+const { writeJsonFileAtomic } = require('./json-db');
 
 // ===== Operation limits state =====
 const operationLimits = new Map();
@@ -15,22 +15,24 @@ let helpAutoDisabledByLimit = false;
 let localBadOperationCount = 0;
 let currentBadAccountId = null;
 let currentHelpExpAccountId = null;
+let badDailyLimitReached = false;
 
-const PUT_BUG_OPERATION_ID = 10005;
-const PUT_WEED_OPERATION_ID = 10006;
+// 官方 BaseConfig.OperationId，不能混用除草/杀虫的 10005/10006。
+const PUT_BUG_OPERATION_ID = 10004;
+const PUT_WEED_OPERATION_ID = 10003;
 const GOLDEN_BUG_OPERATION_ID = 10015;
 const BAD_DAILY_LIMIT = 99;
 
 // ===== Operation type names =====
 const OP_NAMES = {
-  '10001': '帮好友浇水',
-  '10002': '帮好友除草',
-  '10003': '帮好友除虫',
-  '10004': '偷取好友作物',
-  '10005': '给好友放虫',
-  '10006': '给好友放草',
-  '10007': '帮好友复活',
-  '10008': '好友帮忙浇水',
+  '10001': '收获自己的作物',
+  '10002': '铲除作物',
+  '10003': '给好友放草',
+  '10004': '给好友放虫',
+  '10005': '帮好友除草',
+  '10006': '帮好友除虫',
+  '10007': '帮好友浇水',
+  '10008': '偷取好友作物',
   '10015': '给好友放黄金虫',
 };
 
@@ -56,9 +58,11 @@ function persistBadCount() {
   if (!currentBadAccountId) return;
   try {
     const fp = getBadCountPath(currentBadAccountId);
-    fs.mkdirSync(path.dirname(fp), { recursive: true });
-    fs.writeFileSync(fp, JSON.stringify({ date: getTodayKey(), count: localBadOperationCount }));
-  } catch { /* 持久化失败不影响运行 */ }
+    writeJsonFileAtomic(fp, { date: getTodayKey(), count: localBadOperationCount, dailyLimitReached: badDailyLimitReached });
+  } catch (error) {
+    log('统计', `保存捣乱预算失败：${error.message}`, { module: 'friend', event: '捣乱预算保存失败', result: 'error' });
+    throw error;
+  }
 }
 
 /**
@@ -68,11 +72,19 @@ function persistBadCount() {
  */
 function initLocalBadCount(accountId) {
   currentBadAccountId = accountId;
+  localBadOperationCount = 0;
+  badDailyLimitReached = false;
   if (!accountId) return;
   try {
     const data = JSON.parse(fs.readFileSync(getBadCountPath(accountId), 'utf-8'));
-    if (data.date === getTodayKey() && typeof data.count === 'number') {
-      localBadOperationCount = data.count;
+    if (data.date === getTodayKey() && Number.isSafeInteger(data.count) && data.count >= 0) {
+      const stats = require('./stats');
+      const confirmedCount = Math.max(0, Number(stats.getOperationCount('putBug')) || 0)
+        + Math.max(0, Number(stats.getOperationCount('putWeed')) || 0);
+      // A crash between the per-land stats commit and budget commit must not
+      // reopen already-used quota on restart. Keep any larger existing budget.
+      localBadOperationCount = Math.max(data.count, confirmedCount);
+      badDailyLimitReached = data.dailyLimitReached === true;
       return;
     }
   } catch { /* 无持久化或格式错误，走兜底 */ }
@@ -112,6 +124,7 @@ function checkDailyReset() {
     if (lastResetDate !== '') {
       log('系统', '跨日重置，清空操作限制缓存');
       localBadOperationCount = 0;
+      badDailyLimitReached = false;
       persistBadCount();
       persistHelpExpLimit();
       if (helpAutoDisabledByLimit) {
@@ -216,17 +229,30 @@ function getOperationDayTimes(operationId) {
 }
 
 function getBadOperationUsedCount() {
-  // 放虫(10005)与放草(10006)共享每日 99 次"捣乱"预算（放一次虫或一次草都各消耗虫+草额度 1 点），
+  // 放虫(10004)与放草(10003)共享每日 99 次"捣乱"预算（放一次虫或一次草都各消耗虫+草额度 1 点），
   // 用本地共享每日计数 localBadOperationCount 统计（已在 putInsectsDetailed/putWeedsDetailed 内按真实成功数累加）。
   return localBadOperationCount;
 }
 
-// 游戏每日虫(10005)/草(10006)共享 99 次"捣乱"预算：放一次虫或一次草，虫与草额度各减 1。
+// 游戏每日虫(10004)/草(10003)共享 99 次"捣乱"预算：放一次虫或一次草，虫与草额度各减 1。
 // 因此 bot 用本地共享每日计数 localBadOperationCount 统一计次（放虫与放草都累加 result.ok），
 // 上限 BAD_DAILY_LIMIT=99，天然实现"放一次虫/草，虫草共同减少"的联动约束。
 // 不依赖服务器回包的 operation_limits.day_times——实测其语义混乱（历史累计、虫草不相等），不可作为每日剩余判定。
 function getBadRemainingTimes() {
-  return Math.max(0, BAD_DAILY_LIMIT - localBadOperationCount);
+  checkDailyReset();
+  return badDailyLimitReached ? 0 : Math.max(0, BAD_DAILY_LIMIT - localBadOperationCount);
+}
+
+function markBadDailyLimitReached() {
+  checkDailyReset();
+  badDailyLimitReached = true;
+  persistBadCount();
+}
+
+function getBadBudgetSnapshot() {
+  const remaining = getBadRemainingTimes();
+  return { date: getTodayKey(), used: localBadOperationCount, limit: BAD_DAILY_LIMIT,
+    remaining, source: badDailyLimitReached ? 'server-daily-rejection' : 'local-confirmed-placements' };
 }
 
 function canOperateBad() {
@@ -234,7 +260,8 @@ function canOperateBad() {
 }
 
 function recordBadOperationSuccess(count) {
-  const n = Math.max(0, Number(count) || 0);
+  checkDailyReset();
+  const n = Number.isSafeInteger(count) && count > 0 ? count : 0;
   if (n > 0) {
     localBadOperationCount += n;
     persistBadCount();
@@ -474,128 +501,32 @@ async function stealHarvestDetailed(gid, landIds) {
   }
 }
 
-/**
- * Generic helper to put items (weeds/insects) on friend's lands one by one.
- * Returns the number of successful operations.
- */
+/** Compatibility entries share the owned, once-only placement implementation. */
 async function putPlantItems(gid, landIds, RequestType, ReplyType, rpcMethod) {
-  let ok = 0;
-  const ids = Array.isArray(landIds) ? landIds : [];
-
-  for (const landId of ids) {
-    try {
-      const payload = RequestType.encode(
-        RequestType.create({
-          land_ids: [toLong(landId)],
-          host_gid: toLong(gid),
-        })
-      ).finish();
-      const { body } = await sendMsgAsync(
-        'gamepb.plantpb.PlantService',
-        rpcMethod,
-        payload
-      );
-      const reply = ReplyType.decode(body);
-      updateOperationLimits(reply.operation_limits);
-      ok++;
-    } catch (err) {
-      const msg = (err && err.message) ? err.message : '未知错误';
-      if (msg.includes('1001046')) {
-        // Already done - silently skip
-      } else {
-        log('好友', `放虫/放草失败: landId=${landId}, 错误: ${msg}`, {
-          module: 'friend',
-          event: '放虫放草失败',
-          landId,
-          error: msg,
-        });
-      }
-      await require('../utils/utils').randomDelay(500, 1500);
-    }
-
-    if (ok > 0) {
-      await require('../utils/utils').randomDelay(500, 1000);
-    }
-  }
-
-  return ok;
+  return (await putPlantItemsDetailed(gid, landIds, RequestType, ReplyType, rpcMethod)).ok;
 }
 
-/**
- * Detailed version of putPlantItems that returns failure details.
- * Returns: { ok: number, failed: [{landId, reason}] }
- */
-async function putPlantItemsDetailed(gid, landIds, RequestType, ReplyType, rpcMethod) {
-  let ok = 0;
-  const failed = [];
-  const ids = Array.isArray(landIds) ? landIds : [];
-
-  for (const landId of ids) {
-    try {
-      const payload = RequestType.encode(
-        RequestType.create({
-          land_ids: [toLong(landId)],
-          host_gid: toLong(gid),
-        })
-      ).finish();
-      const { body } = await sendMsgAsync(
-        'gamepb.plantpb.PlantService',
-        rpcMethod,
-        payload
-      );
-      const reply = ReplyType.decode(body);
-      updateOperationLimits(reply.operation_limits);
-      ok++;
-    } catch (err) {
-      const msg = (err && err.message) ? err.message : '未知错误';
-      failed.push({
-        landId,
-        reason: msg,
-      });
-      if (!msg.includes('1001046') && !msg.includes('1001039') && !msg.includes('已达上限')) {
-        log('好友', `放虫/放草失败: landId=${landId}, 错误: ${msg}`, {
-          module: 'friend',
-          event: '放虫放草失败',
-          landId,
-          error: msg,
-          detailed: true,
-        });
-      }
-    }
-    if (ok > 0) {
-      await require('../utils/utils').randomDelay(500, 1000);
-    }
-  }
-
-  return { ok, failed };
+async function putPlantItemsDetailed(gid, landIds, _RequestType, _ReplyType, rpcMethod) {
+  // 不保留“无异常即++”的第二套写循环；预算和真实统计只由好友会话所有者提交。
+  return require('./friend-api').putFriendItemsDetailed(gid, landIds, rpcMethod);
 }
 
 // ===== Specific put operations =====
 
 async function putInsects(gid, landIds) {
-  const ok = await putPlantItems(gid, landIds, types.PutInsectsRequest, types.PutInsectsReply, 'PutInsects');
-  recordBadOperationSuccess(ok);
-  if (ok > 0) recordStatOp('putBug', ok);
-  return ok;
+  return putPlantItems(gid, landIds, types.PutInsectsRequest, types.PutInsectsReply, 'PutInsects');
 }
 
 async function putWeeds(gid, landIds) {
-  const ok = await putPlantItems(gid, landIds, types.PutWeedsRequest, types.PutWeedsReply, 'PutWeeds');
-  recordBadOperationSuccess(ok);
-  if (ok > 0) recordStatOp('putWeed', ok);
-  return ok;
+  return putPlantItems(gid, landIds, types.PutWeedsRequest, types.PutWeedsReply, 'PutWeeds');
 }
 
 async function putInsectsDetailed(gid, landIds) {
-  const result = await putPlantItemsDetailed(gid, landIds, types.PutInsectsRequest, types.PutInsectsReply, 'PutInsects');
-  recordBadOperationSuccess(result.ok);
-  return result;
+  return putPlantItemsDetailed(gid, landIds, types.PutInsectsRequest, types.PutInsectsReply, 'PutInsects');
 }
 
 async function putWeedsDetailed(gid, landIds) {
-  const result = await putPlantItemsDetailed(gid, landIds, types.PutWeedsRequest, types.PutWeedsReply, 'PutWeeds');
-  recordBadOperationSuccess(result.ok);
-  return result;
+  return putPlantItemsDetailed(gid, landIds, types.PutWeedsRequest, types.PutWeedsReply, 'PutWeeds');
 }
 
 // ===== Exports =====
@@ -617,6 +548,9 @@ module.exports = {
   getBadRemainingTimes,
   getOperationDayTimes,
   getOperationLimits,
+  recordBadOperationSuccess,
+  markBadDailyLimitReached,
+  getBadBudgetSnapshot,
   getCanGetHelpExp,
   setCanGetHelpExp,
   restoreHelpExpLimit,

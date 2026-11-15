@@ -1,8 +1,11 @@
 import { storeToRefs } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, inject, onScopeDispose, ref, watch } from 'vue'
 import api from '@/api'
 import { useSettingStore } from '@/stores/setting'
 import { useUserStore } from '@/stores/user'
+import { copySettings, createSettingsDraft, SETTINGS_DRAFT_REGISTRY, settingsFingerprint } from '@/composables/settings/useSettingsDraft'
+import type { SettingsDraftRegistry } from '@/composables/settings/useSettingsDraft'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 
 interface DeviceProtocolConfig {
   enabled: boolean
@@ -96,7 +99,7 @@ const CHANNEL_DOCS: Record<string, string> = {
   wxpusher: 'https://wxpusher.zjiecode.com/docs/#/',
 }
 
-export function useUserSettings(showAlert: (message: string, type?: AlertType) => void) {
+export function useUserSettings(showAlert: (message: string, type?: AlertType) => void, draftRegistry?: SettingsDraftRegistry) {
   const userStore = useUserStore()
   const settingStore = useSettingStore()
   const { settings } = storeToRefs(settingStore)
@@ -106,6 +109,11 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
   const offlineTesting = ref(false)
   const deviceProtocolLoading = ref(false)
   const deviceProtocolSaving = ref(false)
+  const deviceProtocolReadError = ref('')
+  const offlineReadError = ref('')
+  const userMutationStates = computed(() => settingStore.userMutationStates)
+  const userMutationErrors = computed(() => settingStore.userMutationErrors)
+  let disposed = false
 
   const passwordForm = ref({
     old: '',
@@ -135,6 +143,25 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
     senderName: '',
     recipientEmail: '',
     emailContent: '',
+  })
+
+  const deviceDraft = createSettingsDraft(() => deviceProtocolForm.value, value => { deviceProtocolForm.value = value })
+  const offlineDraft = createSettingsDraft(() => localOffline.value, value => { localOffline.value = value })
+  const passwordDraft = createSettingsDraft(() => passwordForm.value, value => { passwordForm.value = value })
+  passwordDraft.rebase()
+  // Vue inject reads ancestors, not provide() on this same Settings instance.
+  const registry = draftRegistry || inject(SETTINGS_DRAFT_REGISTRY, null)
+  const unregister = [
+    registry?.register('device-protocol', { label: '设备协议', scope: 'user', dirty: () => deviceDraft.dirty.value, saving: () => deviceProtocolSaving.value, reset: deviceDraft.reset }),
+    registry?.register('offline-reminder', { label: '下线提醒', scope: 'user', dirty: () => offlineDraft.dirty.value, saving: () => offlineSaving.value, reset: offlineDraft.reset }),
+    registry?.register('password', { label: '密码输入', scope: 'user', dirty: () => passwordDraft.dirty.value, saving: () => passwordSaving.value, reset: passwordDraft.reset }),
+  ]
+  onScopeDispose(() => {
+    disposed = true
+    unregister.forEach(remove => remove?.())
+    deviceDraft.clear(); offlineDraft.clear(); passwordDraft.clear()
+    passwordForm.value = { old: '', new: '', confirm: '' }
+    localOffline.value.smtpPass = ''; localOffline.value.token = ''
   })
 
   const channelOptions = [
@@ -250,53 +277,54 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
   }
 
   async function fetchDeviceProtocol() {
+    if (LOCAL_UI_READONLY || disposed || deviceProtocolLoading.value) return false
     deviceProtocolLoading.value = true
+    deviceProtocolReadError.value = ''
     try {
-      const { data } = await api.get('/api/user/device-protocol')
-      if (data?.ok)
-        applyDeviceProtocolConfig(data.config)
+      const result = await settingStore.fetchUserConfig('device')
+      if (disposed) return false
+      if (!result.ok) { deviceProtocolReadError.value = result.error || '设备配置读取失败'; return false }
+      const editing = deviceDraft.dirty.value
+      if (!editing) applyDeviceProtocolConfig(result.config)
+      deviceDraft.rebase(result.config)
+      return true
     }
-    catch (e) {
-      console.error('加载设备协议配置失败', e)
-    }
-    finally {
-      deviceProtocolLoading.value = false
-    }
+    finally { deviceProtocolLoading.value = false }
+  }
+  async function fetchOfflineSettings() {
+    if (LOCAL_UI_READONLY || disposed) return false
+    const result = await settingStore.fetchUserConfig('offline')
+    if (disposed) return false
+    if (!result.ok) { offlineReadError.value = result.error || '下线提醒读取失败'; return false }
+    offlineReadError.value = ''
+    if (!offlineDraft.dirty.value) localOffline.value = copySettings(result.config)
+    offlineDraft.rebase(result.config)
+    return true
   }
 
   async function handleSaveDeviceProtocol() {
+    if (LOCAL_UI_READONLY || disposed || deviceProtocolSaving.value || !deviceDraft.ready.value || deviceProtocolReadError.value) return false
+    const submitted = copySettings(deviceProtocolForm.value)
+    const payload = Object.fromEntries(Object.entries(submitted).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value]))
     deviceProtocolSaving.value = true
     try {
-      const payload = {
-        enabled: !!deviceProtocolForm.value.enabled,
-        userAgent: String(deviceProtocolForm.value.userAgent || '').trim(),
-        deviceBrand: String(deviceProtocolForm.value.deviceBrand || '').trim(),
-        deviceModel: String(deviceProtocolForm.value.deviceModel || '').trim(),
-        deviceMac: String(deviceProtocolForm.value.deviceMac || '').trim(),
-        deviceId: String(deviceProtocolForm.value.deviceId || '').trim(),
-        imei: String(deviceProtocolForm.value.imei || '').trim(),
+      const result = await settingStore.saveUserConfig('device', () => api.post('/api/user/device-protocol', payload), payload, deviceDraft.confirmed())
+      if (disposed) return false
+      if (result.ok) {
+        if (settingsFingerprint(deviceProtocolForm.value) === settingsFingerprint(submitted)) applyDeviceProtocolConfig(result.config)
+        deviceDraft.rebase(result.config)
+        showAlert('设备协议配置已读回确认', 'primary')
       }
-      const { data } = await api.post('/api/user/device-protocol', payload)
-      if (data?.ok) {
-        applyDeviceProtocolConfig(data.config)
-        showAlert('设备协议配置已保存', 'primary')
-      }
-      else {
-        showAlert(`保存失败: ${data?.error || '未知错误'}`, 'danger')
-      }
+      else showAlert(result.error || '保存结果未确认', 'danger')
+      return result.ok === true
     }
-    catch (e: any) {
-      const msg = e?.response?.data?.error || e?.message || '请求失败'
-      showAlert(`保存失败: ${msg}`, 'danger')
-    }
-    finally {
-      deviceProtocolSaving.value = false
-    }
+    finally { deviceProtocolSaving.value = false }
   }
 
   function syncLocalOfflineSettings() {
-    if (settings.value?.offlineReminder) {
-      localOffline.value = JSON.parse(JSON.stringify(settings.value.offlineReminder))
+    if (settingStore.settingsAccountId && settings.value?.offlineReminder && !offlineDraft.dirty.value) {
+      localOffline.value = copySettings(settings.value.offlineReminder)
+      offlineDraft.rebase()
     }
   }
 
@@ -305,6 +333,7 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
   }, { deep: true })
 
   async function handleChangePassword() {
+    if (LOCAL_UI_READONLY || disposed || passwordSaving.value || settingStore.userMutationStates.password === 'unknown') return false
     if (!passwordForm.value.old || !passwordForm.value.new) {
       showAlert('请填写完整', 'danger')
       return
@@ -318,13 +347,15 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
       return
     }
 
+    const submitted = copySettings(passwordForm.value)
     passwordSaving.value = true
     try {
-      const res = await userStore.changePassword(passwordForm.value.old, passwordForm.value.new)
-
+      const res = await settingStore.sendUserAction('password', () => api.post('/api/user/change-password', { oldPassword: submitted.old, newPassword: submitted.new }))
+      if (disposed) return false
       if (res.ok) {
         showAlert('密码修改成功，请重新登录', 'primary')
         passwordForm.value = { old: '', new: '', confirm: '' }
+        passwordDraft.rebase()
         setTimeout(() => {
           userStore.logout()
           window.location.href = '/login'
@@ -340,40 +371,38 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
   }
 
   async function handleSaveOffline() {
+    if (LOCAL_UI_READONLY || disposed || offlineSaving.value || offlineTesting.value || !offlineDraft.ready.value) return false
+    // Enabling automatic deletion is a separate destructive capability. This
+    // frontend improvement never supplies its confirmation implicitly.
+    if (Number(localOffline.value.offlineDeleteSec) > 0 && Number(offlineDraft.confirmed()?.offlineDeleteSec || 0) <= 0) {
+      showAlert('启用离线自动删除需要单独确认；本次不会自动提交该危险设置。', 'danger'); return false
+    }
+    const submitted = copySettings(localOffline.value)
     offlineSaving.value = true
     try {
-      const res = await settingStore.saveOfflineConfig(localOffline.value)
-
+      const res = await settingStore.saveOfflineConfig(submitted)
+      if (disposed) return false
       if (res.ok) {
-        showAlert('下线提醒设置已保存', 'primary')
+        if (settingsFingerprint(localOffline.value) === settingsFingerprint(submitted)) localOffline.value = copySettings(res.config)
+        offlineDraft.rebase(res.config)
+        showAlert('下线提醒设置已读回确认', 'primary')
       }
-      else {
-        showAlert(`保存失败: ${res.error || '未知错误'}`, 'danger')
-      }
+      else showAlert(res.error || '保存结果未确认', 'danger')
+      return res.ok === true
     }
-    finally {
-      offlineSaving.value = false
-    }
+    finally { offlineSaving.value = false }
   }
 
   async function handleTestOffline() {
+    if (LOCAL_UI_READONLY || disposed || offlineTesting.value || offlineSaving.value) return
+    const submitted = copySettings(localOffline.value)
     offlineTesting.value = true
     try {
-      const { data } = await api.post('/api/settings/offline-reminder/test', localOffline.value)
-      if (data?.ok) {
-        showAlert('测试消息发送成功', 'primary')
-      }
-      else {
-        showAlert(`测试失败: ${data?.error || '未知错误'}`, 'danger')
-      }
+      const result = await settingStore.sendUserAction('notification', () => api.post('/api/settings/offline-reminder/test', submitted))
+      if (disposed) return
+      showAlert(result.ok ? '测试通知请求已受理；是否收到请在接收端确认。' : result.error || '测试通知结果未确认', result.ok ? 'primary' : 'danger')
     }
-    catch (e: any) {
-      const msg = e?.response?.data?.error || e?.message || '请求失败'
-      showAlert(`测试失败: ${msg}`, 'danger')
-    }
-    finally {
-      offlineTesting.value = false
-    }
+    finally { offlineTesting.value = false }
   }
 
   return {
@@ -382,6 +411,12 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
     offlineTesting,
     deviceProtocolLoading,
     deviceProtocolSaving,
+    deviceProtocolReadError,
+    offlineReadError,
+    deviceProtocolReady: deviceDraft.ready,
+    offlineReady: offlineDraft.ready,
+    userMutationStates,
+    userMutationErrors,
     passwordForm,
     deviceProtocolPresetOptions,
     selectedDevicePreset,
@@ -396,6 +431,7 @@ export function useUserSettings(showAlert: (message: string, type?: AlertType) =
     fillRandomImei,
     applyDevicePreset,
     fetchDeviceProtocol,
+    fetchOfflineSettings,
     syncLocalOfflineSettings,
     handleSaveDeviceProtocol,
     handleChangePassword,

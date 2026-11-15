@@ -9,12 +9,13 @@
 用法：python start_guard_detached.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import time
 
 DIR = os.path.dirname(os.path.abspath(__file__))
-PYW = r"C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"
+PYW = os.environ.get('FARM_PYTHONW') or shutil.which('pythonw.exe') or sys.executable
 SCRIPT = os.path.join(DIR, 'napcat-code-guard.py')
 PID_FILE = os.path.join(DIR, 'napcat_guard.pid')
 LOG = os.path.join(DIR, 'napcat_guard.log')

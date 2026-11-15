@@ -57,13 +57,15 @@ function registerAdminIllustratedRoutes({
     if (!accountId) return;
 
     try {
-      const refresh = req.query.refresh === "true";
+      // 2026-11-02：官方 GetIllustratedListV2Request 只有 rarity + type，
+      // 旧的 refresh 参数不存在（field 1 是 rarity），传布尔值会造成字段错位。
+      const rarity = Number(req.query.rarity) || 0;
       const illustratedType = Number(req.query.illustrated_type) || 1;
       const userLevel = getUserLevel(provider, accountId);
 
       adminLogger.info("获取图鉴列表请求", {
         accountId,
-        refresh,
+        rarity,
         illustratedType,
       });
 
@@ -74,8 +76,8 @@ function registerAdminIllustratedRoutes({
           adminLogger,
           tolerateFailure: true,
         }),
-        provider.getIllustratedList(accountId, refresh, illustratedType),
-        getNongmePlantData(refresh),
+        provider.getIllustratedList(accountId, rarity, illustratedType),
+        getNongmePlantData(false),
       ]);
 
       adminLogger.info("图鉴列表数据", {

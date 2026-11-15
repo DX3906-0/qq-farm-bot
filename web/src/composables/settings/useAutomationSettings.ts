@@ -1,12 +1,14 @@
 import type { Ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import { ref } from 'vue'
+import { onScopeDispose, ref } from 'vue'
 import api from '@/api'
 import { useSettingStore } from '@/stores/setting'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { copySettings } from '@/composables/settings/useSettingsDraft'
 
 type AlertType = 'primary' | 'danger'
 
-const allFertilizerLandTypes = ['purple', 'gold', 'black', 'red', 'normal']
+const allFertilizerLandTypes = ['blue-crystal', 'purple', 'gold', 'black', 'red', 'normal']
 
 /**
  * automation 默认值唯一来源。
@@ -30,6 +32,8 @@ export const defaultAutomation = {
   star_passport_claim: false,
   star_record_claim: false,
   solar_terms_claim: false,
+  solar_terms_quiz_notify: false,
+  solar_terms_auto_answer: false,
   qingmei_seed_claim: false,
   qingmei_wine_brew: false,
   qixi_dew_use: false,
@@ -139,9 +143,12 @@ export function useAutomationSettings({
 
   const automationSaving = ref(false)
   const autoCodeRefreshing = ref(false)
+  let disposed = false
+  onScopeDispose(() => { disposed = true })
 
   const fertilizerLandTypeOptions = [
-    { label: '紫土地', value: 'purple' },
+    { label: '蓝晶土地', value: 'blue-crystal' },
+    { label: '紫晶土地', value: 'purple' },
     { label: '金土地', value: 'gold' },
     { label: '黑土地', value: 'black' },
     { label: '红土地', value: 'red' },
@@ -172,6 +179,7 @@ export function useAutomationSettings({
         continue
       normalized.push(value)
     }
+    // 后端仅在读旧配置时迁移一次；前端不得把用户主动取消的蓝晶重新选中。
     return normalized
   }
 
@@ -185,10 +193,10 @@ export function useAutomationSettings({
     if (settings.value) {
       localAutomationSettings.value.automation = settings.value.automation
         ? {
-            ...defaultAutomation,
-            ...settings.value.automation,
+            ...JSON.parse(JSON.stringify(defaultAutomation)),
+            ...JSON.parse(JSON.stringify(settings.value.automation)),
           }
-        : { ...defaultAutomation }
+        : JSON.parse(JSON.stringify(defaultAutomation))
 
       localAutomationSettings.value.automation.fertilizer_land_types = normalizeFertilizerLandTypes(localAutomationSettings.value.automation.fertilizer_land_types)
       localAutomationSettings.value.automation.qixi_friend_priority = normalizeQixiFriendPriority(localAutomationSettings.value.automation.qixi_friend_priority)
@@ -230,15 +238,14 @@ export function useAutomationSettings({
   }
 
   async function saveAutomationSettings() {
-    if (!currentAccountId.value)
-      return
+    if (LOCAL_UI_READONLY || disposed || !currentAccountId.value || automationSaving.value)
+      return false
     const accountId = String(currentAccountId.value)
     automationSaving.value = true
     try {
       localAutoCodeRefresh.value.intervalMinutes = normalizeAutoCodeRefreshInterval(localAutoCodeRefresh.value.intervalMinutes)
       localAutomationSettings.value.automation.qixi_friend_priority = normalizeQixiFriendPriority(localAutomationSettings.value.automation.qixi_friend_priority)
-      const fullSettings = {
-        ...settings.value,
+      const fullSettings = copySettings({
         automation: localAutomationSettings.value.automation,
         autoCodeRefresh: localAutoCodeRefresh.value,
         autoAcceptFriendMinLevel: localAutomationSettings.value.autoAcceptFriendMinLevel,
@@ -250,27 +257,28 @@ export function useAutomationSettings({
         goldenBugKeepCount: localAutomationSettings.value.goldenBugKeepCount,
         goldenBugRoundLimit: localAutomationSettings.value.goldenBugRoundLimit,
         friendBadTargets: localAutomationSettings.value.friendBadTargets,
-      }
+      })
       // 记录保存前的化肥购买开关状态，仅当开关从关变开时才立即触发检测购买
       // （避免每次保存设置都触发购买，导致误买化肥）
       const prevBuyOrganic = !!settings.value?.automation?.fertilizer_buy_organic
       const prevBuyNormal = !!settings.value?.automation?.fertilizer_buy_normal
       const res = await settingStore.saveSettings(accountId, fullSettings)
+      if (disposed || String(currentAccountId.value) !== accountId) return false
       if (res.ok) {
         showAlert('自动控制设置已保存', 'primary')
 
         // 仅当化肥购买开关从关变开时，立即检测并购买一次
-        const newBuyOrganic = !!localAutomationSettings.value.automation.fertilizer_buy_organic
-        const newBuyNormal = !!localAutomationSettings.value.automation.fertilizer_buy_normal
+        const newBuyOrganic = !!fullSettings.automation.fertilizer_buy_organic
+        const newBuyNormal = !!fullSettings.automation.fertilizer_buy_normal
         if ((newBuyOrganic && !prevBuyOrganic) || (newBuyNormal && !prevBuyNormal)) {
           try {
             const buyRes = await api.post('/api/fertilizer/check-and-buy', {
-              buyOrganic: localAutomationSettings.value.automation.fertilizer_buy_organic,
-              buyNormal: localAutomationSettings.value.automation.fertilizer_buy_normal,
-              organicCount: localAutomationSettings.value.fertilizerBuyOrganicCount,
-              organicThresholdHours: localAutomationSettings.value.fertilizerBuyOrganicThresholdHours,
-              normalCount: localAutomationSettings.value.fertilizerBuyNormalCount,
-              normalThresholdHours: localAutomationSettings.value.fertilizerBuyNormalThresholdHours,
+              buyOrganic: fullSettings.automation.fertilizer_buy_organic,
+              buyNormal: fullSettings.automation.fertilizer_buy_normal,
+              organicCount: fullSettings.fertilizerBuyOrganicCount,
+              organicThresholdHours: fullSettings.fertilizerBuyOrganicThresholdHours,
+              normalCount: fullSettings.fertilizerBuyNormalCount,
+              normalThresholdHours: fullSettings.fertilizerBuyNormalThresholdHours,
             }, {
               headers: { 'x-account-id': accountId },
             })
@@ -289,6 +297,7 @@ export function useAutomationSettings({
       else {
         showAlert(`保存失败: ${res.error}`, 'danger')
       }
+      return res.ok === true
     }
     finally {
       automationSaving.value = false

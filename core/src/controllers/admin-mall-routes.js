@@ -1,5 +1,17 @@
-const { parseMallPriceValue, parseMallLimitInfo } = require("../services/mall");
-  const { toNum } = require("../utils/utils");
+// 2026-11-02：mallpb.proto 换成官方定义后，price/reward_items/purchase_limit
+// 都是结构化字段，无需手写 varint 解析（旧的 parse* 函数已无调用方）。
+const { toNum } = require("../utils/utils");
+const { getItemImageById, getItemById } = require("../config/gameConfig");
+
+// 服务端 pic 可能是相对路径 / CDN 路径，统一成可直接 <img src> 的形式
+function normalizePicUrl(pic) {
+  if (!pic) return "";
+  const s = String(pic).trim();
+  if (!s) return "";
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith("/")) return s;
+  return "/" + s;
+}
 
 const MALL_GOODS_ORDER = [1002, 1003, 1006];
 const MALL_GOODS_PRICE_OVERRIDES = {
@@ -75,70 +87,114 @@ function registerAdminMallRoutes({
       if (!status || !status.connection || !status.connection.connected) {
         return res.json({
           ok: false,
-          error: "获取道具商城失败:\x20账号未运行",
+          error: "获取商城失败:\x20账号未运行",
         });
       }
 
+      // slotType 对应游戏的商场分栏（1=主商城 4=SVIP 5=限时 等）
+      const slotType = Math.max(1, toNum(req.query.slot) || 1);
       const userTicket = status?.status?.coupon || 0;
-      const discounts = await provider.getMallGoods(accountId);
+      const discounts = await provider.getMallGoods(accountId, slotType);
       const goods = [];
+      const typeCounts = {};
 
-      for (const discount of discounts) {
-        const id = toNum(discount.goods_id) || 0;
-        if (!MALL_GOODS_ORDER.includes(id)) continue;
+      for (const raw of discounts) {
+        const id = toNum(raw.goods_id) || 0;
+        if (!id) continue;
 
-        const meta = MALL_GOODS_META[id];
-        if (!meta) continue;
+        // ---- 结构化字段（proto 已正确解码，无需手写 varint）----
+        // price: corepb.Item { id=货币道具id, count=单价 }
+        const priceItem = raw.price || {};
+        const currencyId = toNum(priceItem.id) || 0;
+        const parsedPrice = toNum(priceItem.count) || 0;
 
-        const isFree = discount.is_free === true;
-        const isLimited = discount.is_limited === true;
-        const price =
-          MALL_GOODS_PRICE_OVERRIDES[id] || parseMallPriceValue(discount.price);
-        let limitCount = 0;
-        let boughtNum = 0;
-        if (isLimited && discount.limit) {
-          try {
-            const limitInfo = parseMallLimitInfo(discount.limit);
-            if (limitInfo) {
-              limitCount = limitInfo.limitCount || 0;
-              boughtNum = limitInfo.boughtNum || 0;
-            }
-          } catch {}
-        }
+        // reward_items: repeated corepb.Item，首个非货币物品当作图标/名称来源
+        const rewards = (Array.isArray(raw.reward_items) ? raw.reward_items : [])
+          .map(it => ({ id: toNum(it.id) || 0, count: toNum(it.count) || 0 }))
+          .filter(it => it.id > 0);
+
+        // purchase_limit: { limit_type, bought_count, limit_count }
+        const pl = raw.purchase_limit || {};
+        const limitType = toNum(pl.limit_type) || 0;
+        const boughtNum = toNum(pl.bought_count) || 0;
+        const limitCount = toNum(pl.limit_count) || 0;
+
+        const isFree = raw.is_free === true;
+        const isAvailable = raw.is_available !== false;
+
+        // 图片：服务端 pic 优先（通常是 CDN 相对路径），否则用奖励物品图标
+        const pic = typeof raw.pic === 'string' ? raw.pic.trim() : '';
+        const iconFromReward = rewards.length
+          ? (getItemImageById(rewards[0].id) || '')
+          : '';
+        const images = [];
+        if (pic) images.push(normalizePicUrl(pic));
+        if (iconFromReward) images.push(iconFromReward);
+
+        // 名称：服务端 name 优先（官方就叫这个），本地 meta 兜底修正
+        const meta = MALL_GOODS_META[id] || null;
+        const name = (raw.name && String(raw.name).trim())
+          || meta?.name
+          || (rewards.length ? (getItemById(rewards[0].id)?.name || '') : '')
+          || ("\u5546\u54c1 " + id);
 
         const isSoldOut = limitCount > 0 && boughtNum >= limitCount;
+        const goodsType = toNum(raw.goods_type) || 0;
+        typeCounts[goodsType] = (typeCounts[goodsType] || 0) + 1;
+
+        // 折扣文案
+        const discountText = typeof raw.discount_text === 'string' ? raw.discount_text : '';
+
         goods.push({
           id,
           goodsId: id,
-          name: meta.name,
-          type: toNum(discount.type) || 0,
-          itemIds: [],
-          price,
+          name,
+          type: goodsType,
+          itemIds: rewards.map(r => r.id),
+          rewards,
+          price: parsedPrice,
+          currencyId,
+          origPrice: parsedPrice,
           isFree,
-          isLimited,
+          isAvailable,
+          isLimited: limitCount > 0,
           limitCount,
           boughtNum,
+          limitType,
           isSoldOut,
-          discount: discount.discount || "",
-          images: meta.images,
-          layout: meta.layout,
-          canBuy: !isSoldOut && (isFree || userTicket >= price),
+          discount: discountText,
+          images,
+          pic,
+          canBuy: isAvailable && !isSoldOut,
         });
       }
 
-      goods.sort(
-        (left, right) =>
-          MALL_GOODS_ORDER.indexOf(left.goodsId) -
-          MALL_GOODS_ORDER.indexOf(right.goodsId),
-      );
-      res.json({ ok: true, data: goods, userTicket });
-    } catch (error) {
-      adminLogger.error("获取道具商城失败", {
-        error: error.message,
-        stack: error.stack,
+      // 已知商品优先（白名单顺序），其余按 id 升序，保证展示稳定
+      const orderIndex = new Map(MALL_GOODS_ORDER.map((id, idx) => [id, idx]));
+      goods.sort((a, b) => {
+        const oa = orderIndex.has(a.id) ? orderIndex.get(a.id) : 9999;
+        const ob = orderIndex.has(b.id) ? orderIndex.get(b.id) : 9999;
+        if (oa !== ob) return oa - ob;
+        return a.id - b.id;
       });
-      const message = error.message || "未知错误";
-      res.json({ ok: false, error: `获取道具商城失败:\x20${  message}` });
+
+      // 按 type 汇总成分类
+      const categories = Object.keys(typeCounts)
+        .map(t => ({ type: Number(t), count: typeCounts[t] }))
+        .sort((a, b) => b.count - a.count);
+
+      return res.json({
+        ok: true,
+        data: {
+          goods,
+          categories,
+          slotType,
+          userTicket,
+          total: goods.length,
+        },
+      });
+    } catch (e) {
+      return sendProviderError(res, e, "获取商城失败");
     }
   });
 

@@ -19,14 +19,27 @@ const CURRENCY_NAMES = {
 const AUTO_BUY_CHECK_INTERVAL_MS = 2 * 60 * 1000;
 
 function normalizeNPC(reply) {
-  const npc = reply?.npc;
+  // Proto默认active=false是合法的“不在期”；丢失响应或非协议对象不能伪装成不在期。
+  if (!reply || typeof reply !== 'object' || typeof reply.active !== 'boolean') {
+    throw Object.assign(new Error('神秘商人状态响应不完整'), { errorCode: 'MYSTERY_SHOP_INVALID_RESPONSE', stage: 'decode' });
+  }
+  const npc = reply.npc;
   const itemId = toNum(npc?.item_id);
   const itemInfo = getItemById(itemId);
-  const endTime = toNum(reply?.end_time);
+  const endTime = toNum(reply.end_time);
+  const startTime = toNum(reply.start_time);
   const purchased = !!npc?.purchased;
+  const now = Date.now() / 1000;
+  const reason = purchased ? 'purchased' : endTime > 0 && endTime <= now ? 'expired'
+    : startTime > now ? 'upcoming' : !reply.active ? 'inactive' : '';
+  const labels = { purchased: '本次神秘商品已购买，商人已离开', expired: '本次神秘商人已离开（已过期）',
+    upcoming: '神秘商人尚未开始', inactive: '神秘商人当前不在期，暂未出现' };
 
   return {
-    active: !!reply?.active && !purchased && (!endTime || endTime * 1000 > Date.now()),
+    active: !reason,
+    skipped: !!reason,
+    reason: reason || undefined,
+    statusLabel: labels[reason] || '神秘商人已出现',
     npcId: toNum(npc?.npc_id),
     itemId,
     itemType: toNum(npc?.item_type),
@@ -39,7 +52,7 @@ function normalizeNPC(reply) {
     originalPrice: toNum(npc?.original_price),
     discount: toNum(npc?.discount),
     purchased,
-    startTime: toNum(reply?.start_time),
+    startTime,
     endTime,
   };
 }
@@ -49,7 +62,11 @@ async function getActiveMysteryShop() {
     types.GetActiveMysteryNPCRequest.create({})
   ).finish();
   const { body } = await sendMsgAsync(SERVICE, 'GetActiveNPC', request);
-  return normalizeNPC(types.GetActiveMysteryNPCReply.decode(body));
+  // 同时支持线端bytes和已解码message；结构化回包不能二次decode。
+  if (body == null) throw Object.assign(new Error('神秘商人状态未返回'), { errorCode: 'MYSTERY_SHOP_INVALID_RESPONSE', stage: 'decode' });
+  const reply = Buffer.isBuffer(body) || body instanceof Uint8Array
+    ? types.GetActiveMysteryNPCReply.decode(body) : body;
+  return normalizeNPC(reply);
 }
 
 async function buyMysteryShopGoods(npcId) {

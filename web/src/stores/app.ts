@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import api from '@/api'
 
 const THEME_KEY = 'ui_theme'
+// A startup-written legacy palette is not an explicit user choice. Store that
+// intent separately so a generic server light/dark flag cannot erase it.
+const THEME_CHOICE_KEY = 'ui_theme_choice_v1'
 
 export type Theme = 'light-blue' | 'light-green' | 'light-pink' | 'dark-blue' | 'dark-purple' | 'dark-teal' | 'dark-orange' | 'dark-red'
 
@@ -26,7 +29,10 @@ const defaultLoginPageConfig: LoginPageConfig = {
 
 export const useAppStore = defineStore('app', () => {
   const sidebarOpen = ref(false)
-  const currentTheme = ref<Theme>((localStorage.getItem(THEME_KEY) as Theme) || 'light-green')
+  const currentTheme = ref<Theme>('light-green')
+  let themeRevision = 0
+  let explicitThemeChoice = false
+  let themeFlight: Promise<void> | null = null
   const showThemePanel = ref(false)
   const loginPageConfig = ref<LoginPageConfig>({ ...defaultLoginPageConfig })
   let loginPageConfigPromise: Promise<void> | null = null
@@ -135,16 +141,26 @@ export const useAppStore = defineStore('app', () => {
     sidebarOpen.value = true
   }
 
-  async function fetchTheme() {
-    try {
-      const res = await api.get('/api/settings')
-      const theme = res.data?.data?.ui?.theme as Theme | undefined
-      if (res.data.ok && theme && themes[theme])
-        applyTheme(theme)
-    }
-    catch {
-      // 未登录时静默失败，使用本地缓存主题。
-    }
+  function fetchTheme(): Promise<void> {
+    if (themeFlight)
+      return themeFlight
+    const revision = themeRevision
+    const pending = api.get('/api/settings').then((res) => {
+      const rawTheme = res.data?.data?.ui?.theme
+      const theme = rawTheme === 'light' ? 'light-green' : rawTheme === 'dark' ? 'dark-blue' : rawTheme
+      // Generic backend light/dark flags are a fallback, never a color choice.
+      // A chosen local palette and choices made during this read win the race.
+      if (!explicitThemeChoice && revision === themeRevision && res.data?.ok === true
+        && typeof theme === 'string' && Object.prototype.hasOwnProperty.call(themes, theme))
+        applyTheme(theme as Theme, false)
+    }).catch(() => {
+      // Keep the local theme while offline or not logged in.
+    }).finally(() => {
+      if (themeFlight === pending)
+        themeFlight = null
+    })
+    themeFlight = pending
+    return pending
   }
 
   async function fetchLoginPageConfig() {
@@ -164,14 +180,19 @@ export const useAppStore = defineStore('app', () => {
     return loginPageConfigPromise
   }
 
-  function applyTheme(theme: Theme) {
-    if (!themes[theme]) {
-      theme = 'light-pink'
-    }
+  function applyTheme(theme: Theme, rememberChoice = true) {
+    if (!Object.prototype.hasOwnProperty.call(themes, theme))
+      theme = 'light-green'
 
     const t = themes[theme]
+    themeRevision++
     currentTheme.value = theme
-    localStorage.setItem(THEME_KEY, theme)
+    if (rememberChoice) explicitThemeChoice = true
+    try {
+      localStorage.setItem(THEME_KEY, theme)
+      if (rememberChoice) localStorage.setItem(THEME_CHOICE_KEY, theme)
+    }
+    catch { /* Theme selection must still work when storage is unavailable. */ }
 
     if (typeof document !== 'undefined' && document.documentElement) {
       document.documentElement.style.setProperty('--theme-bg', t.bg)
@@ -179,6 +200,16 @@ export const useAppStore = defineStore('app', () => {
       document.documentElement.style.setProperty('--theme-primary', t.primary)
       document.documentElement.style.setProperty('--theme-secondary', t.secondary)
       document.documentElement.style.setProperty('--theme-gradient', t.gradient)
+      // Accessible solid actions are separate from decorative brand gradients.
+      const actionColors: Record<Theme, string> = {
+        'light-green': '#416d3b', 'light-blue': '#1d4ed8', 'light-pink': '#a61b59',
+        'dark-blue': '#1d4ed8', 'dark-purple': '#7e22ce', 'dark-orange': '#92400e',
+        'dark-teal': '#0e7490', 'dark-red': '#be123c',
+      }
+      document.documentElement.style.setProperty('--action-bg', actionColors[theme])
+      document.documentElement.style.setProperty('--action-hover', `color-mix(in srgb, ${actionColors[theme]} 88%, #000000)`)
+      document.documentElement.style.setProperty('--action-text', '#ffffff')
+      document.documentElement.style.setProperty('color-scheme', t.isDark ? 'dark' : 'light')
 
       if (t.isDark) {
         document.documentElement.classList.add('dark')
@@ -199,17 +230,31 @@ export const useAppStore = defineStore('app', () => {
       applyTheme('light-green')
     }
     else {
-      applyTheme('light-pink')
+      applyTheme('dark-blue')
     }
   }
 
   const isDark = computed(() => themes[currentTheme.value]?.isDark ?? false)
 
-  watch(currentTheme, (val) => {
-    applyTheme(val)
-  })
-
-  applyTheme(currentTheme.value)
+  let savedTheme: Theme = 'light-green'
+  try {
+    const chosen = localStorage.getItem(THEME_CHOICE_KEY)
+    const legacy = localStorage.getItem(THEME_KEY)
+    if (chosen && Object.prototype.hasOwnProperty.call(themes, chosen)) {
+      savedTheme = chosen as Theme
+      explicitThemeChoice = true
+    }
+    else if (legacy && Object.prototype.hasOwnProperty.call(themes, legacy)) {
+      // The old startup wrote its default blue as though it were a choice.
+      // Migrate only that unmarked default to green; retain every alternative
+      // and any marked blue selected through the current theme picker.
+      savedTheme = legacy === 'light-blue' ? 'light-green' : legacy as Theme
+      explicitThemeChoice = legacy !== 'light-blue' && legacy !== 'light-green'
+    }
+    else if (legacy === 'dark') savedTheme = 'dark-blue'
+  }
+  catch { /* Use the default without blocking app startup. */ }
+  applyTheme(savedTheme, false)
 
   return {
     sidebarOpen,

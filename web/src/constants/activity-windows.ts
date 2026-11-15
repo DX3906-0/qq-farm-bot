@@ -75,6 +75,22 @@ export const MILK_TEA_BUSINESS_WINDOW: ActivityWindow = {
   note: '2026-10-15 10:00 ~ 2026-11-14 23:59:58（经营期）',
 }
 
+// 截止时间展示使用实际服务端时间窗；无服务端字段时不伪装成已确认。
+export function formatActivityDeadline(value?: number): string {
+  if (!value || !Number.isFinite(value)) return '时间待确认'
+  const date = new Date(value * 1000)
+  if (Number.isNaN(date.getTime())) return '时间待确认'
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', month: 'numeric', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date)
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find(part => part.type === type)?.value || ''
+  // 服务端闭区间23:59:59，对应公告的当日24:00；不将它误读成下一日白天。
+  const time = get('hour') === '23' && get('minute') === '59' && Number(get('second')) >= 58
+    ? '24:00' : `${get('hour')}:${get('minute')}`
+  return `${get('month')}月${get('day')}日 ${time}`
+}
+
 /** 别名：兼容历史命名（小红花旧称 RED_FLOWER） */
 export const RED_FLOWER_ACTIVITY_WINDOW = CHARITY_FLOWER_ACTIVITY_WINDOW
 

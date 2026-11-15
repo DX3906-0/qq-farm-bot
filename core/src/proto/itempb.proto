@@ -26,14 +26,20 @@ message SellReply {
 
 // ============ 使用物品 ============
 
+// Official 1.16 item use contract: nested item and target; no failed-write fallback.
 message UseRequest {
-    int64 item_id = 1;
-    int64 count = 2;
-    repeated int64 land_ids = 3;
+    corepb.Item item = 1;
+    UseTarget target = 2;
 }
 
 message UseReply {
-    repeated corepb.Item items = 1;
+    repeated corepb.Item used_items = 1;
+    repeated corepb.Item items = 2;
+    repeated corepb.Item compensated_items = 3;
+    bytes land = 4;
+    UseLandReward land_reward = 5;
+    UseSocialReward social_reward = 6;
+    RandomPackUseRsp random_pack = 100;
 }
 
 // ============ 批量使用物品 ============
@@ -45,4 +51,59 @@ message BatchUseRequest {
 message BatchUseReply {
     repeated corepb.Item used_items = 1;
     repeated corepb.Item items = 2;
+}
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message UseTarget {
+    int64 host_gid = 1;
+    repeated int64 land_ids = 2 [packed = true];
+    int64 use_config_id = 3;
+}
+
+message RandomPackUseRsp {
+    repeated RandomPackStatus packs = 1;
+}
+
+message RandomPackStatus {
+    int64 item_id = 1;
+    repeated RandomPackGroupStatus groups = 2;
+}
+
+message RandomPackGroupStatus {
+    int32 remaining_item_count = 1;
+}
+
+message UseLandReward {
+    int64 land_id = 1;
+    repeated corepb.Item items = 2;
+}
+
+message UseSocialReward {
+    int64 item_id = 1;
+    repeated corepb.Item items = 2;
+}
+
+message CannelNewRequest {
+    repeated corepb.Item items = 1;
+}
+
+message CannelNewReply {}
+
+message LockItemsRequest {
+    repeated int64 item_uids = 1 [packed = true];
+}
+
+message LockItemsReply {
+    repeated int64 item_uids = 1 [packed = true];
+}
+
+message UnlockItemsRequest {
+    repeated int64 item_uids = 1 [packed = true];
+}
+
+message UnlockItemsReply {
+    repeated int64 item_uids = 1 [packed = true];
 }

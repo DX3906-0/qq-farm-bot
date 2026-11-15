@@ -108,9 +108,9 @@ const isRemovable = computed(() =>
 const canFertilize = computed(() => props.showActions && isFertilizable.value)
 const canRemove = computed(() => props.showActions && isRemovable.value)
 
-const landTextureName = computed(() => {
+const landTextureUrl = computed(() => {
   const targetLand = land.value || {}
-  const level = Math.min(5, Math.max(1, Number(targetLand.level) || 1))
+  const level = Math.min(6, Math.max(1, Number(targetLand.level) || 1))
   const isSnow = Boolean(
     targetLand.isSnow
     || targetLand.snow
@@ -119,30 +119,37 @@ const landTextureName = computed(() => {
   )
 
   if (targetLand.status === 'locked')
-    return isSnow ? 'land_locked_snow' : 'land_locked'
+    return `/game-config/land_images/${isSnow ? 'land_locked_snow' : 'land_locked'}.png`
 
-  if (targetLand.needWater) {
-    if (level === 1 && isSnow)
-      return 'land_dry1_snow'
-    return `land_dry${level}`
-  }
-
-  if (level === 1 && isSnow)
-    return 'land_valid1_snow'
-  return `land_valid${level}`
+  // 同源蓝晶小格112×64、四格356×202；不再放大旧53×29缩略图或重复拼铺。
+  // PNG原字节同步，官方来源未证，出处和用户确认状态登记在sources.json。
+  if (level === 6)
+    return Number(targetLand.plantSize) > 1
+      ? '/game-config/land_images/land_valid6_2x2.png'
+      : '/game-config/land_images/land_valid6.png'
+  if (Number(targetLand.plantSize) > 1)
+    return `/game-config/land_images/land_valid${level}_2x2.png`
+  if (targetLand.needWater)
+    return `/game-config/land_images/${level === 1 && isSnow ? 'land_dry1_snow' : `land_dry${level}`}.png`
+  return `/game-config/land_images/${level === 1 && isSnow ? 'land_valid1_snow' : `land_valid${level}`}.png`
 })
 
-const landTextureUrl = computed(() => {
-  if (Number(land.value?.plantSize) > 1)
-    return `/game-config/land_images/land_valid${Math.min(5, Math.max(1, Number(land.value?.level) || 1))}_2x2.png`
-  return `/game-config/land_images/${landTextureName.value}.png`
-})
+function normalizeMutantIcon(value: unknown) {
+  const icon = String(value || '').trim()
+  const match = icon.match(/^gui\/texture\/mutant\/icon\/([a-z0-9_-]+)\/spriteFrame$/i)
+  if (match?.[1])
+    return match[1].toLowerCase()
+  return /^[a-z0-9_-]+$/i.test(icon) ? icon.toLowerCase() : ''
+}
 
-const mutantEffects = computed(() => {
+const failedMutantImages = ref<Record<string, boolean>>({})
+
+const mutantEffects = computed<any[]>(() => {
   const effects = Array.isArray(land.value?.mutantEffects) ? land.value.mutantEffects : []
   return effects
     .map((effect: any) => {
-      const icon = String(effect?.icon || '').trim()
+      // 官方 icon 是 Cocos spriteFrame 路径，不是 PNG 文件名。
+      const icon = normalizeMutantIcon(effect?.icon)
       return {
         id: Number(effect?.id) || 0,
         name: String(effect?.name || effect?.effect_name || icon || '变异').trim(),
@@ -198,7 +205,7 @@ function getLandStatusClass(targetLand: any) {
   if (status === 'locked')
     return 'land-level-locked bg-slate-50/90 dark:bg-slate-900/80 border-slate-300 dark:border-slate-700 border-dashed'
 
-  const baseClass = `land-level-${Math.min(5, Math.max(1, level || 1))} bg-stone-50/90 dark:bg-stone-950/80 border-stone-300 dark:border-stone-700`
+  const baseClass = `land-level-${Math.min(6, Math.max(1, level || 1))} bg-stone-50/90 dark:bg-stone-950/80 border-stone-300 dark:border-stone-700`
 
   if (status === 'dead')
     return 'bg-gray-200 dark:bg-gray-700 border-gray-300 dark:border-gray-600 grayscale'
@@ -393,13 +400,14 @@ function getIsometricBubbleClass(targetLand: any) {
       class="land-mutant-effects absolute left-1 top-5 flex flex-col gap-1"
     >
       <img
-        v-for="effect in mutantEffects"
+        v-for="effect in mutantEffects.filter(item => item.image && !failedMutantImages[item.image])"
         :key="`${land.id}-${effect.id}-${effect.icon}`"
         :src="effect.image"
         :alt="effect.name"
         :title="effect.tag && effect.tag !== '无' ? `${effect.name} · ${effect.tag}` : effect.name"
         class="h-4 w-4 rounded-sm object-contain drop-shadow-sm"
         loading="eager"
+        @error="failedMutantImages[effect.image] = true"
       >
     </div>
 
@@ -623,7 +631,14 @@ function getIsometricBubbleClass(targetLand: any) {
               :key="`bubble-${land.id}-${effect.id}-${effect.icon}`"
               class="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-[11px] text-pink-700 shadow-sm dark:bg-gray-900 dark:text-pink-200"
             >
-              <img :src="effect.image" :alt="effect.name" class="h-4 w-4 object-contain">
+              <img
+                v-if="effect.image && !failedMutantImages[effect.image]"
+                :src="effect.image"
+                :alt="`${effect.name}变异图标`"
+                class="h-4 w-4 object-contain"
+                @error="failedMutantImages[effect.image] = true"
+              >
+              <span v-else class="i-carbon-crop-growth h-4 w-4" aria-hidden="true" />
               <span class="font-medium">{{ effect.name }}</span>
               <span v-if="effect.tag && effect.tag !== '无'" class="text-[10px] text-pink-400">· {{ effect.tag }}</span>
             </div>

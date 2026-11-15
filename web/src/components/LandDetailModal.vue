@@ -113,6 +113,13 @@ function format(value: unknown) {
               </strong>
             </div>
 
+            <div v-if="info.precedingLands" class="land-detail-condition">
+              <span>{{ info.precedingLands.name }}及以上达到 {{ info.precedingLands.required }} 块</span>
+              <strong :class="info.precedingLands.met === true ? 'land-detail-improved' : 'land-detail-missing'">
+                {{ info.precedingLands.owned ?? '—' }} / {{ info.precedingLands.required }}
+              </strong>
+            </div>
+
             <div v-if="info.current && info.next" class="land-detail-condition">
               <span>当前地块为{{ info.current.name }}</span>
               <strong class="land-detail-improved">已满足</strong>

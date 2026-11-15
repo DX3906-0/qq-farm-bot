@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onScopeDispose, reactive, ref, useId, watch } from 'vue'
+import { moveSlidingTabFocus, useSlidingTabs, vSlidingTabs } from '@/composables/useContentMotion'
+import { isReadCanceled } from '@/api'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseSwitch from '@/components/ui/BaseSwitch.vue'
 import { useAccountStore } from '@/stores/account'
@@ -13,19 +15,36 @@ const accountStore = useAccountStore()
 const petStore = usePetStore()
 const toast = useToastStore()
 const { currentAccountId } = storeToRefs(accountStore)
-const { overview, logs, capitalMode, loading, mutating } = storeToRefs(petStore)
+const { overview, logs, capitalMode, capitalReady, loading, mutating, status, error } = storeToRefs(petStore)
 const tab = ref<PetTab>('pets')
 const feedCounts = reactive<Record<number, number>>({})
 const draft = reactive({ enabled: false, dogId: 0, leadSeconds: 10 })
 const saving = ref(false)
+let accountEpoch = 0
+let loadRequest = 0
+let disposed = false
+const scopeController = new AbortController()
+let readController: AbortController | undefined
+let pageFlight: { key: string, promise: Promise<void> } | undefined
+let queuedLoad: Promise<void> | undefined
+let dirty = false
+onScopeDispose(() => {
+  disposed = true
+  accountEpoch++
+  readController?.abort()
+  scopeController.abort()
+})
 
 const tabs: { key: PetTab, label: string, icon: string }[] = [
   { key: 'pets', label: '宠物管理', icon: 'i-carbon-dog-walker' },
   { key: 'logs', label: '守护记录', icon: 'i-carbon-security' },
   { key: 'capital', label: '资本模式', icon: 'i-carbon-time' },
 ]
-const sortedDogs = computed(() => [...overview.value.dogs].sort((a, b) => Number(b.deployed) - Number(a.deployed) || Number(b.owned) - Number(a.owned) || b.rarity - a.rarity))
-const ownedCount = computed(() => overview.value.dogs.filter(dog => dog.owned).length)
+const petContent = ref<HTMLElement | null>(null)
+const petPanelId = useId()
+const { select: selectPetTab, selected: selectedPetTab } = useSlidingTabs(tab, () => petContent.value, () => tabs.map(item => item.key), () => currentAccountId.value)
+const sortedDogs = computed(() => [...overview.value.dogs].sort((a, b) => Number(b.deployed === true) - Number(a.deployed === true) || Number(b.owned === true) - Number(a.owned === true) || b.rarity - a.rarity))
+const ownedCount = computed(() => overview.value.dogs.filter(dog => dog.owned === true).length)
 const deployed = computed(() => overview.value.dogs.find(dog => dog.deployed))
 const foodPercent = computed(() => {
   const maximum = Math.max(overview.value.protectSeconds || 0, 1)
@@ -59,47 +78,85 @@ function duration(seconds: number) {
   return `${minutes}分钟`
 }
 
-async function load() {
+function load(): Promise<void> {
+  const key = `${currentAccountId.value}:${accountEpoch}:${tab.value}`
+  if (disposed) return Promise.resolve()
+  if (pageFlight?.key === key) { dirty = false; return pageFlight.promise }
+  if (pageFlight) {
+    dirty = true
+    if (!queuedLoad) queuedLoad = pageFlight.promise.then(async () => {
+      queuedLoad = undefined
+      if (!disposed && dirty) { dirty = false; await load() }
+    }).catch(() => { queuedLoad = undefined })
+    return queuedLoad
+  }
+  const controller = new AbortController()
+  readController = controller
+  const flight = { key, promise: loadCurrent(controller.signal).finally(() => {
+    if (pageFlight === flight) pageFlight = undefined
+  }) }
+  pageFlight = flight
+  return flight.promise
+}
+async function loadCurrent(signal: AbortSignal) {
   const id = String(currentAccountId.value || '')
-  if (!id)
+  const version = accountEpoch
+  const request = ++loadRequest
+  if (!id || disposed || signal.aborted)
     return
+  const selected = tab.value
   try {
-    await Promise.all([
-      petStore.fetchOverview(id),
-      petStore.fetchCapitalMode(id),
-      tab.value === 'logs' ? petStore.fetchLogs(id) : Promise.resolve(),
-    ])
-    Object.assign(draft, capitalMode.value)
+    if (selected === 'logs')
+      await petStore.fetchLogs(id, signal)
+    else if (selected === 'capital')
+      await Promise.all([petStore.fetchCapitalMode(id, signal), petStore.fetchOverview(id, signal)])
+    else
+      await petStore.fetchOverview(id, signal)
+    if (!disposed && !signal.aborted && selected === tab.value && selected === 'capital' && version === accountEpoch && request === loadRequest && capitalReady.value)
+      Object.assign(draft, capitalMode.value)
   }
   catch (e: any) {
-    toast.error(e?.response?.data?.error || e?.message || '加载失败')
+    if (!disposed && !signal.aborted && !isReadCanceled(e) && selected === tab.value && version === accountEpoch && request === loadRequest)
+      toast.error(e?.response?.data?.error || e?.message || '加载失败')
   }
 }
 
 async function action(run: () => Promise<any>, message: string) {
+  const version = accountEpoch
   try {
-    await run()
-    toast.success(message)
+    const applied = await run()
+    if (!disposed && version === accountEpoch && applied !== false)
+      toast.success(message)
   }
   catch (e: any) {
-    toast.error(e?.response?.data?.error || e?.message || '操作失败')
+    if (!disposed && !isReadCanceled(e) && version === accountEpoch)
+      toast.error(e?.response?.data?.error || e?.message || '操作失败')
   }
 }
 
 async function saveSettings() {
   if (saving.value)
     return
+  const version = accountEpoch
   saving.value = true
   try {
-    await action(() => petStore.saveCapitalMode(String(currentAccountId.value), draft), '设置已保存')
+    await action(() => petStore.saveCapitalMode(String(currentAccountId.value), { ...draft }), '设置已保存')
   }
   finally {
-    saving.value = false
+    if (version === accountEpoch)
+      saving.value = false
   }
 }
 
-watch([currentAccountId, tab], load)
-onMounted(load)
+watch(currentAccountId, () => {
+  accountEpoch++
+  readController?.abort()
+  saving.value = false
+  Object.assign(draft, { enabled: false, dogId: 0, leadSeconds: 10 })
+  for (const key of Object.keys(feedCounts))
+    delete feedCounts[Number(key)]
+}, { flush: 'sync' })
+watch([currentAccountId, tab], load, { immediate: true })
 </script>
 
 <template>
@@ -123,21 +180,27 @@ onMounted(load)
       </BaseButton>
     </header>
 
-    <nav class="flex shrink-0 gap-1 border-b border-gray-200 dark:border-gray-700" aria-label="宠物功能">
+    <nav v-sliding-tabs class="ui-tabs shrink-0" role="tablist" aria-label="宠物功能">
       <button
         v-for="item in tabs"
+        :id="`${petPanelId}-${item.key}`"
         :key="item.key"
         type="button"
-        class="relative flex items-center gap-1.5 px-3 py-2.5 text-sm font-medium transition-colors sm:px-4"
-        :class="tab === item.key ? 'text-[var(--theme-primary)]' : 'text-gray-500 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200'"
-        :aria-current="tab === item.key ? 'page' : undefined"
-        @click="tab = item.key"
+        class="ui-tab"
+        role="tab"
+        :data-active="selectedPetTab === item.key"
+        :aria-selected="selectedPetTab === item.key"
+        :aria-controls="`${petPanelId}-content`"
+        :tabindex="selectedPetTab === item.key ? 0 : -1"
+        @click="selectPetTab(item.key)"
+        @keydown="moveSlidingTabFocus"
       >
-        <span :class="item.icon" />{{ item.label }}
-        <span v-if="tab === item.key" class="absolute bottom-0 left-2 right-2 h-0.5 rounded-full bg-[var(--theme-primary)]" />
+        <span :class="item.icon" aria-hidden="true" /><span class="ui-tab-label">{{ item.label }}</span>
       </button>
     </nav>
 
+    <div :id="`${petPanelId}-content`" ref="petContent" class="tab-motion-viewport min-h-0 flex flex-1 flex-col" role="tabpanel" :aria-labelledby="`${petPanelId}-${tab}`" :aria-busy="loading">
+      <div class="min-h-0 flex flex-1 flex-col gap-3" data-motion-entry>
     <div v-if="!currentAccountId" class="ui-card min-h-72 flex flex-1 flex-col items-center justify-center rounded-lg p-8 text-center">
       <span class="i-carbon-user-avatar mb-3 text-4xl text-gray-300 dark:text-gray-600" />
       <h2 class="text-base text-gray-800 font-semibold dark:text-gray-100">
@@ -155,7 +218,20 @@ onMounted(load)
       </p>
     </div>
 
+    <div v-else-if="tab !== 'logs' && status !== 'ready'" class="ui-card min-h-72 flex flex-1 flex-col items-center justify-center rounded-lg p-8 text-center" role="alert">
+      <h2 class="text-base text-gray-800 font-semibold dark:text-gray-100">
+        {{ status === 'error' ? '宠物信息加载失败' : '宠物状态尚未确认' }}
+      </h2>
+      <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">
+        {{ error || '请刷新获取当前账号的真实宠物状态' }}
+      </p>
+      <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">未知或错误响应不代表尚未拥有宠物</p>
+    </div>
+
     <template v-else-if="tab === 'pets'">
+      <p v-if="overview.warnings?.length" class="text-sm text-amber-600 dark:text-amber-400" role="status">
+        {{ overview.warnings.join('；') }}
+      </p>
       <div class="pet-workspace min-h-0 flex flex-1 flex-col gap-3 lg:grid lg:grid-cols-[minmax(0,1.5fr)_minmax(300px,0.85fr)]">
         <section class="ui-card min-h-0 flex flex-col overflow-hidden rounded-lg">
           <div class="guardian-strip flex shrink-0 flex-wrap items-center gap-3 border-b border-gray-200 p-3 sm:flex-nowrap dark:border-gray-700 sm:p-4">
@@ -177,7 +253,7 @@ onMounted(load)
                 {{ deployed?.desc || `已拥有 ${ownedCount} 只宠物` }}
               </p>
             </div>
-            <BaseButton v-if="deployed" variant="secondary" size="sm" :disabled="mutating" @click="action(() => petStore.withdraw(String(currentAccountId)), '宠物已召回')">
+            <BaseButton v-if="deployed" variant="secondary" size="sm" :disabled="mutating" @click="action(() => petStore.withdraw(String(currentAccountId), scopeController.signal), '宠物已召回')">
               <span class="i-carbon-pause mr-1" />召回
             </BaseButton>
           </div>
@@ -218,10 +294,10 @@ onMounted(load)
                     <h3 class="truncate text-sm text-gray-900 font-semibold dark:text-gray-100" :title="dog.name">
                       {{ dog.name }}
                     </h3>
-                    <span v-if="dog.owned" class="shrink-0 text-[11px] text-gray-400">Lv.{{ dog.level || 1 }}</span>
+                    <span v-if="dog.owned === true" class="shrink-0 text-[11px] text-gray-400">已拥有</span>
                   </div>
                   <p class="line-clamp-2 mt-1 text-[11px] text-gray-500 leading-4 dark:text-gray-400" :title="dog.desc || undefined">
-                    {{ dog.desc || (dog.owned ? '农场守护伙伴' : '尚未获得该宠物') }}
+                    {{ dog.desc || (dog.owned === true ? '农场守护伙伴' : dog.owned === false ? '尚未获得该宠物' : '拥有状态未知') }}
                   </p>
                 </div>
               </div>
@@ -233,11 +309,11 @@ onMounted(load)
                   : dog.owned
                     ? 'bg-gray-100 text-gray-700 hover:bg-[var(--theme-primary)] hover:text-white dark:bg-gray-700 dark:text-gray-200'
                     : 'bg-gray-100 text-gray-400 dark:bg-gray-800'"
-                :disabled="!dog.owned || dog.deployed || mutating"
-                @click="action(() => petStore.deploy(String(currentAccountId), dog.id), `${dog.name}已派出`)"
+                :disabled="dog.owned !== true || dog.activated !== true || dog.deployed !== false || mutating || loading"
+                @click="action(() => petStore.deploy(String(currentAccountId), dog.id, scopeController.signal), `${dog.name}已派出`)"
               >
                 <span :class="dog.deployed ? 'i-carbon-checkmark-filled' : dog.owned ? 'i-carbon-play-filled' : 'i-carbon-locked'" />
-                {{ dog.deployed ? '正在守护' : dog.owned ? '派出守护' : '尚未获得' }}
+                {{ dog.deployed === true ? '正在守护' : dog.owned === null ? '拥有状态未知' : dog.owned === false ? '尚未获得' : dog.activated === null ? '激活状态未知' : dog.activated === false ? '已拥有 · 待激活' : '派出守护' }}
               </button>
             </article>
           </div>
@@ -313,7 +389,7 @@ onMounted(load)
                     <span class="i-carbon-add" />
                   </button>
                 </div>
-                <BaseButton size="sm" class="h-8 shrink-0 px-3!" :disabled="!food.count || mutating || invalidFeedCount(food.id, food.count)" @click="action(() => petStore.feed(String(currentAccountId), food.id, getFeedCount(food.id)), '喂食成功')">
+                <BaseButton size="sm" class="h-8 shrink-0 px-3!" :disabled="!food.count || mutating || invalidFeedCount(food.id, food.count)" @click="action(() => petStore.feed(String(currentAccountId), food.id, getFeedCount(food.id), scopeController.signal), '喂食成功')">
                   喂食
                 </BaseButton>
               </div>
@@ -397,7 +473,7 @@ onMounted(load)
               守护宠物
               <select v-model.number="draft.dogId" class="mt-2 h-10 w-full border border-gray-200 rounded-lg bg-[var(--input-bg)] px-3 text-sm text-gray-900 outline-none dark:border-gray-600 focus:border-[var(--theme-primary)] dark:text-gray-100 focus:ring-2 focus:ring-[color-mix(in_srgb,var(--theme-primary)_18%,transparent)]">
                 <option :value="0">请选择宠物</option>
-                <option v-for="dog in overview.dogs.filter(dog => dog.owned)" :key="dog.id" :value="dog.id">{{ dog.name }}</option>
+                <option v-for="dog in overview.dogs.filter(dog => dog.owned === true && dog.activated === true)" :key="dog.id" :value="dog.id">{{ dog.name }}</option>
               </select>
             </label>
             <label class="min-w-0 text-sm text-gray-700 font-medium dark:text-gray-200">
@@ -415,13 +491,15 @@ onMounted(load)
           </div>
 
           <div class="mt-5 flex justify-end border-t border-gray-200 pt-4 dark:border-gray-700">
-            <BaseButton :loading="saving" :disabled="loading || (draft.enabled && !draft.dogId) || !Number.isInteger(draft.leadSeconds) || draft.leadSeconds < 5 || draft.leadSeconds > 300" @click="saveSettings">
+            <BaseButton :loading="saving" :disabled="loading || !capitalReady || (draft.enabled && !draft.dogId) || !Number.isInteger(draft.leadSeconds) || draft.leadSeconds < 5 || draft.leadSeconds > 300" @click="saveSettings">
               <span v-if="!saving" class="i-carbon-save mr-1" />保存设置
             </BaseButton>
           </div>
         </div>
       </div>
     </section>
+      </div>
+    </div>
   </section>
 </template>
 

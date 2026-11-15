@@ -1,21 +1,27 @@
 <script setup lang="ts">
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import api from '@/api'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useAccountStore } from '@/stores/account'
 import { useBagStore } from '@/stores/bag'
+import type { ExpRateInfo } from '@/stores/status'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
 import { formatCouponAmount, formatGoldAmount, formatGoldBeanAmount } from '@/utils/number-format'
+import { deriveAccountPresentation, integerText } from '@/utils/operation-result'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { useSettingStore } from '@/stores/setting'
+import { vFoldMotion } from '@/composables/useContentMotion'
 
 const statusStore = useStatusStore()
 const accountStore = useAccountStore()
 const bagStore = useBagStore()
 const toastStore = useToastStore()
+const settingStore = useSettingStore()
 
 const {
   status,
@@ -23,14 +29,53 @@ const {
   accountLogs: statusAccountLogs,
   realtimeConnected,
   currentStatusReady,
+  currentStatusMetadata,
+  currentStatusStale,
+  loading: statusLoading,
+  error: statusError,
 } = storeToRefs(statusStore)
 const { currentAccountId, currentAccount } = storeToRefs(accountStore)
-const { dashboardItems } = storeToRefs(bagStore)
+const { dashboardItems, bagAccountId, lastUpdatedAt: bagUpdatedAt, mutationStates: bagMutationStates } = storeToRefs(bagStore)
+const presentation = computed(() => deriveAccountPresentation({
+  accountId: currentAccountId.value, account: currentAccount.value,
+  snapshot: currentStatusReady.value ? { ...status.value, metadata: currentStatusMetadata.value } : null,
+  snapshotReady: currentStatusReady.value, loading: statusLoading.value, error: statusError.value,
+  stale: currentStatusStale.value, readonly: LOCAL_UI_READONLY,
+}))
+const readableStatus = computed(() => currentStatusReady.value ? status.value : null)
+const readableBag = computed(() => !!currentAccountId.value && bagAccountId.value === String(currentAccountId.value) && bagUpdatedAt.value > 0 && !bagStore.readError)
+const lastStatusTime = computed(() => currentStatusMetadata.value?.updatedAt
+  ? new Date(currentStatusMetadata.value.updatedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '')
+function statusAmount(value: unknown, format: (value: any) => string) {
+  return currentStatusReady.value && integerText(value) !== null ? format(value) : '—'
+}
+const dashboardNotice = computed(() => {
+  if (LOCAL_UI_READONLY) return { text: '本地只读浏览 · 未登录账号，不读取实时数据。', path: '', action: '' }
+  if (presentation.value.kind === 'unselected') return { text: '未选择账号；选择后才能确认游戏状态。', path: '/settings?tab=account', action: '查看账号' }
+  if (accountStore.operationStates[String(currentAccountId.value)] === 'unknown') return { text: accountStore.operationErrors[String(currentAccountId.value)] || '账号操作结果未确认，请查看核对。', path: '/settings?tab=account', action: '查看账号' }
+  if (bagMutationStates.value[String(currentAccountId.value)] === 'unknown') return { text: '背包有操作结果未确认，请查看并核对，不重复提交。', path: '/personal', action: '查看背包' }
+  if (settingStore.mutationStates[String(currentAccountId.value)] === 'unknown') return { text: '设置保存结果未确认，请读取核对，不重复提交。', path: '/settings', action: '查看设置' }
+  if (settingStore.defaultPlanApplications[String(currentAccountId.value)] === 'unknown') return { text: '默认方案应用结果未确认，请读取核对，不重复应用。', path: '/settings?tab=account', action: '查看账号' }
+  if (['offline', 'stale', 'error', 'unknown', 'loading'].includes(presentation.value.kind)) return { text: presentation.value.detail, path: '/settings?tab=account', action: '查看账号' }
+  return null
+})
 
 const logContainer = ref<HTMLElement | null>(null)
 const autoScroll = ref(true)
 const lastBagFetchAt = ref(0)
 const clearingLogs = ref(false)
+let disposed = false
+let accountEpoch = 0
+let refreshInFlight: Promise<void> | null = null
+let bagInFlight: Promise<void> | null = null
+let refreshQueued = false
+let forceLogsQueued = false
+
+function isRefreshCurrent(accountId: string, epoch: number) {
+  return !disposed && accountEpoch === epoch && currentAccountId.value === accountId
+}
+
+watch(currentAccountId, () => { accountEpoch += 1 }, { flush: 'sync' })
 
 const filter = reactive({
   module: '',
@@ -42,9 +87,7 @@ const filter = reactive({
 const hasActiveLogFilter = computed(() =>
   !!(filter.module || filter.event || filter.keyword || filter.isWarn),
 )
-const currentAccountDisconnected = computed(() =>
-  currentStatusReady.value && !status.value?.connection?.connected,
-)
+const currentAccountDisconnected = computed(() => presentation.value.kind === 'offline' || presentation.value.kind === 'stopped')
 
 const allLogs = computed(() => {
   const sLogs = statusLogs.value || []
@@ -128,7 +171,8 @@ const eventLabelMap: Record<string, string> = Object.fromEntries(
 
 const displayName = computed(() => {
   const account = accountStore.currentAccount
-  const gameName = status.value?.status?.name
+  if (!currentAccountId.value) return LOCAL_UI_READONLY ? '本地浏览 · 无账号' : '未选择账号'
+  const gameName = readableStatus.value?.status?.name
 
   if (gameName) {
     if (account?.name)
@@ -151,81 +195,44 @@ const displayName = computed(() => {
     return account.name || account.nick || '未命名'
   }
 
-  return '未命名'
+  return '账号资料尚未读取'
 })
 
-/**
- * 经验速率（经验/小时）。
- *
- * ⚠️ 旧实现用 sessionExpGained / uptime：
- *    分子是「今日 00:00 起的累计」（持久化跨重启），分母却是「本次 worker 进程运行秒数」。
- *    两个时间起点不同，今天重启几次分母就被清零几次 → 速率虚高数倍。
- *    且 exp 曾长期不刷新，分子本身就是冻结的历史残留。
- *
- * 新实现优先用后端 computeExpRate() 给出的 expRate.expPerHour，
- * 它 = 活跃区间速率(EMA) × 活跃占比，已考虑了「作物成熟等待」造成的空档。
- * 后端字段缺失时才回退到 sessionExpSec 口径（与分子同源，重启不失真）。
- */
-const expRateInfo = computed(() => (status.value as any)?.expRate || null)
-
+// 只展示后端真实区间估计；每日收益不能除以滚动样本时长或进程 uptime。
+const expRateInfo = computed<ExpRateInfo | null>(() => readableStatus.value?.expRate || null)
+const validExpRate = computed(() => {
+  const info = expRateInfo.value
+  const rate = Number(info?.expPerHour)
+  return info && !info.stale && info.reason !== 'clock-regression' && Number.isFinite(rate) && rate > 0 ? rate : 0
+})
 const expRate = computed(() => {
-  const info = expRateInfo.value
-  if (info && info.expPerHour > 0)
-    return `${Math.floor(info.expPerHour)}/小时`
-
-  // 回退：用与 sessionExpGained 同源的秒数
-  const gain = status.value?.sessionExpGained || 0
-  const sec = (status.value as any)?.sessionExpSec || 0
-  if (!sec || gain <= 0)
+  const rate = validExpRate.value
+  if (rate > 0)
+    return `${rate < 1 ? rate.toFixed(2) : Math.round(rate)}/小时`
+  if (expRateInfo.value?.reason === 'idle')
     return '0/小时'
-  return `${Math.floor(gain / (sec / 3600))}/小时`
+  return '--/小时'
 })
 
-/**
- * 升级预测。
- *
- * 改进点：
- *  1. 速率改用「综合速率」（已含活跃占比），不再用错误的 uptime 口径。
- *  2. 数据不足时明确说明，而不是给一个看着很准的假数字。
- *  3. 展示区间（乐观/保守）而非单点：作物成熟时间不可控，
- *     单点预测必然不准，区间更诚实也更有决策价值。
- *     保守值按「活跃占比」折算（空闲越多，实际越慢）。
- */
 const timeToLevel = computed(() => {
-  const info = expRateInfo.value
-  const current = status.value?.levelProgress?.current || 0
-  const needed = status.value?.levelProgress?.needed || 0
-  if (!needed)
-    return ''
-
+  const current = Number(readableStatus.value?.levelProgress?.current || 0)
+  const needed = Number(readableStatus.value?.levelProgress?.needed || 0)
+  if (!Number.isFinite(current) || !Number.isFinite(needed) || needed <= 0)
+    return '暂无法预测'
   const expNeeded = Math.max(0, needed - current)
   if (expNeeded <= 0)
     return '即将升级'
-
-  const rate = info?.expPerHour || 0
+  const rate = validExpRate.value
   if (rate <= 0)
-    return '数据不足，暂无法预测'
-
-  // 采样不足时不做精细预测，避免误导
-  const confidence = info?.confidence || 'low'
-  if (confidence === 'low' || (info?.sampleCount || 0) < 3) {
-    const h = expNeeded / rate
-    return `约 ${h < 24 ? `${h.toFixed(1)} 小时` : `${(h / 24).toFixed(1)} 天`}后升级（数据积累中，仅供参考）`
-  }
-
-  const hoursBest = expNeeded / rate
-  // 保守值：假定活跃占比只有观察到的一半（给成熟等待更多余量）
-  const ratio = info?.activeRatio && info.activeRatio > 0 ? info.activeRatio : 0.5
-  const hoursWorst = expNeeded / (rate * Math.min(1, Math.max(0.3, ratio)))
-
-  const fmt = (h: number) => (h < 1
-    ? `${Math.max(1, Math.ceil(h * 60))} 分钟`
-    : h < 24 ? `${h.toFixed(1)} 小时` : `${(h / 24).toFixed(1)} 天`)
-
-  if (Math.abs(hoursWorst - hoursBest) / Math.max(hoursBest, 0.001) < 0.25)
-    return `约 ${fmt(hoursBest)}后升级`
-
-  return `约 ${fmt(hoursBest)} ~ ${fmt(hoursWorst)}后升级`
+    return '暂无法预测'
+  // 含等待时间的综合速率已经折算 idle，不能再乘 activeRatio 二次折损。
+  const hours = expNeeded / rate
+  if (!Number.isFinite(hours))
+    return '暂无法预测'
+  const duration = hours < 1
+    ? `${Math.max(1, Math.ceil(hours * 60))} 分钟`
+    : hours < 24 ? `${hours.toFixed(1)} 小时` : `${(hours / 24).toFixed(1)} 天`
+  return `约 ${duration}后升级`
 })
 
 const fertilizerNormal = computed(() => dashboardItems.value.find((item: any) => Number(item.id) === 1011))
@@ -275,8 +282,20 @@ const OP_META: Record<string, { label: string, icon: string, color: string }> = 
   mysteryMerchant: { label: '神秘商人', icon: 'i-carbon-gift', color: 'text-rose-500' },
 }
 
+const badTaskText = computed(() => {
+  const task = readableStatus.value?.badTask
+  if (!task) return ''
+  const remaining = Number.isSafeInteger(task.budget?.remaining) ? task.budget.remaining : null
+  if (!task.enabled) return '自动放虫放草已关闭；计数仅记录已确认成功的投放。'
+  if (task.paused) return `放虫放草因连续错误暂停至 ${task.retryDate}${remaining === null ? '' : `，今日预算仍剩 ${remaining}`}；暂停不代表已达上限。`
+  if (task.running) return '正在检查可投放目标；逐地块确认后计入统计。'
+  if (remaining === 0) return '今日捣乱预算已用完。'
+  if (task.lastRun?.reason === 'unknown_operation') return '有投放结果未确认，已保留访问锁，不重复提交。'
+  return remaining === null ? '投放预算尚未确认。' : `今日捣乱预算剩余 ${remaining}；目标装不下时跳过，等待下一轮，不算完成。`
+})
+
 const filteredOperations = computed(() => {
-  const operations = status.value?.operations || {}
+  const operations = readableStatus.value?.operations || {}
   const result: Record<string, number> = {}
 
   for (const key of Object.keys(operations)) {
@@ -292,6 +311,7 @@ function getEventLabel(event: string) {
 }
 
 function formatBucketTime(item: any) {
+  if (!readableBag.value) return '—'
   if (!item)
     return '0.0h'
   if (item.hoursText)
@@ -300,14 +320,15 @@ function formatBucketTime(item: any) {
 }
 
 function updateCountdowns() {
-  if (currentAccountDisconnected.value) {
-    nextFarmCheck.value = '账号未登录'
-    nextHelpCheck.value = '账号未登录'
-    nextStealCheck.value = '账号未登录'
+  if (presentation.value.kind !== 'online') {
+    const label = ['unselected', 'readonly'].includes(presentation.value.kind) ? '未选择账号' : presentation.value.label
+    nextFarmCheck.value = label
+    nextHelpCheck.value = label
+    nextStealCheck.value = label
     return
   }
 
-  localUptime.value++
+  if (Number.isFinite(readableStatus.value?.uptime)) localUptime.value++
 
   if (localNextFarmRemainSec > 0) {
     localNextFarmRemainSec--
@@ -334,7 +355,7 @@ function updateCountdowns() {
   }
 }
 
-watch(status, (newVal) => {
+watch(readableStatus, (newVal) => {
   if (newVal?.nextChecks) {
     localNextFarmRemainSec = newVal.nextChecks.farmRemainSec || 0
     localNextHelpRemainSec = newVal.nextChecks.helpRemainSec || 0
@@ -404,43 +425,91 @@ function getExpPercent(progress: any) {
   return Math.min(100, Math.max(0, (progress.current / progress.needed) * 100))
 }
 
-async function refreshBag(force = false) {
-  if (!currentAccountId.value || !currentAccount.value?.running || !currentStatusReady.value || !status.value?.connection?.connected)
+async function refreshBag(force = false, accountId = currentAccountId.value, epoch = accountEpoch) {
+  if (!isRefreshCurrent(accountId, epoch) || !accountId || !currentAccount.value?.running
+    || !currentStatusReady.value || !status.value?.connection?.connected)
     return
-
+  if (bagInFlight) {
+    await bagInFlight.catch(() => undefined)
+    if (isRefreshCurrent(accountId, epoch) && force)
+      await refreshBag(false, accountId, epoch)
+    return
+  }
   const now = Date.now()
-  if (!force && now - lastBagFetchAt.value < 2500)
+  if (!force && now - lastBagFetchAt.value < 10000)
     return
-
   lastBagFetchAt.value = now
-  await bagStore.fetchBag(currentAccountId.value)
+  // Reuse the existing one-reader store contract so the account attribution and
+  // actual successful update time accompany the items. No extra game request.
+  const pending = bagStore.fetchBag(accountId).then(() => undefined)
+  bagInFlight = pending
+  try {
+    await pending
+  }
+  catch (error) {
+    if (isRefreshCurrent(accountId, epoch))
+      console.error('刷新背包失败', error)
+  }
+  finally {
+    if (bagInFlight === pending)
+      bagInFlight = null
+  }
 }
 
-async function refresh(forceReloadLogs = false) {
-  if (!currentAccountId.value)
+async function refreshData(forceReloadLogs: boolean, accountId: string, epoch: number) {
+  if (!isRefreshCurrent(accountId, epoch) || !accountId || !currentAccount.value)
     return
-
-  const account = currentAccount.value
-  if (!account)
-    return
-
   // 首次加载、断线回退时走 HTTP；实时连接正常时优先依赖 WS 推送。
-  if (!realtimeConnected.value) {
-    await statusStore.fetchStatus(currentAccountId.value)
-    await statusStore.fetchAccountLogs(currentAccountId.value)
+  if (!realtimeConnected.value || !currentStatusReady.value) {
+    await statusStore.fetchStatus(accountId)
+    if (!isRefreshCurrent(accountId, epoch))
+      return
+    await statusStore.fetchAccountLogs(accountId)
+    if (!isRefreshCurrent(accountId, epoch))
+      return
   }
-
   if (forceReloadLogs || hasActiveLogFilter.value || !realtimeConnected.value) {
-    await statusStore.fetchLogs(currentAccountId.value, {
+    await statusStore.fetchLogs(accountId, {
       module: filter.module || undefined,
       event: filter.event || undefined,
       keyword: filter.keyword || undefined,
       isWarn: filter.isWarn === 'warn' ? true : filter.isWarn === 'info' ? false : undefined,
     })
+    if (!isRefreshCurrent(accountId, epoch))
+      return
   }
+  await refreshBag(false, accountId, epoch)
+}
 
-  // 仅在账号运行且连接稳定后再拉背包，避免启动阶段出现 500。
-  await refreshBag()
+function refresh(forceReloadLogs = false): Promise<void> {
+  if (disposed)
+    return Promise.resolve()
+  if (refreshInFlight) {
+    if (forceReloadLogs) {
+      refreshQueued = true
+      forceLogsQueued = true
+    }
+    return refreshInFlight
+  }
+  const accountId = currentAccountId.value
+  const epoch = accountEpoch
+  const pending = refreshData(forceReloadLogs, accountId, epoch)
+    .catch((error) => {
+      if (isRefreshCurrent(accountId, epoch))
+        console.error('刷新面板失败', error)
+    })
+    .finally(() => {
+      if (refreshInFlight === pending)
+        refreshInFlight = null
+      if (!disposed && refreshQueued) {
+        const forceLogs = forceLogsQueued
+        refreshQueued = false
+        forceLogsQueued = false
+        void refresh(forceLogs)
+      }
+    })
+  refreshInFlight = pending
+  return pending
 }
 
 function syncRealtimeAccount() {
@@ -462,6 +531,7 @@ function onLogSearchTrigger() {
 }
 
 watch(currentAccountId, async (newId, oldId) => {
+  const epoch = accountEpoch
   if (oldId !== undefined && newId !== oldId) {
     statusStore.clearAccountScopedData()
     bagStore.clearBag()
@@ -469,7 +539,8 @@ watch(currentAccountId, async (newId, oldId) => {
   }
   syncRealtimeAccount()
   await refresh(true)
-  scrollToBottom()
+  if (isRefreshCurrent(newId, epoch))
+    scrollToBottom()
 })
 
 watch(() => status.value?.connection?.connected, (connected) => {
@@ -526,22 +597,33 @@ watch(allLogs, () => {
   })
 }, { deep: true })
 
+function resumeLiveLogs() { autoScroll.value = true; scrollToBottom() }
 function scrollToBottom() {
   nextTick(() => {
-    if (logContainer.value)
+    if (logContainer.value && autoScroll.value)
       logContainer.value.scrollTop = logContainer.value.scrollHeight
   })
 }
 
 onMounted(async () => {
+  const accountId = currentAccountId.value
+  const epoch = accountEpoch
   statusStore.setRealtimeLogsEnabled(!hasActiveLogFilter.value)
   syncRealtimeAccount()
   await refresh()
-  scrollToBottom()
+  if (isRefreshCurrent(accountId, epoch))
+    scrollToBottom()
 })
 
-// Auto refresh fallback every 10s (WS 断开或启用筛选时回退 HTTP)
-useIntervalFn(refresh, 10000)
+onUnmounted(() => {
+  disposed = true
+  accountEpoch += 1
+  refreshQueued = false
+  forceLogsQueued = false
+})
+
+// 每10秒回退刷新，未完成的请求不重叠。
+useIntervalFn(() => refresh(), 10000)
 // Countdown timer (every 1s)
 useIntervalFn(updateCountdowns, 1000)
 </script>
@@ -556,7 +638,7 @@ useIntervalFn(updateCountdowns, 1000)
             账号
           </div>
           <div class="rounded-lg bg-blue-100 px-2 py-0.5 text-xs text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-            Lv.{{ status?.status?.level || 0 }}
+            {{ currentStatusReady && integerText(readableStatus?.status?.level) !== null ? `Lv.${readableStatus.status.level}` : '等级未读取' }}
           </div>
         </div>
         <div class="mb-1 truncate text-xl font-bold" :title="displayName">
@@ -568,16 +650,16 @@ useIntervalFn(updateCountdowns, 1000)
               <div class="i-fas-bolt text-blue-400" />
               <span>EXP</span>
             </div>
-            <span>{{ status?.levelProgress?.current || 0 }} / {{ status?.levelProgress?.needed || '?' }}</span>
+            <span>{{ currentStatusReady && readableStatus?.levelProgress ? `${readableStatus.levelProgress.current ?? '—'} / ${readableStatus.levelProgress.needed ?? '—'}` : '尚未读取' }}</span>
           </div>
           <div class="h-2 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-700">
             <div
               class="h-full rounded-full bg-blue-500 transition-all duration-500"
-              :style="{ width: `${getExpPercent(status?.levelProgress)}%` }"
+              :style="{ width: `${getExpPercent(readableStatus?.levelProgress)}%` }"
             />
           </div>
-          <div class="mt-2 flex justify-between text-xs text-gray-400">
-            <span>效率: {{ expRate }}</span>
+          <div class="mt-2 flex flex-wrap justify-between gap-x-3 gap-y-1 text-xs text-gray-400">
+            <span>效率 {{ expRate }}</span>
             <span>{{ timeToLevel }}</span>
           </div>
         </div>
@@ -591,14 +673,14 @@ useIntervalFn(updateCountdowns, 1000)
               金币
             </div>
             <div class="text-2xl text-yellow-600 font-bold dark:text-yellow-500">
-              {{ formatGoldAmount(status?.status?.gold || 0) }}
+              {{ statusAmount(readableStatus?.status?.gold, formatGoldAmount) }}
             </div>
             <div
-              v-if="(status?.sessionGoldGained || 0) !== 0"
-              class="text-[10px]"
-              :class="(status?.sessionGoldGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
+              v-if="(readableStatus?.sessionGoldGained || 0) !== 0"
+              class="dashboard-amount-change"
+              :class="(readableStatus?.sessionGoldGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
             >
-              {{ (status?.sessionGoldGained || 0) > 0 ? '+' : '' }}{{ formatGoldAmount(status?.sessionGoldGained || 0) }}
+              {{ (readableStatus?.sessionGoldGained || 0) > 0 ? '+' : '' }}{{ formatGoldAmount(readableStatus?.sessionGoldGained || 0) }}
             </div>
           </div>
           <div class="text-right">
@@ -607,14 +689,14 @@ useIntervalFn(updateCountdowns, 1000)
               点券
             </div>
             <div class="text-2xl text-emerald-500 font-bold dark:text-emerald-400">
-              {{ formatCouponAmount(status?.status?.coupon || 0) }}
+              {{ statusAmount(readableStatus?.status?.coupon, formatCouponAmount) }}
             </div>
             <div
-              v-if="(status?.sessionCouponGained || 0) !== 0"
-              class="text-[10px]"
-              :class="(status?.sessionCouponGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
+              v-if="(readableStatus?.sessionCouponGained || 0) !== 0"
+              class="dashboard-amount-change"
+              :class="(readableStatus?.sessionCouponGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
             >
-              {{ (status?.sessionCouponGained || 0) > 0 ? '+' : '' }}{{ formatCouponAmount(status?.sessionCouponGained || 0) }}
+              {{ (readableStatus?.sessionCouponGained || 0) > 0 ? '+' : '' }}{{ formatCouponAmount(readableStatus?.sessionCouponGained || 0) }}
             </div>
           </div>
           <div class="text-right">
@@ -623,26 +705,26 @@ useIntervalFn(updateCountdowns, 1000)
               金豆
             </div>
             <div class="text-2xl text-amber-500 font-bold dark:text-amber-400">
-              {{ formatGoldBeanAmount(status?.status?.goldBean || 0) }}
+              {{ statusAmount(readableStatus?.status?.goldBean, formatGoldBeanAmount) }}
             </div>
             <div
-              v-if="(status?.sessionGoldBeanGained || 0) !== 0"
-              class="text-[10px]"
-              :class="(status?.sessionGoldBeanGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
+              v-if="(readableStatus?.sessionGoldBeanGained || 0) !== 0"
+              class="dashboard-amount-change"
+              :class="(readableStatus?.sessionGoldBeanGained || 0) > 0 ? 'text-green-500' : 'text-red-500'"
             >
-              {{ (status?.sessionGoldBeanGained || 0) > 0 ? '+' : '' }}{{ formatGoldBeanAmount(status?.sessionGoldBeanGained || 0) }}
+              {{ (readableStatus?.sessionGoldBeanGained || 0) > 0 ? '+' : '' }}{{ formatGoldBeanAmount(readableStatus?.sessionGoldBeanGained || 0) }}
             </div>
           </div>
         </div>
         <div class="mt-4 border-t border-gray-100/80 pt-3 dark:border-gray-700/80">
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-2">
-              <div class="h-2.5 w-2.5 rounded-full" :class="status?.connection?.connected ? 'bg-green-500' : currentStatusReady ? 'bg-red-500' : 'bg-gray-300'" />
-              <span class="text-xs font-bold">{{ status?.connection?.connected ? '在线' : currentStatusReady ? '离线' : '检查中' }}</span>
+              <div class="dashboard-status-dot h-2.5 w-2.5 rounded-full" :data-tone="presentation.tone" />
+              <span class="text-xs font-bold">{{ presentation.label }}</span>
             </div>
             <div class="flex items-center gap-1.5 text-xs text-gray-400">
               <div class="i-fas-clock text-purple-400" />
-              {{ formatDuration(localUptime) }}
+              {{ currentStatusReady && Number.isFinite(readableStatus?.uptime) ? formatDuration(localUptime) : '尚未读取' }}
             </div>
           </div>
         </div>
@@ -685,7 +767,7 @@ useIntervalFn(updateCountdowns, 1000)
               普通
             </div>
             <div class="font-bold">
-              {{ collectionNormal?.count || 0 }}
+              {{ readableBag ? collectionNormal?.count ?? 0 : '—' }}
             </div>
           </div>
           <div>
@@ -694,11 +776,16 @@ useIntervalFn(updateCountdowns, 1000)
               典藏
             </div>
             <div class="font-bold">
-              {{ collectionRare?.count || 0 }}
+              {{ readableBag ? collectionRare?.count ?? 0 : '—' }}
             </div>
           </div>
         </div>
       </div>
+    </div>
+
+    <div v-if="dashboardNotice" class="dashboard-notice ui-notice" role="status">
+      <div><strong>{{ dashboardNotice.text }}</strong><span v-if="lastStatusTime">上次确认 {{ lastStatusTime }}{{ currentStatusStale ? ' · 非实时状态' : '' }}</span></div>
+      <BaseButton v-if="dashboardNotice.path" variant="outline" size="sm" :to="dashboardNotice.path">{{ dashboardNotice.action }}</BaseButton>
     </div>
 
     <div class="flex flex-1 flex-col items-stretch gap-5 md:flex-row">
@@ -714,10 +801,13 @@ useIntervalFn(updateCountdowns, 1000)
               >筛选中 · {{ allLogs.length }} 条</span>
             </h3>
 
-            <div class="flex flex-wrap items-center gap-2 text-sm">
+            <details v-fold-motion class="dashboard-log-filters" :open="hasActiveLogFilter || undefined">
+              <summary>筛选日志{{ hasActiveLogFilter ? ' · 已筛选' : '' }}</summary>
+              <div class="flex flex-wrap items-center gap-2 text-sm">
               <BaseSelect
                 v-model="filter.module"
                 :options="modules"
+                aria-label="日志模块"
                 class="w-32"
                 @change="onLogFilterChange"
               />
@@ -725,6 +815,7 @@ useIntervalFn(updateCountdowns, 1000)
               <BaseSelect
                 v-model="filter.event"
                 :options="events"
+                aria-label="日志事件"
                 class="w-32"
                 @change="onLogFilterChange"
               />
@@ -732,6 +823,7 @@ useIntervalFn(updateCountdowns, 1000)
               <BaseSelect
                 v-model="filter.isWarn"
                 :options="logLevels"
+                aria-label="日志级别"
                 class="w-32"
                 @change="onLogFilterChange"
               />
@@ -739,6 +831,7 @@ useIntervalFn(updateCountdowns, 1000)
               <BaseInput
                 v-model="filter.keyword"
                 placeholder="关键词..."
+                aria-label="日志关键词"
                 class="w-32"
                 clearable
                 @keyup.enter="onLogSearchTrigger"
@@ -748,6 +841,7 @@ useIntervalFn(updateCountdowns, 1000)
               <BaseButton
                 variant="primary"
                 size="sm"
+                aria-label="搜索日志"
                 @click="onLogSearchTrigger"
               >
                 <div class="i-carbon-search" />
@@ -762,8 +856,10 @@ useIntervalFn(updateCountdowns, 1000)
                 <div class="i-carbon-trash-can mr-1" />
                 清空
               </BaseButton>
-            </div>
+              </div>
+            </details>
           </div>
+          <div v-if="!autoScroll && allLogs.length" class="dashboard-reading-note"><span>正在查看历史，新日志不会打断阅读。</span><BaseButton variant="text" @click="resumeLiveLogs">回到最新</BaseButton></div>
 
           <div ref="logContainer" class="ui-subtle-panel max-h-[50vh] min-h-0 flex-1 overflow-y-auto rounded-lg p-4 text-sm leading-relaxed font-mono" @scroll="onLogScroll">
             <div v-if="!allLogs.length" class="py-8 text-center text-gray-400">
@@ -772,7 +868,7 @@ useIntervalFn(updateCountdowns, 1000)
                 暂无日志
               </div>
               <div class="mt-1 text-xs text-gray-400">
-                运行账号后，这里会持续追加巡查、种植、任务和出售记录。
+                {{ LOCAL_UI_READONLY ? '本地只读浏览不读取日志。' : hasActiveLogFilter ? '没有符合当前筛选条件的记录。' : '尚未取得日志；不会据此判定任务未执行。' }}
               </div>
             </div>
             <div v-for="log in allLogs" :key="log.ts + log.msg" class="mb-1 break-all">
@@ -831,13 +927,14 @@ useIntervalFn(updateCountdowns, 1000)
             <div class="i-carbon-connection-signal-off text-4xl text-gray-400" />
             <div class="flex flex-col">
               <div class="text-lg text-gray-700 font-medium dark:text-gray-300">
-                账号未登录
+                {{ presentation.label }}
               </div>
               <div class="mt-1 text-sm text-gray-400">
-                请先运行账号或检查网络连接。
+                {{ presentation.detail }}
               </div>
             </div>
           </div>
+          <div v-else-if="!currentStatusReady" class="ui-empty-state"><p>统计尚未读取</p><p>{{ LOCAL_UI_READONLY ? '本地浏览不读取账号数据。' : '选择账号并确认状态后显示，不把未读取当成零次操作。' }}</p></div>
           <div v-else-if="!Object.keys(filteredOperations).length" class="ui-subtle-panel flex flex-col items-center justify-center gap-3 rounded-lg p-8 text-center">
             <div class="i-carbon-chart-column text-3xl text-gray-300" />
             <div class="text-sm text-gray-600 font-medium dark:text-gray-300">
@@ -864,8 +961,24 @@ useIntervalFn(updateCountdowns, 1000)
               </div>
             </div>
           </div>
+          <p v-if="currentStatusReady && badTaskText" class="mt-3 text-xs leading-6 text-[var(--muted-text)]" role="status">{{ badTaskText }}</p>
         </div>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.metric-card { font-variant-numeric: tabular-nums; }
+.dashboard-amount-change { font-size: 12px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.dashboard-status-dot { background: var(--muted-text); }
+.dashboard-status-dot[data-tone='success'] { background: var(--status-success, #327047); }
+.dashboard-status-dot[data-tone='warning'], .dashboard-status-dot[data-tone='error'] { background: var(--status-danger, #b4232c); }
+.dashboard-notice { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.dashboard-notice strong { display: block; font-size: 13px; font-weight: 500; }
+.dashboard-notice span { display: block; margin-top: 5px; color: var(--muted-text); font-size: 12px; }
+.dashboard-log-filters { min-width: 0; max-width: 100%; }
+.dashboard-log-filters summary { padding: 8px 10px; color: var(--muted-text); font-size: 13px; cursor: pointer; }
+.dashboard-log-filters[open] > div { margin-top: 10px; }
+.dashboard-reading-note { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-bottom: 10px; color: var(--muted-text); font-size: 12px; }
+</style>

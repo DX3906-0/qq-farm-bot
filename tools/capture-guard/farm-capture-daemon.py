@@ -23,18 +23,18 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 import urllib.request
 
 # ---- 配置 ----
-# 环境相关值统一走环境变量，仓库内只保留占位默认值。
-PANEL = os.environ.get('FARM_PANEL', 'http://127.0.0.1:3007')
-USER = os.environ.get('FARM_PANEL_USER', 'admin')
+PANEL = os.environ.get('FARM_PANEL', '')
+USER = os.environ.get('FARM_PANEL_USER', '')
 PASS = os.environ.get('FARM_PANEL_PASS', '')
-NODE_EXE = os.environ.get('NODE_EXE', r'C:\Program Files\nodejs\node.exe')
-PYW_EXE = os.environ.get('PYW_EXE', 'pythonw.exe')
+NODE_EXE = r'C:\Program Files\nodejs\node.exe'
+PYW_EXE = os.environ.get('FARM_PYTHONW') or shutil.which('pythonw.exe') or sys.executable
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(DIR, '_daemon.log')

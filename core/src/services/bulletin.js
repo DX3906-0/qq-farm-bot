@@ -21,6 +21,25 @@ const BULLETIN_DETAIL_METHOD = 'GetBulletinDetail';
 
 async function getBulletinList() {
   const { body } = await sendMsgAsync(BULLETIN_SERVICE, BULLETIN_METHOD, Buffer.alloc(0));
+
+  // 2026-11-03：优先用 proto 结构化解析（proto 已纳入加载列表）。
+  // 手写解码保留为回退 —— proto 里部分字段仍是"待逆向确认"状态，不足以覆盖全部字段。
+  try {
+    const { types } = require('../utils/proto');
+    if (types.BulletinListReply) {
+      const decoded = types.BulletinListReply.decode(body);
+      const list = (decoded.bulletins || []).map(b => ({
+        id: Number(b.id) || 0,
+        title: b.title || '',
+        type: Number(b.type) || 0,
+        pic: b.pic || '',
+        status: Number(b.status) || 0,
+      }));
+      if (list.length > 0) return list;
+    }
+  } catch (e) {
+    // 落到手写解码
+  }
   return decodeBulletins(body);
 }
 

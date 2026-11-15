@@ -29,7 +29,7 @@ Usage:
 
 --qq-id: 目标 QQ 号（来自面板账号 gid）。提供时会截图选号框并用 Windows OCR
          读取每行文本，找到显示该 QQ 号的行直接点它 —— 不依赖行顺序假设
-         （历史事故：行顺序变化导致罗辑的 Code 写到了比尔希恩斯头上）。
+         （历史事故：行顺序变化导致账号甲的 Code 写到了示例账号乙头上）。
          OCR 不可用或未匹配到时，退回 --row 行号模式。
 """
 import argparse
@@ -365,12 +365,12 @@ public class FarmSnap {
 def nick_keywords(nick):
     """Extract short match keys from a panel nickname for OCR line matching.
 
-    "面壁者比尔·希恩斯" -> ["希恩斯", "比尔", "希恩", "比"]  (full parts first,
+    "示例账号乙" -> ["账号乙", "比尔", "希恩", "比"]  (full parts first,
     then 2-char / 1-char heads — CJK OCR often drops the last glyph).
     """
     if not nick:
         return []
-    s = re.sub(r'面壁者|执剑人|守护者', '', nick)
+    s = re.sub(r'示例前缀|执剑人|守护者', '', nick)
     parts = [p for p in re.split(r'[·•・.\uFF0E\u3002\s]+', s) if p]
     keys = []
     for p in parts:
@@ -406,7 +406,7 @@ def ocr_find_row_y(hwnd, qq_id, log, nick=''):
         #   1. nickname keywords  — CJK OCR is far more reliable than the
         #      10-digit QQ number rendered in tiny glyphs, AND the panel gid is
         #      a game id that differs from the QQ number shown in the dialog
-        #      (e.g. gid=1000000003 vs dialog 1000000002) so gid often CANNOT
+        #      (e.g. gid=1000000002 vs dialog 1000000002) so gid often CANNOT
         #      match anything on screen;
         #   2. gid exact / homoglyph-normalized — still useful when it works.
         probes = [p for p in nick_keywords(nick) if p]

@@ -1,21 +1,56 @@
 <script setup lang="ts">
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onScopeDispose, onUnmounted, ref, watch } from 'vue'
+import { isReadCanceled } from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
+import FarmToolbar from '@/components/FarmToolbar.vue'
 import LandCard from '@/components/LandCard.vue'
 import LandDetailModal from '@/components/LandDetailModal.vue'
 import { useAccountStore } from '@/stores/account'
+import type { FarmOperationResponse } from '@/stores/farm'
 import { useFarmStore } from '@/stores/farm'
+import { useToastStore } from '@/stores/toast'
 import { useStatusStore } from '@/stores/status'
 
 const farmStore = useFarmStore()
+const toast = useToastStore()
+
+function showFarmOperationResult(result: FarmOperationResponse) {
+  const harvested = result.harvestedLands?.length || 0
+  if (!result.ok) {
+    const partial = harvested > 0 ? `已收获 ${harvested} 块土地；` : result.hadWork ? '部分操作已完成；' : ''
+    toast.error(`${partial}${result.error || '农场操作失败'}`)
+  }
+  else if (result.skipped || result.hadWork === false) {
+    toast.info('当前没有可执行的农场操作，已跳过')
+  }
+  else if (result.success === true) {
+    toast.success(harvested > 0 ? `已收获 ${harvested} 块土地` : `农场操作完成${result.actions?.length ? `：${result.actions.join('/')}` : ''}`)
+  }
+  else {
+    toast.info('操作请求已返回，尚未确认完成')
+  }
+  if (result.refreshError)
+    toast.warning(result.refreshError)
+}
 const accountStore = useAccountStore()
 const statusStore = useStatusStore()
 const { lands, summary, weather, loading, unifiedHarvest } = storeToRefs(farmStore)
 const { currentAccountId, currentAccount } = storeToRefs(accountStore)
 const { status, loading: statusLoading, realtimeConnected, currentStatusReady } = storeToRefs(statusStore)
 
+let disposed = false
+let refreshEpoch = 0
+let readController = new AbortController()
+let refreshFlight: { id: string, epoch: number, promise: Promise<void> } | undefined
+let queuedRefresh: Promise<void> | undefined
+onScopeDispose(() => {
+  disposed = true
+  refreshEpoch++
+  readController.abort()
+})
+let operationRequest = 0
 const operating = ref(false)
 const farmLoaded = ref(false)
 const confirmVisible = ref(false)
@@ -31,8 +66,6 @@ watch(currentAccountId, () => {
   detailLandId.value = null
 })
 const farmCanvas = ref<HTMLCanvasElement | null>(null)
-const farmViewport = ref<HTMLElement | null>(null)
-const farmStageWidth = ref<number | null>(null)
 const FARM_CANVAS_WIDTH = 1200
 const FARM_CANVAS_HEIGHT = 650
 const SINGLE_LAND_WIDTH = 210
@@ -58,8 +91,14 @@ const confirmConfig = ref({
 })
 
 async function executeOperate() {
-  if (!currentAccountId.value)
+  if (!currentAccountId.value || operating.value)
     return
+  const operationAccountId = currentAccountId.value
+  const request = ++operationRequest
+  refreshEpoch++
+  readController.abort()
+  readController = new AbortController()
+  const signal = readController.signal
 
   const config = confirmConfig.value
   if (!config.opType && !config.bulkAction && (!config.landAction || !config.land))
@@ -69,38 +108,50 @@ async function executeOperate() {
   operating.value = true
   try {
     if (config.opType) {
-      await farmStore.operate(currentAccountId.value, config.opType)
+      const result = await farmStore.operate(operationAccountId, config.opType, signal)
+      if (!disposed && !signal.aborted && currentAccountId.value === operationAccountId)
+        showFarmOperationResult(result)
     }
     else if (config.bulkAction === 'removeAll') {
-      await farmStore.removeAllPlants(currentAccountId.value)
+      await farmStore.removeAllPlants(operationAccountId, signal)
     }
     else if (config.landAction === 'fertilize') {
-      await farmStore.fertilizeLand(currentAccountId.value, Number(config.land.id))
+      await farmStore.fertilizeLand(operationAccountId, Number(config.land.id), signal)
     }
     else if (config.landAction === 'remove') {
-      await farmStore.removePlant(currentAccountId.value, Number(config.land.id))
+      await farmStore.removePlant(operationAccountId, Number(config.land.id), signal)
     }
     else if (config.bulkAction === 'unifiedOn') {
-      await farmStore.setUnifiedHarvest(currentAccountId.value, true)
+      await farmStore.setUnifiedHarvest(operationAccountId, true)
     }
     else if (config.bulkAction === 'unifiedOff') {
-      await farmStore.setUnifiedHarvest(currentAccountId.value, false)
+      await farmStore.setUnifiedHarvest(operationAccountId, false)
     }
   }
+  catch (error: any) {
+    if (!disposed && !signal.aborted && !isReadCanceled(error)) toast.error(error?.message || '农场操作失败')
+  }
   finally {
-    operating.value = false
+    if (!disposed && currentAccountId.value === operationAccountId && request === operationRequest) operating.value = false
   }
 }
 
 function handleOperate(opType: string) {
-  if (!currentAccountId.value)
+  if (!currentAccountId.value || operating.value)
     return
+
+  if (opType === 'all' || opType === 'harvest') {
+    // 手动全收/收获点击即执行；危险的铲除、升级仍保留确认。
+    confirmConfig.value = { ...confirmConfig.value, opType, bulkAction: '', landAction: '', land: null }
+    void executeOperate().catch(() => {}) // 网络错误由请求层提示，避免未处理拒绝。
+    return
+  }
 
   const confirmMap: Record<string, string> = {
     harvest: '确定要收获所有成熟作物吗？',
     clear: '确定要执行一键务农吗？将自动浇水、除草、除虫。',
     plant: '确定要一键种植吗？(根据策略配置)',
-    upgrade: '确定要升级所有可升级的土地吗？(消耗金币)',
+    upgrade: '确定要升级所有可升级的土地吗？会按游戏条件消耗金币和对应道具；当前可升级的蓝晶优先，其余不等待。',
     all: '确定要执行一键全收吗？将依次执行收获、务农、种植与升级。',
   }
 
@@ -188,35 +239,41 @@ function handleLandRemove(land: any) {
   confirmVisible.value = true
 }
 
-const operations = [
-  { type: 'harvest', label: '收获', icon: 'i-carbon-wheat', color: 'bg-blue-600 hover:bg-blue-700' },
-  { type: 'clear', label: '一键务农', icon: 'i-carbon-clean', color: 'bg-teal-600 hover:bg-teal-700' },
-  { type: 'plant', label: '种植', icon: 'i-carbon-sprout', color: 'bg-green-600 hover:bg-green-700' },
-  { type: 'upgrade', label: '升级土地', icon: 'i-carbon-upgrade', color: 'bg-purple-600 hover:bg-purple-700' },
-  { type: 'all', label: '一键全收', icon: 'i-carbon-flash', color: 'bg-orange-600 hover:bg-orange-700' },
-]
-
-async function refresh() {
-  if (currentAccountId.value) {
-    const acc = currentAccount.value
-    if (!acc)
-      return
-
+function refresh(): Promise<void> {
+  const id = String(currentAccountId.value || '')
+  const epoch = refreshEpoch
+  if (disposed || document.hidden || !id || !currentAccount.value) return Promise.resolve()
+  if (refreshFlight?.id === id && refreshFlight.epoch === epoch) return refreshFlight.promise
+  if (refreshFlight) {
+    if (!queuedRefresh) queuedRefresh = refreshFlight.promise.catch(() => {}).then(async () => {
+      queuedRefresh = undefined
+      if (!disposed) await refresh()
+    })
+    return queuedRefresh
+  }
+  const signal = readController.signal
+  const valid = () => !disposed && !signal.aborted && !document.hidden && epoch === refreshEpoch && String(currentAccountId.value) === id
+  const flight = { id, epoch, promise: (async () => {
     try {
-      if (!realtimeConnected.value) {
-        await statusStore.fetchStatus(currentAccountId.value)
+      if (!realtimeConnected.value) await statusStore.fetchStatus(id)
+      if (!valid()) return
+      if (currentAccount.value?.running) {
+        const applied = await farmStore.fetchLands(id, signal)
+        if (applied === false || !valid()) return
+        await farmStore.fetchUnifiedHarvest(id, signal)
       }
-
-      if (acc.running) {
-        await farmStore.fetchLands(currentAccountId.value)
-        // 统一时间收获是 worker 侧的一次性任务，按钮状态要能反映它是否还在等待
-        await farmStore.fetchUnifiedHarvest(currentAccountId.value)
-      }
+    }
+    catch (error) {
+      if (valid() && !isReadCanceled(error)) throw error
     }
     finally {
-      farmLoaded.value = true
+      if (valid()) farmLoaded.value = true
     }
-  }
+  })().finally(() => {
+    if (refreshFlight === flight) refreshFlight = undefined
+  }) }
+  refreshFlight = flight
+  return flight.promise
 }
 
 const showInitialLoading = computed(() =>
@@ -269,29 +326,17 @@ const displayLands = computed(() =>
   (Array.isArray(lands.value) ? lands.value : []).filter(land => !land?.occupiedByMaster),
 )
 
-const farmStageStyle = computed(() => farmStageWidth.value
-  ? { width: `${farmStageWidth.value}px` }
-  : undefined)
-
-function updateFarmStageSize() {
-  const viewport = farmViewport.value
-  if (!viewport || window.innerWidth < 640) {
-    farmStageWidth.value = null
-    return
-  }
-  const documentTop = viewport.getBoundingClientRect().top + window.scrollY
-  const availableHeight = Math.max(240, window.innerHeight - documentTop - 72)
-  const availableWidth = viewport.parentElement?.clientWidth || FARM_CANVAS_WIDTH
-  // 保持 1200×650 比例并限制在当前一屏内；外层 viewport 同步收窄，不再露出第二层背景。
-  farmStageWidth.value = Math.min(availableWidth, FARM_CANVAS_WIDTH, availableHeight * FARM_CANVAS_WIDTH / FARM_CANVAS_HEIGHT)
-}
-
 function getLandTextureUrl(land: any) {
-  const level = Math.min(5, Math.max(1, Number(land?.level) || 1))
-  if (Number(land?.plantSize) > 1)
-    return `/game-config/land_images/land_valid${level}_2x2.png`
+  const level = Math.min(6, Math.max(1, Number(land?.level) || 1))
   if (land?.status === 'locked')
     return '/game-config/land_images/land_locked.png'
+  // 与卡片共用同源清晰小格/四格资源，保留各自尺寸；不使用旧缩略图或降为紫晶。
+  if (level === 6)
+    return Number(land?.plantSize) > 1
+      ? '/game-config/land_images/land_valid6_2x2.png'
+      : '/game-config/land_images/land_valid6.png'
+  if (Number(land?.plantSize) > 1)
+    return `/game-config/land_images/land_valid${level}_2x2.png`
   return `/game-config/land_images/${land?.needWater ? `land_dry${level}` : `land_valid${level}`}.png`
 }
 
@@ -363,7 +408,6 @@ function getIsometricStyle(land: any) {
 
 watch(lands, () => {
   drawFarmCanvas()
-  nextTick(updateFarmStageSize)
 }, { flush: 'post' })
 
 watch(selectedLandId, () => {
@@ -371,17 +415,23 @@ watch(selectedLandId, () => {
 })
 
 watch(currentAccountId, (newId, oldId) => {
+  refreshEpoch++
+  readController.abort()
+  readController = new AbortController()
   if (oldId !== undefined && newId !== oldId) {
     farmLoaded.value = false
+    operationRequest++
+    operating.value = false
+    confirmVisible.value = false
     farmStore.clearFarmData()
     statusStore.clearAccountScopedData()
     selectedLandId.value = null
   }
-  refresh()
-}, { immediate: true })
+  void refresh().catch(() => {})
+}, { immediate: true, flush: 'sync' })
 
 watch(() => currentAccount.value?.running, () => {
-  refresh()
+  void refresh().catch(() => {})
 })
 
 watch(confirmVisible, (visible) => {
@@ -389,21 +439,28 @@ watch(confirmVisible, (visible) => {
     selectedLandId.value = null
 })
 
-const { pause: pauseRefresh, resume: resumeRefresh } = useIntervalFn(refresh, 60000)
-
-resumeRefresh()
+const { pause: pauseRefresh, resume: resumeRefresh } = useIntervalFn(() => { void refresh().catch(() => {}) }, 60000, { immediate: false })
+function syncRefreshVisibility() {
+  if (document.hidden) {
+    pauseRefresh()
+    refreshEpoch++
+    readController.abort()
+    readController = new AbortController()
+  }
+  else if (!disposed) resumeRefresh()
+}
+syncRefreshVisibility()
 onMounted(() => {
+  document.addEventListener('visibilitychange', syncRefreshVisibility)
   document.addEventListener('pointerdown', handleDocumentPointerDown)
   document.addEventListener('keydown', handleDocumentKeydown)
-  window.addEventListener('resize', updateFarmStageSize)
-  updateFarmStageSize()
   drawFarmCanvas()
 })
 onUnmounted(() => {
   pauseRefresh()
+  document.removeEventListener('visibilitychange', syncRefreshVisibility)
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
   document.removeEventListener('keydown', handleDocumentKeydown)
-  window.removeEventListener('resize', updateFarmStageSize)
 })
 </script>
 
@@ -416,65 +473,14 @@ onUnmounted(() => {
     }"
   >
     <div class="rounded-lg bg-white shadow dark:bg-gray-800">
-      <!-- Header with Title and Actions -->
-      <div class="flex flex-col items-stretch justify-between gap-3 border-b border-gray-100 p-4 sm:flex-row sm:items-center dark:border-gray-700">
-        <h3 class="flex items-center gap-2 text-lg font-bold">
-          <div class="i-carbon-grid text-xl" />
-          土地详情
-        </h3>
-        <div class="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap">
-          <button
-            v-for="op in operations"
-            :key="op.type"
-            class="flex items-center justify-center gap-1.5 rounded px-3 py-2 text-sm text-white transition disabled:cursor-not-allowed disabled:opacity-50"
-            :class="op.color"
-            :disabled="operating"
-            @click="handleOperate(op.type)"
-          >
-            <div :class="op.icon" />
-            <span class="hidden sm:inline">{{ op.label }}</span>
-            <span class="sm:hidden">{{ op.type === 'clear' ? '务农' : op.label.replace('一键', '') }}</span>
-          </button>
-          <button
-            class="flex items-center justify-center gap-1.5 rounded bg-red-600 px-3 py-2 text-sm text-white transition disabled:cursor-not-allowed hover:bg-red-700 disabled:opacity-50"
-            :disabled="operating"
-            @click="handleRemoveAllPlants"
-          >
-            <div class="i-carbon-trash-can" />
-            一键铲除
-          </button>
-          <button
-            class="flex items-center justify-center gap-1.5 rounded px-3 py-2 text-sm text-white transition disabled:cursor-not-allowed disabled:opacity-50"
-            :class="unifiedHarvest ? 'bg-amber-600 hover:bg-amber-700' : 'bg-emerald-600 hover:bg-emerald-700'"
-            :disabled="operating"
-            :title="unifiedHarvest ? '正在等待最后一块地成熟，点击取消' : '等待最后一块地成熟后统一一键收取'"
-            @click="handleUnifiedHarvest"
-          >
-            <div :class="unifiedHarvest ? 'i-carbon-close' : 'i-carbon-timer'" />
-            {{ unifiedHarvest ? '取消统一收获' : '统一时间收获' }}
-          </button>
-        </div>
-      </div>
-
-      <!-- Summary -->
-      <div class="grid grid-cols-4 gap-2 border-b border-gray-100 bg-gray-50 p-3 text-xs sm:flex sm:flex-wrap sm:gap-4 dark:border-gray-700 dark:bg-gray-900/50 sm:p-4 sm:text-sm">
-        <div class="flex items-center gap-1.5 rounded-full bg-orange-100 px-3 py-1 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400">
-          <div class="i-carbon-clean" />
-          <span class="font-medium">可收: {{ summary?.harvestable || 0 }}</span>
-        </div>
-        <div class="flex items-center gap-1.5 rounded-full bg-green-100 px-3 py-1 text-green-700 dark:bg-green-900/30 dark:text-green-400">
-          <div class="i-carbon-sprout" />
-          <span class="font-medium">生长: {{ summary?.growing || 0 }}</span>
-        </div>
-        <div class="flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1 text-gray-700 dark:bg-gray-800 dark:text-gray-400">
-          <div class="i-carbon-checkbox" />
-          <span class="font-medium">空闲: {{ summary?.empty || 0 }}</span>
-        </div>
-        <div class="flex items-center gap-1.5 rounded-full bg-red-100 px-3 py-1 text-red-700 dark:bg-red-900/30 dark:text-red-400">
-          <div class="i-carbon-warning" />
-          <span class="font-medium">枯萎: {{ summary?.dead || 0 }}</span>
-        </div>
-      </div>
+      <FarmToolbar
+        :operating="operating"
+        :unified-harvest="unifiedHarvest"
+        :summary="summary"
+        @operate="handleOperate"
+        @remove-all="handleRemoveAllPlants"
+        @unified-harvest="handleUnifiedHarvest"
+      />
 
       <!-- Grid -->
       <div class="p-2 sm:p-4">
@@ -491,7 +497,7 @@ onUnmounted(() => {
         </div>
 
         <template v-else>
-          <div ref="farmViewport" class="farm-land-viewport rounded-2xl" :style="farmStageStyle">
+          <div class="farm-land-viewport rounded-2xl">
             <div class="iso-farm-stage">
               <canvas
                 ref="farmCanvas"
@@ -561,6 +567,9 @@ onUnmounted(() => {
 
 <style scoped>
 .farm-land-viewport {
+  /* 由卡片内容宽度决定大小；不再为塞进剩余屏高而缩小土地与作物。 */
+  width: 100%;
+  max-width: 1200px;
   container-type: inline-size;
   overflow: hidden;
   margin-inline: auto;

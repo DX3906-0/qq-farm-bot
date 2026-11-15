@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
+import { cancelContentMotion, createModalPresenceMotion } from '@/composables/useContentMotion'
 
 type ModalType = 'primary' | 'danger' | 'success' | 'secondary'
-
 const props = withDefaults(defineProps<{
   show: boolean
   title?: string
@@ -15,232 +15,200 @@ const props = withDefaults(defineProps<{
   type?: ModalType
   confirmationCode?: string
 }>(), {
-  title: '\u786E\u8BA4\u64CD\u4F5C',
-  message: '\u786E\u5B9A\u8981\u6267\u884C\u6B64\u64CD\u4F5C\u5417\uFF1F',
-  confirmText: '\u786E\u5B9A',
-  cancelText: '\u53D6\u6D88',
-  loading: false,
-  isAlert: false,
-  type: 'primary',
-  confirmationCode: '',
+  title: '确认操作', message: '确定要执行此操作吗？', confirmText: '确定', cancelText: '取消',
+  loading: false, isAlert: false, type: 'primary', confirmationCode: '',
 })
-
 const emit = defineEmits<{
   (e: 'confirm'): void
   (e: 'cancel'): void
   (e: 'close'): void
 }>()
-
-const confirmDisabled = computed(() => {
-  if (props.loading)
-    return true
-  return false
-})
-const confirmVariant = computed<ModalType>(() => props.type || 'primary')
-const modalTone = computed(() => props.type || 'primary')
-const iconClass = computed(() => {
-  if (props.isAlert)
-    return props.type === 'danger' ? 'i-carbon-warning' : 'i-carbon-information'
-  if (props.type === 'danger')
-    return 'i-carbon-warning-alt'
-  if (props.type === 'success')
-    return 'i-carbon-checkmark'
-  return 'i-carbon-help'
-})
-
-function closeModal() {
-  if (props.loading)
-    return
-  emit('close')
+const dialog = ref<HTMLDialogElement | null>(null)
+const dialogId = useId()
+let previousFocus: HTMLElement | null = null
+let disposed = false
+let presenceRevision = 0
+const rendered = ref(props.show)
+const leaving = ref(false)
+function finishHidden() {
+  if (props.show || disposed) return
+  dialog.value?.close()
+  rendered.value = false
+  leaving.value = false
+  restoreFocus()
 }
+const presence = createModalPresenceMotion(() => dialog.value, finishHidden)
+const confirmDisabled = computed(() => props.loading || leaving.value)
+const iconClass = computed(() => props.type === 'danger'
+  ? 'i-carbon-warning-alt' : props.type === 'success' ? 'i-carbon-checkmark'
+    : props.isAlert ? 'i-carbon-information' : 'i-carbon-help')
+
+function restoreFocus() {
+  const target = previousFocus
+  previousFocus = null
+  if (target?.isConnected)
+    target.focus({ preventScroll: true })
+}
+function focusSafely() {
+  const element = dialog.value
+  if (!element?.open)
+    return
+  // Never initially focus an irreversible action. A pending request has no
+  // active controls: focus the dialog itself, without implying cancellation.
+  const target = props.loading ? element : element.querySelector<HTMLElement>(props.isAlert
+    ? '.confirm-modal-actions button' : '[data-modal-cancel]') || element
+  target.focus({ preventScroll: true })
+}
+watch(() => props.show, async (visible) => {
+  if (typeof document === 'undefined' || disposed) return
+  const request = ++presenceRevision
+  if (!visible) {
+    leaving.value = true
+    if (!dialog.value?.open) { finishHidden(); return }
+    // Keep native modality until the short exit ends; invisible stale controls
+    // cannot confirm, and focus returns only after the top layer is released.
+    presence.change(false)
+    return
+  }
+  cancelContentMotion('overlay')
+  const wasOpen = dialog.value?.open === true
+  if (!wasOpen) previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  rendered.value = true
+  leaving.value = false
+  await nextTick()
+  if (disposed || request !== presenceRevision || !props.show || !dialog.value) return
+  if (!dialog.value.open) dialog.value.showModal()
+  focusSafely()
+  presence.change(true, !wasOpen)
+}, { immediate: true, flush: 'pre' })
+watch(() => props.loading, () => { void nextTick(focusSafely) })
+onBeforeUnmount(() => {
+  disposed = true
+  presenceRevision++
+  presence.dispose()
+  dialog.value?.close()
+  restoreFocus()
+})
 
 function cancel() {
-  if (props.loading)
-    return
-  emit('cancel')
+  if (props.show && !props.loading && !leaving.value)
+    emit('cancel')
 }
-
-function confirm() {
-  if (confirmDisabled.value)
+function closeModal() {
+  if (!props.show || props.loading || leaving.value)
     return
-  emit('confirm')
+  // Existing callers may listen to either event. Both are dismissals only;
+  // neither changes nor cancels the already-sent request.
+  emit('cancel')
+  emit('close')
+}
+function onNativeCancel(event: Event) {
+  event.preventDefault()
+  closeModal()
+}
+function onDialogKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Tab' || !dialog.value)
+    return
+  const controls = [...dialog.value.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]')]
+    .filter(element => !element.hidden && element.getClientRects().length > 0)
+  if (!controls.length) {
+    event.preventDefault()
+    dialog.value.focus({ preventScroll: true })
+    return
+  }
+  const first = controls[0], last = controls[controls.length - 1]
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog.value)) {
+    event.preventDefault()
+    last?.focus({ preventScroll: true })
+  }
+  else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog.value)) {
+    event.preventDefault()
+    first?.focus({ preventScroll: true })
+  }
+}
+function onBackdropClick(event: MouseEvent) {
+  const element = dialog.value
+  if (!element || event.target !== element)
+    return
+  const bounds = element.getBoundingClientRect()
+  if (event.clientX < bounds.left || event.clientX > bounds.right
+    || event.clientY < bounds.top || event.clientY > bounds.bottom)
+    closeModal()
+}
+function confirm() {
+  if (!confirmDisabled.value)
+    emit('confirm')
 }
 </script>
 
 <template>
-  <Transition name="confirm-modal">
-    <div
-      v-if="show"
-      class="confirm-modal-overlay"
-      @click="closeModal"
+    <dialog
+      v-if="rendered"
+      ref="dialog"
+      class="confirm-modal"
+      :data-tone="type"
+      :data-leaving="leaving"
+      :aria-labelledby="`${dialogId}-title`"
+      :aria-describedby="`${dialogId}-message`"
+      :aria-busy="loading ? 'true' : undefined"
+      aria-modal="true"
+      tabindex="-1"
+      @cancel="onNativeCancel"
+      @keydown="onDialogKeydown"
+      @click="onBackdropClick"
     >
-      <div
-        class="confirm-modal"
-        :data-tone="modalTone"
-        @click.stop
-      >
-        <div class="confirm-modal-icon">
-          <div :class="iconClass" />
-        </div>
-
-        <div class="confirm-modal-content">
-          <h3 class="confirm-modal-title">
-            {{ title }}
-          </h3>
-          <p class="confirm-modal-message">
-            {{ message }}
-          </p>
-        </div>
-
-        <div class="confirm-modal-actions" :class="{ 'is-alert': isAlert }">
-          <BaseButton
-            v-if="!isAlert"
-            class="confirm-modal-button"
-            variant="secondary"
-            :disabled="loading"
-            @click="cancel"
-          >
-            {{ cancelText }}
-          </BaseButton>
-          <BaseButton
-            class="confirm-modal-button"
-            :variant="confirmVariant"
-            :loading="loading"
-            :disabled="confirmDisabled"
-            @click="confirm"
-          >
-            {{ confirmText }}
-          </BaseButton>
-        </div>
+      <div class="confirm-modal-icon" aria-hidden="true"><div :class="iconClass" /></div>
+      <div class="confirm-modal-content">
+        <h3 :id="`${dialogId}-title`" class="confirm-modal-title">{{ title }}</h3>
+        <p :id="`${dialogId}-message`" class="confirm-modal-message">{{ message }}</p>
+        <p v-if="loading" class="confirm-modal-progress" role="status">请求处理中，请等待结果；已发送的请求不会因关闭窗口而取消。</p>
       </div>
-    </div>
-  </Transition>
+      <div class="confirm-modal-actions" :class="{ 'is-alert': isAlert }">
+        <BaseButton v-if="!isAlert" class="confirm-modal-button" data-modal-cancel variant="secondary" :disabled="loading || leaving" @click="cancel">{{ cancelText }}</BaseButton>
+        <BaseButton class="confirm-modal-button" :variant="type" :loading="loading" :disabled="confirmDisabled" @click="confirm">{{ confirmText }}</BaseButton>
+      </div>
+    </dialog>
 </template>
 
 <style scoped>
-.confirm-modal-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  background: rgba(15, 23, 42, 0.34);
-  backdrop-filter: blur(4px);
-}
-
 .confirm-modal {
-  width: min(100%, 430px);
-  border: 1px solid rgba(102, 187, 106, 0.22);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.97);
-  box-shadow:
-    0 18px 56px rgba(46, 125, 50, 0.14),
-    0 8px 28px rgba(15, 23, 42, 0.14);
-  padding: 28px;
-  text-align: center;
+  --modal-tone: var(--theme-primary, #416d3b);
+  width: min(430px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  margin: auto;
+  padding: 24px;
+  overflow-y: auto;
+  border: 1px solid var(--surface-border-strong, #e1d9c5);
+  border-radius: var(--radius-panel, 16px);
+  background: var(--surface-1, #fcfbf6);
+  color: var(--theme-text, #2c2a22);
+  box-shadow: var(--surface-shadow, 0 12px 32px rgba(0,0,0,.16));
+  text-align: left;
 }
-
+.confirm-modal::backdrop { background: rgba(15, 23, 42, .38); }
+.confirm-modal[data-tone='danger'] { --modal-tone: var(--status-danger, #b4232c); }
+.confirm-modal[data-tone='success'] { --modal-tone: var(--status-success, #327047); }
 .confirm-modal-icon {
-  display: inline-flex;
-  width: 56px;
-  height: 56px;
+  display: flex;
+  width: 42px;
+  height: 42px;
   align-items: center;
   justify-content: center;
-  border: 2px solid #66bb6a;
-  border-radius: 50%;
-  background: #e8f5e9;
-  color: #43a047;
-  font-size: 1.6rem;
-  box-shadow: 0 6px 18px rgba(102, 187, 106, 0.16);
+  border-radius: var(--radius-card, 12px);
+  color: var(--modal-tone);
+  background: color-mix(in srgb, var(--modal-tone) 11%, var(--surface-1, #fcfbf6));
+  font-size: 22px;
 }
-
-.confirm-modal[data-tone='danger'] {
-  border-color: rgba(239, 68, 68, 0.24);
-}
-
-.confirm-modal[data-tone='danger'] .confirm-modal-icon {
-  border-color: #ef9a9a;
-  background: #ffebee;
-  color: #d32f2f;
-  box-shadow: 0 6px 18px rgba(239, 68, 68, 0.12);
-}
-
-.confirm-modal[data-tone='success'] .confirm-modal-icon {
-  border-color: #66bb6a;
-  background: #e8f5e9;
-  color: #2e7d32;
-}
-
-.confirm-modal-content {
-  margin-top: 16px;
-}
-
-.confirm-modal-title {
-  margin: 0;
-  color: #2e7d32;
-  font-size: 1.25rem;
-  font-weight: 700;
-  line-height: 1.25;
-}
-
-.confirm-modal[data-tone='danger'] .confirm-modal-title {
-  color: #c62828;
-}
-
-.confirm-modal-message {
-  margin: 12px 0 0;
-  white-space: pre-line;
-  color: #546e5a;
-  font-size: 0.92rem;
-  line-height: 1.65;
-}
-
-.confirm-modal-actions {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: 1fr 1fr;
-  margin-top: 24px;
-}
-
-.confirm-modal-actions.is-alert {
-  grid-template-columns: 1fr;
-}
-
-.confirm-modal-button {
-  min-height: 44px;
-  border-radius: 10px;
-  font-weight: 700;
-}
-
-.confirm-modal-enter-active,
-.confirm-modal-leave-active {
-  transition: opacity 0.2s ease;
-}
-
-.confirm-modal-enter-from,
-.confirm-modal-leave-to {
-  opacity: 0;
-}
-
-.confirm-modal-enter-active .confirm-modal,
-.confirm-modal-leave-active .confirm-modal {
-  transition: transform 0.2s ease;
-}
-
-.confirm-modal-enter-from .confirm-modal,
-.confirm-modal-leave-to .confirm-modal {
-  transform: translateY(8px) scale(0.97);
-}
-
-@media (max-width: 480px) {
-  .confirm-modal-overlay {
-    align-items: flex-end;
-  }
-
-  .confirm-modal {
-    padding: 24px 22px 22px;
-  }
-}
+.confirm-modal-content { margin-top: 16px; }
+.confirm-modal-title { margin: 0; color: var(--theme-text, #2c2a22); font-size: 20px; font-weight: 600; line-height: 1.4; }
+.confirm-modal-message { margin: 10px 0 0; white-space: pre-line; color: var(--muted-text, #706857); font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; }
+.confirm-modal-progress { margin: 12px 0 0; font-size: 13px; line-height: 1.6; color: var(--muted-text, #706857); }
+.confirm-modal-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 24px; }
+.confirm-modal-actions.is-alert { grid-template-columns: 1fr; }
+.confirm-modal-button { min-height: 44px; }
+.confirm-modal[data-leaving='true'] { pointer-events: none; }
+.confirm-modal::backdrop { transition: background-color 150ms ease; }
+.confirm-modal[data-leaving='true']::backdrop { background: transparent; }
+@media (max-width: 480px) { .confirm-modal { margin: auto auto max(16px, env(safe-area-inset-bottom)); padding: 20px; } }
+@media (prefers-reduced-motion: reduce) { .confirm-modal::backdrop { transition: none; } }
 </style>

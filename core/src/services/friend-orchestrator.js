@@ -5,7 +5,6 @@ const {
   getFriendBlacklist,
   getFriendBadTargets,
   getAutoAcceptFriendMinLevel,
-  getKnownFriendGids,
   applyConfigSnapshot,
   getFriendBadRetryDate,
   readFriendDogInfoCache,
@@ -27,6 +26,10 @@ const {
   acceptFriends,
   getApplications,
   clearAllInvalidKnownFriendGidCooldown,
+  getInvalidKnownFriendGidSet,
+  isConfirmedFriendRefusal,
+  classifyBadOperationFailure,
+  parseRpcErrorCode,
   SYSTEM_NPC_FRIENDS,
   SYSTEM_NPC_GIDS,
 } = require('./friend-api');
@@ -37,6 +40,7 @@ const {
   getCanGetHelpExp,
   getHelpAutoDisabledByLimit,
   updateOperationLimits,
+  getBadBudgetSnapshot,
 } = require('./friend-operation-limits');
 const {
   visitFriend,
@@ -69,6 +73,8 @@ let friendLoopRunning = false;
 let externalSchedulerMode = false;
 const friendScheduler = createScheduler('friend');
 let badExecutedOnStartup = false;
+let badRunInProgress = false;
+let lastBadRun = null;
 let consecutiveBadFailureCount = 0;
 let dogInfoBootstrapAttempted = false;
 let dogInfoBootstrapReadyAt = 0;
@@ -130,11 +136,11 @@ function resetBadFailureCount() {
 }
 
 function getLocalDateKey(offsetDays = 0) {
-  const date = new Date();
-  date.setDate(date.getDate() + offsetDays);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+  const serverSec = Number(require('../utils/utils').getServerTimeSec?.()) || 0;
+  const date = new Date((serverSec > 0 ? serverSec * 1000 : Date.now()) + (8 * 3600 + offsetDays * 86400) * 1000);
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -190,29 +196,6 @@ function recordBadFailure(reason, context = {}) {
   return false;
 }
 
-function isIgnorableBadFailureMessage(message) {
-  const text = String(message || '');
-  if (!text) return true;
-  return [
-    '??',
-    'No target',
-    '?????',
-    '1001046',
-    '1001039',
-    'used up',
-    'no target',
-    '没有可捣乱土地',
-    '捣乱失败或今日次数已用完',
-    '今日次数已用完',
-    '次数已用完',
-    '已经放过',
-    '来晚一步',
-    '植物虫子数量已达上限',
-    '植物杂草数量已达上限',
-    '已达上限',
-  ].some(kw => text.includes(kw));
-}
-
 function trackBadVisitResult(result, target, context = {}) {
   const count = Number(
     result && (
@@ -226,7 +209,10 @@ function trackBadVisitResult(result, target, context = {}) {
   }
 
   const message = String(result && result.message || '').trim();
-  if (isIgnorableBadFailureMessage(message)) return false;
+  // 已完成访问的无目标/明确地块拒绝属于检查结果，不以中文包含“上限”猜安全。
+  if (result?.skipped === true || !message || message === '没有可捣乱土地'
+    || (Array.isArray(result?.failed) && result.failed.length > 0
+      && result.failed.every(item => ['target_unavailable', 'no_eligible_land', 'operation_limit', 'friend_unavailable', 'daily_limit'].includes(item.kind)))) return false;
 
   return recordBadFailure(message, {
     friendName: target && target.name,
@@ -238,19 +224,21 @@ function trackBadVisitResult(result, target, context = {}) {
 // ===== Main friend check routine =====
 
 /**
- * 收集可捣乱好友候选：农场空闲（无可偷、无需浇水/除草/除虫）的好友。
- * badTargetSet 非空时仅保留指定好友（仅捣乱指定好友模式）。
+ * 收集指定范围内的捣乱候选；列表计数只排序，实时地块容量才决定能否投放。
+ * badTargetSet 非空时仅保留指定好友，失效GID和安静时段不能由兜底加回。
  */
 function collectBadCandidates(rawFriends, userGid, blacklist, badTargetSet) {
   const candidates = [];
   const visited = new Set();
   const candidateGids = new Set();
+  const invalidGids = getInvalidKnownFriendGidSet();
 
   for (const friend of rawFriends) {
     const gid = toNum(friend.gid);
     if (gid === userGid) continue;
     if (visited.has(gid)) continue;
-    if (blacklist.has(gid)) continue;
+    if (blacklist.has(gid) || invalidGids.has(gid)) continue;
+    if (SYSTEM_NPC_GIDS.has(gid) && badTargetSet.size > 0 && !badTargetSet.has(gid)) continue;
     if (badTargetSet.size > 0 && !badTargetSet.has(gid)) continue;
 
     const name = friend.remark || friend.name || `GID:${gid}`;
@@ -260,14 +248,11 @@ function collectBadCandidates(rawFriends, userGid, blacklist, badTargetSet) {
     const weedNum = plant ? toNum(plant.weed_num) : 0;
     const insectNum = plant ? toNum(plant.insect_num) : 0;
 
-    // Target friends with empty farms (no crops, no issues)
-    // NPC GID 的 plant 数据缺失（不在好友列表 API 中返回），始终加入捣乱候选，
-    // 执行层（visitFriend）会按 canPutBug/canPutWeed 精确判断，放不了不会硬放。
-    // 静默时段内仅豁免GID进入候选列表
-    if ((stealNum === 0 && dryNum === 0 && weedNum === 0 && insectNum === 0 && !inFriendQuietHours(gid))
-      || SYSTEM_NPC_GIDS.has(gid)) {
+    // List counters are sorting hints, not a veto. They are often absent or
+    // stale; the freshly entered land snapshot is the capacity authority.
+    if (!inFriendQuietHours(gid) || SYSTEM_NPC_GIDS.has(gid)) {
       const level = toNum(friend.level);
-      candidates.push({ gid, name, level });
+      candidates.push({ gid, name, level, likelyCapacity: stealNum === 0 && dryNum === 0 && weedNum === 0 && insectNum === 0 });
       candidateGids.add(gid);
     }
     visited.add(gid);
@@ -277,12 +262,15 @@ function collectBadCandidates(rawFriends, userGid, blacklist, badTargetSet) {
   // 同时始终纳入所有系统 NPC 好友（它们常不在好友列表 API 返回中，但农场可放虫草）。
   // 使用 candidateGids 而非 visited，确保即使 NPC 在 rawFriends 中但 plant 数据非空，仍能被兜底添加。
   const extraGids = new Set(badTargetSet);
-  for (const npc of SYSTEM_NPC_FRIENDS) extraGids.add(toNum(npc.gid));
+  for (const npc of SYSTEM_NPC_FRIENDS) {
+    if (!badTargetSet.size || badTargetSet.has(toNum(npc.gid))) extraGids.add(toNum(npc.gid));
+  }
   if (extraGids.size > 0) {
     for (const gid of extraGids) {
       if (candidateGids.has(gid)) continue;  // 已在候选中，跳过
       if (gid === userGid) continue;
-      if (blacklist.has(gid)) continue;
+      if (blacklist.has(gid) || invalidGids.has(gid)) continue;
+      if (inFriendQuietHours(gid) && !SYSTEM_NPC_GIDS.has(gid)) continue;
       // 系统 NPC 使用预定义名称，否则显示 GID
       const npcInfo = SYSTEM_NPC_GIDS.has(gid)
         ? SYSTEM_NPC_FRIENDS.find(n => n.gid === gid)
@@ -313,7 +301,7 @@ async function runDueStealPlans() {
   if (!Array.isArray(plans) || plans.length === 0) return 0;
 
   // 「仅偷取指定好友」白名单是**准入**（谁能被偷），预约偷取只是**排期**（什么时候偷），
-  // 排期不能绕过准入。否则会出现"白名单只放了小果+希恩斯，小脆骨却因预约计划被偷"
+  // 排期不能绕过准入。否则会出现"白名单只放了小果+账号乙，小脆骨却因预约计划被偷"
   // （2026-10-24 用户反馈）。白名单为空数组 = 不限制，此时预约计划照常全量执行。
   const stealOnlyGids = new Set(
     (getAutomation(accountId)?.friend_steal_only_gids || [])
@@ -842,7 +830,7 @@ async function checkFriends(options = {}) {
           });
         }
         for (const target of visitBatch) {
-          if (!canOperate(0x2714)) break; // 10004 = steal
+          if (!canOperate(10008)) break; // 官方 Harvest_Friend；10004 是放虫。
           try {
             await visitFriendForSteal(target, tally, userState.gid, userState.accountId);
           } catch {
@@ -1087,6 +1075,9 @@ async function checkAndAcceptApplications() {
 async function acceptFriendsWithRetry(gids) {
   if (gids.length === 0) return;
 
+  const friendApi = require('./friend-api');
+  const baseGids = friendApi.getCurrentKnownGids();
+  const generation = friendApi.getFriendMutationGeneration();
   try {
     const reply = await acceptFriends(gids);
     const friends = reply.friends || [];
@@ -1103,34 +1094,7 @@ async function acceptFriendsWithRetry(gids) {
         .filter(g => g > 0);
 
       if (newGids.length > 0) {
-        const currentGids = normalizeFriendGids(getKnownFriendGids());
-        const mergedGids = normalizeFriendGids([...currentGids, ...newGids]);
-
-        if (mergedGids.length !== currentGids.length) {
-          const accountId = process.env.FARM_ACCOUNT_ID || '';
-          applyConfigSnapshot(
-            { knownFriendGids: mergedGids },
-            { persist: false, accountId }
-          );
-
-          const synced = postToMaster({
-            type: 'known_friend_gids_sync',
-            gids: mergedGids,
-          });
-
-          if (!synced) {
-            applyConfigSnapshot(
-              { knownFriendGids: mergedGids },
-              { persist: true, accountId }
-            );
-          }
-
-          log('申请', `已将 ${newGids.length} 人加入好友列表`, {
-            module: 'friend',
-            event: '好友加入列表',
-            result: 'ok',
-          });
-        }
+        friendApi.syncKnownFriendGidsFromFriends(friends, { baseGids, generation });
 
         // Refresh friends list cache
         clearFriendsListCache();
@@ -1157,15 +1121,22 @@ async function acceptFriendsWithRetry(gids) {
  * Run a one-time "bad" operation on startup to put weeds/insects on friends' farms.
  */
 async function runBadOnceOnStartup(force = false) {
-  if (!force && badExecutedOnStartup) return;
+  if (badRunInProgress) return { skipped: true, reason: 'already_running' };
+  if (!force && badExecutedOnStartup) return { skipped: true, reason: 'startup_checked' };
 
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   const badEnabled = isAutomationOn('friend_bad', accountId);
-  if (!badEnabled) return;
-  if (isFriendBadPaused()) return;
+  if (!badEnabled || !isAutomationOn('friend', accountId)) return { skipped: true, reason: 'automation_disabled' };
+  if (isFriendBadPaused()) {
+    lastBadRun = { at: Date.now(), reason: 'paused_after_errors', retryDate: getFriendBadRetryDate(accountId) };
+    return { skipped: true, reason: lastBadRun.reason };
+  }
+  checkDailyReset();
+  badRunInProgress = true;
 
   const userState = getUserState();
   if (!userState.gid) {
+    badRunInProgress = false;
     log('好友', '用户未登录，无法执行放虫放草', {
       module: 'friend',
       event: '放虫放草未登录',
@@ -1196,13 +1167,16 @@ async function runBadOnceOnStartup(force = false) {
     const badTargetSet = new Set(getFriendBadTargets(accountId));
     const badCandidates = collectBadCandidates(rawFriends, userState.gid, blacklist, badTargetSet);
 
-    badCandidates.sort((a, b) => b.level - a.level);
+    badCandidates.sort((a, b) => Number(b.likelyCapacity || false) - Number(a.likelyCapacity || false) || b.level - a.level);
 
-    const topCount = Math.min(20, badCandidates.length);
-    const topTargets = badCandidates.slice(0, topCount);
+    const maxVisits = Math.max(1, Math.min(Number(getAutomation(accountId)?.friend_visit_max_per_run) || 12, 30));
+    const cooldownMs = Math.max(0, Number(getAutomation(accountId)?.friend_visit_cooldown_min ?? 10)) * 60000;
+    // Rotate eligible candidates under the existing visit pacing. Do not
+    // repeatedly pin the same full highest-level targets and starve others.
+    const topTargets = selectFriendVisitBatch(badCandidates, { accountId, mode: 'bad', maxVisits, cooldownMs });
 
     log('好友',
-      `找到 ${badCandidates.length} 个可捣乱的好友${badTargetSet.size > 0 ? `（仅限指定 ${badTargetSet.size} 人）` : ''}，处理等级最高的前${topTargets.length}个`,
+      `找到 ${badCandidates.length} 个捣乱候选${badTargetSet.size > 0 ? `（仅限指定 ${badTargetSet.size} 人）` : ''}，按访问节流轮转检查 ${topTargets.length} 个`,
       {
         module: 'friend',
         event: '放虫放草好友列表',
@@ -1213,10 +1187,14 @@ async function runBadOnceOnStartup(force = false) {
 
     const tally = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
     let processedCount = 0;
+    let stopReason = topTargets.length ? 'round_complete' : badCandidates.length ? 'visit_cooldown' : 'no_targets';
 
     for (let i = 0; i < topTargets.length; i++) {
       const target = topTargets[i];
+      if (!isAutomationOn('friend_bad', accountId)) { stopReason = 'automation_disabled'; break; }
+      if (isFriendBadPaused()) { stopReason = 'paused_after_errors'; break; }
       if (!canOperateBad()) {
+        stopReason = 'daily_budget_exhausted';
         log('好友', `放虫放草次数已用完，停止执行。已处理 ${processedCount} 个好友`, {
           module: 'friend',
           event: '放虫放草次数用完',
@@ -1238,9 +1216,10 @@ async function runBadOnceOnStartup(force = false) {
       );
 
       try {
-        const result = await visitFriend(target, tally, userState.gid, accountId);
+        const result = await visitFriend(target, tally, userState.gid, accountId, { onlyBad: true });
         processedCount++;
         if (trackBadVisitResult(result, target, { source: 'startup_bad' })) {
+          stopReason = 'paused_after_errors';
           break;
         }
       } catch (err) {
@@ -1250,11 +1229,30 @@ async function runBadOnceOnStartup(force = false) {
           friendName: target.name,
           error: err.message,
         });
-        if (recordBadFailure(err && err.message, {
+        if (err.resultState === 'unknown' || err.outcomeUnknown === true || err.holdUntilTransportEpochChanged || err.leaveError) {
+          stopReason = 'unknown_operation';
+          break;
+        }
+        const confirmedRefusal = isConfirmedFriendRefusal(err);
+        if (!confirmedRefusal) {
+          // 尚未发送、连接/排队/解码故障只停本轮，不累计成“次日再试”的账号处罚。
+          stopReason = 'transport_unavailable';
+          break;
+        }
+        const targetRefusal = err.friendEnterHandling?.handled || classifyBadOperationFailure(err)
+          || (err.visitStage === 'enter' && [1002002, 1002003, 1002004, 1002005, 1002006, 1002007, 1002008].includes(parseRpcErrorCode(err)));
+        if (targetRefusal) {
+          log('好友', `该好友当前不可捣乱，继续其它候选：${target.name}`, {
+            module: 'friend', event: '捣乱目标跳过', result: 'skipped', friendGid: target.gid,
+            reason: err.message,
+          });
+        }
+        else if (recordBadFailure(err && err.message, {
           friendName: target.name,
           friendGid: target.gid,
           source: 'startup_bad',
         })) {
+          stopReason = 'paused_after_errors';
           break;
         }
       }
@@ -1262,6 +1260,13 @@ async function runBadOnceOnStartup(force = false) {
     }
 
     badExecutedOnStartup = true;
+    const budget = getBadBudgetSnapshot();
+    lastBadRun = { at: Date.now(), reason: budget.remaining === 0 ? 'daily_budget_exhausted' : stopReason, processedCount, budget };
+    log('好友', budget.remaining > 0
+      ? `本轮捣乱检查结束，今日预算仍剩 ${budget.remaining}；${stopReason === 'paused_after_errors' ? '错误暂停，非已达上限' : '等待下一轮或其它可投放目标'}`
+      : '今日捣乱预算已用完，结束检查', {
+      module: 'friend', event: '捣乱轮次状态', result: 'checked', ...lastBadRun,
+    });
 
     const summary = [];
     if (tally.putBug > 0) summary.push(`放虫${tally.putBug}`);
@@ -1278,10 +1283,19 @@ async function runBadOnceOnStartup(force = false) {
       }
     );
   } catch (err) {
+    lastBadRun = { at: Date.now(), reason: 'round_error', message: err.message };
     if (!isTransientNetworkError(err)) {
       logWarn('好友', `${label}异常: ${err.message}`);
     }
-  }
+  } finally { badRunInProgress = false; }
+}
+
+function getBadTaskSnapshot() {
+  const accountId = process.env.FARM_ACCOUNT_ID || '';
+  const retryDate = getFriendBadRetryDate(accountId);
+  return { enabled: isAutomationOn('friend_bad', accountId), running: badRunInProgress,
+    paused: !!retryDate && getLocalDateKey() < retryDate, retryDate,
+    budget: getBadBudgetSnapshot(), lastRun: lastBadRun };
 }
 
 // ===== Status queries =====
@@ -1297,52 +1311,24 @@ function isCheckingFriendsRunning() {
 // ===== Sync friends from external GID list =====
 
 async function syncFriendsFromGids(gids) {
-  const accountId = process.env.FARM_ACCOUNT_ID || '';
   const newGids = normalizeFriendGids(gids);
   if (newGids.length === 0) return [];
-
-  const currentGids = normalizeFriendGids(getKnownFriendGids(accountId));
-  const mergedGids = normalizeFriendGids([...currentGids, ...newGids]);
-
-  if (mergedGids.length !== currentGids.length) {
-    applyConfigSnapshot(
-      { knownFriendGids: mergedGids },
-      { persist: false, accountId }
-    );
-
-    const synced = postToMaster({
-      type: 'known_friend_gids_sync',
-      gids: mergedGids,
-    });
-
-    if (!synced) {
-      applyConfigSnapshot(
-        { knownFriendGids: mergedGids },
-        { persist: true, accountId }
-      );
-    }
-
-    log('好友',
-      `批量添加 ${newGids.length} 个好友GID，当前共 ${mergedGids.length} 个`,
-      {
-        module: 'friend',
-        event: '批量添加好友GID',
-        result: 'ok',
-        addedCount: newGids.length,
-        totalKnownGids: mergedGids.length,
-      }
-    );
-  }
-
+  const api = require('./friend-api');
+  const baseGids = api.getCurrentKnownGids();
+  const generation = api.getFriendMutationGeneration();
+  api.syncKnownFriendGidsFromFriends(newGids.map(gid => ({ gid })), { baseGids, generation });
   clearFriendsListCache();
-  return await getFriendsList(true);
+  // 提交与查询分离；刷新结果不能再次把旧全量 GID 写回主进程。
+  return getFriendsList({ force: true, discover: false });
 }
 
 /**
  * 每小时定时放虫放草：次数用完则直接跳过，不进入 runBadOnceOnStartup（避免空跑刷日志）。
  */
 async function runBadHourly() {
+  checkDailyReset();
   if (!canOperateBad()) {
+    lastBadRun = { at: Date.now(), reason: 'daily_budget_exhausted', budget: getBadBudgetSnapshot() };
     log('好友', '每小时放虫放草：今日次数已用完，本次跳过', {
       module: 'friend',
       event: '每小时放虫放草跳过',
@@ -1371,6 +1357,7 @@ module.exports = {
   runBadHourly,
   isHelpExpLimitReached,
   isCheckingFriendsRunning,
+  getBadTaskSnapshot,
   clearFriendsListCache,
   syncFriendsFromGids,
 };

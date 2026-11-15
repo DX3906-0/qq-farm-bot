@@ -15,6 +15,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const express = require("express");
+const { runWithRequestContext, requestError } = require("../utils/request-priority");
 const { Server: SocketIOServer } = require("socket.io");
 const {
   CONFIG,
@@ -51,6 +52,8 @@ const {
 } = require("./admin-farm-resource-routes");
 const { registerAdminFriendRoutes } = require("./admin-friend-routes");
 const { registerAdminIllustratedRoutes } = require("./admin-illustrated-routes");
+const { registerAdminCollectionRoutes } = require("./admin-collection-routes");
+const { registerAdminGameplayRoutes } = require("./admin-gameplay-routes");
 const { registerAdminLoginLogRoutes } = require("./admin-login-log-routes");
 const {
   registerAdminPlantBlacklistRoutes,
@@ -104,7 +107,7 @@ const LOG_SNAPSHOT_LIMIT = 100;
 const HTTP_REQUEST_TIMEOUT_MS = 120 * 1000;
 const HTTP_HEADERS_TIMEOUT_MS = 16 * 1000;
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = 5 * 1000;
-const HTTP_CONNECTION_IDLE_TIMEOUT_MS = 30 * 1000;
+const HTTP_CONNECTION_IDLE_TIMEOUT_MS = HTTP_REQUEST_TIMEOUT_MS + 5000;
 const HTTP_CLOSE_WAIT_SWEEP_MS = 5000;
 
 let app = null;
@@ -207,20 +210,65 @@ function registerHealthRoute(expressApp) {
 
 function registerRequestTimeoutGuard(expressApp) {
   expressApp.use((req, res, next) => {
-    if (req.path === "/api/health") return next();
+    if (req.path === "/api/health" || !(req.path === "/api" || req.path.startsWith("/api/"))) return next();
 
+    const controller = new AbortController();
+    const deadline = Date.now() + HTTP_REQUEST_TIMEOUT_MS;
+    const rpcOutcome = { pendingWrites: 0 };
+    let finished = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      req.removeListener("aborted", onAbort);
+      res.removeListener("finish", onFinish);
+      res.removeListener("close", onClose);
+    };
+    const cancel = (errorCode) => {
+      if (!finished && !res.writableFinished && !controller.signal.aborted) {
+        controller.abort(requestError(errorCode === "DEADLINE" ? "Request Timeout" : "Request Cancelled", {
+          errorCode, stage: "http_request",
+        }));
+      }
+    };
+    const onFinish = () => { finished = true; cleanup(); };
+    const onClose = () => { res.locals.requestClosed = true; cancel("CANCELLED"); cleanup(); };
+    const onAbort = () => { res.locals.requestClosed = true; cancel("CANCELLED"); cleanup(); };
     const timeout = setTimeout(() => {
-      if (res.headersSent || res.writableEnded || res.destroyed) return;
       res.locals.requestTimedOut = true;
+      cancel("DEADLINE");
+      cleanup();
+      if (res.writableEnded || res.destroyed) return;
+      if (res.headersSent) { res.destroy(); return; }
       res.status(503).json({
         ok: false,
         error: "Request Timeout",
+        errorCode: "DEADLINE",
+        stage: "http_request",
+        ...(rpcOutcome.pendingWrites > 0 ? { sent: true, resultState: "unknown", outcomeUnknown: true } : {}),
       });
     }, HTTP_REQUEST_TIMEOUT_MS);
 
-    res.on("finish", () => clearTimeout(timeout));
-    res.on("close", () => clearTimeout(timeout));
-    return next();
+    req.once("aborted", onAbort);
+    res.once("finish", onFinish);
+    res.once("close", onClose);
+    if (req.aborted) { onAbort(); return; }
+    return runWithRequestContext({ signal: controller.signal, deadline, priority: "foreground", rpcOutcome }, next);
+  });
+}
+
+function registerTransportDiagnosticsRoute(expressApp, { requireAdminToken, getAccountIdFromRequest, canAccessAccount, sendProviderError }) {
+  expressApp.get(["/api/runtime/transport", "/api/runtime/transport/manager"], requireAdminToken, async (req, res) => {
+    const accountId = getAccountIdFromRequest(req);
+    if (!accountId) return res.status(400).json({ ok: false, error: "Missing x-account-id" });
+    if (!canAccessAccount(req, accountId)) return res.status(403).json({ ok: false, error: "无权访问此账号" });
+    try {
+      const data = req.path === "/api/runtime/transport/manager"
+        ? provider.getManagerDiagnostics(accountId)
+        : await provider.getTransportDiagnostics(accountId);
+      if (res.headersSent || res.writableEnded || res.destroyed || res.locals.requestTimedOut || res.locals.requestClosed) return;
+      return res.json({ ok: true, data });
+    } catch (err) {
+      return sendProviderError(res, err);
+    }
   });
 }
 
@@ -426,6 +474,7 @@ function startAdminServer(dataProvider) {
   registerHealthRoute(app);
   registerAuthGate(app, requireAdminToken);
   registerRequestTimeoutGuard(app);
+  registerTransportDiagnosticsRoute(app, { requireAdminToken, getAccountIdFromRequest, canAccessAccount, sendProviderError });
   registerAdminPublicInfoRoutes({
     app,
     provider,
@@ -485,6 +534,16 @@ function startAdminServer(dataProvider) {
     canAccessAccount,
     sendProviderError,
   });
+  // 藏品（collectionpb，2026-11-03 新增；公告 26110102「果冻花园」）
+  registerAdminCollectionRoutes({
+    app,
+    provider,
+    adminLogger,
+    getAccountIdFromRequest,
+    canAccessAccount,
+    sendProviderError,
+  });
+  registerAdminGameplayRoutes({ app, provider, getAccountIdFromRequest, canAccessAccount, sendProviderError });
   registerAdminCareerRoutes({
     app,
     provider,
@@ -631,7 +690,7 @@ function startAdminServer(dataProvider) {
     canAccessAccount,
     sendProviderError,
   });
-  registerAdminWxLoginRoutes({ app });
+  registerAdminWxLoginRoutes({ app, provider });
   registerAdminProxyRoutes({ app, logger: adminLogger });
   registerAdminLoginLogRoutes({
     app,

@@ -38,6 +38,8 @@ async function getCareerInfo(gid) {
     avatar: String(reply.avatar_url || ''),
     level: toNum(reply.level),
     exp: toNum(reply.exp),
+    expAvailable: Object.prototype.hasOwnProperty.call(reply, 'exp')
+      && Number.isSafeInteger(toNum(reply.exp)) && toNum(reply.exp) >= 0,
     gid: toNum(reply.gid) || numericGid,
     platform: toNum(reply.platform),
     openId: String(reply.open_id || ''),

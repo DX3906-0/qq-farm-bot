@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import type { ActivityLabels, ActivitySection, ActivitySectionKey } from '@/components/activity/types'
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onScopeDispose, onUnmounted, ref, useId, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import HeluExchangePanel from '@/components/activity/HeluExchangePanel.vue'
 import HeluPassportPanel from '@/components/activity/HeluPassportPanel.vue'
-import HeluSolarTermsPanel from '@/components/activity/HeluSolarTermsPanel.vue'
+import SolarCalendar from '@/views/SolarCalendar.vue'
 import QingmeiActivityPanel from '@/components/activity/QingmeiActivityPanel.vue'
 import RedFlowerActivityPanel from '@/components/activity/RedFlowerActivityPanel.vue'
 import QixiActivityPanel from '@/components/activity/QixiActivityPanel.vue'
@@ -14,14 +15,20 @@ import PetDiaryActivityPanel from '@/components/activity/PetDiaryActivityPanel.v
 import WishSignActivityPanel from '@/components/activity/WishSignActivityPanel.vue'
 import ShareRewardActivityPanel from '@/components/activity/ShareRewardActivityPanel.vue'
 import MilkTeaActivityPanel from '@/components/activity/MilkTeaActivityPanel.vue'
+import { milkTeaOverview } from '@/utils/activity-overview'
+import { accountDataEmptyState, LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { useSettingStore } from '@/stores/setting'
 import AdminActivityUpdatePanel from '@/components/admin/AdminActivityUpdatePanel.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import { useAccountStore } from '@/stores/account'
+import { useSlidingTabs, vSlidingTabs } from '@/composables/useContentMotion'
 import { useActivityStore } from '@/stores/activity'
 import { isActivityHidden } from '@/config/activityVisibility'
+import { formatActivityDeadline } from '@/constants/activity-windows'
+import { SOLAR_TERM_ASSETS, solarTermIllustration, solarTermName, solarTermStatusLabel } from '@/config/solarTerms'
 import { useActivityDiscoveryStore } from '@/stores/activityDiscovery'
 import AutoActivityPanel from '@/components/activity/AutoActivityPanel.vue'
-import api from '@/api'
+import api, { isReadCanceled } from '@/api'
 
 const discovery = useActivityDiscoveryStore()
 import { useToastStore } from '@/stores/toast'
@@ -40,7 +47,7 @@ const L: ActivityLabels = {
   giftLotusTab: '观星礼录',
   shopTab: '星砂兑换商店',
   journeyTab: '千星游记',
-  notesTab: '节令小札',
+  notesTab: '节令小礼',
   pool: '奖池',
   recent: '最近结果',
   freeRemain: '免费剩余',
@@ -84,12 +91,14 @@ const accountStore = useAccountStore()
 const activityStore = useActivityStore()
 const toast = useToastStore()
 const userStore = useUserStore()
-const { currentAccountId, currentAccount } = storeToRefs(accountStore)
+const { currentAccountId } = storeToRefs(accountStore)
+const { settingsAccountId, confirmedAutomation } = storeToRefs(useSettingStore())
+const automationSnapshot = computed(() => settingsAccountId.value === String(currentAccountId.value) ? confirmedAutomation.value : null)
+const accountEmptyState = computed(() => accountDataEmptyState(LOCAL_UI_READONLY, currentAccountId.value))
 const {
   heluActivity: activity,
   heluLoading,
   passportClaimLoading,
-  solarClaimLoading,
   starRecordClaimLoading,
   qingmeiClaimLoading,
   qingmeiSellLoading,
@@ -123,8 +132,18 @@ const {
 // 奶茶热销中（S4）：面板内二级页签，按页缓存
 const milkTeaPage = ref('shop')
 const milkTeaActivity = computed(() => milkTeaPages.value[milkTeaPage.value] || null)
-
 const nowMs = ref(Date.now())
+const milkTeaProgressUncertain = ref(false)
+// Derive from the current already-read page only. No extra pre-reads or
+// merging old subpage snapshots into a newer summary.
+const milkTeaTodo = computed(() => milkTeaOverview(milkTeaActivity.value, automationSnapshot.value,
+  milkTeaProgressUncertain.value || milkTeaLoading.value || milkTeaOperateLoading.value, Math.floor(nowMs.value / 1000)))
+const milkTeaSchedule = computed(() => {
+  // 子页共享同一服务端活动头；切页加载时保留已确认时间，不能拿星砂/旧活动字段兜底。
+  const state = milkTeaActivity.value || Object.values(milkTeaPages.value).find(page => page.endTime > 0)
+  return { businessEnd: formatActivityDeadline(state?.settleStartTime), rewardEnd: formatActivityDeadline(state?.endTime) }
+})
+
 let nowTimer: ReturnType<typeof window.setInterval> | null = null
 // ⚠️ 活动「是否在期」统一由 isActivityHidden（内部走 activity-windows.ts 时间窗）判定，
 // 此处不再各自硬编码窗口常量，避免与 core/src/models/store.js 口径分叉。
@@ -132,7 +151,15 @@ const rainPoemActivityActive = computed(() => !isActivityHidden('rain-poem'))
 const redFlowerActivityActive = computed(() => !isActivityHidden('honghua'))
 const gameBulletinPic = ref('')
 const bulletinLoading = ref(false)
+const isSolarSection = computed(() => activeSection.value === 'notes')
+const showStarTheme = computed(() => ['journey', 'records', 'shop'].includes(activeSection.value))
+const solarHeaderTerm = computed(() => solarSummary.value.current
+  ? { ...solarSummary.value.current, status: 0, startTime: 0, endTime: 0, rewards: [], claimable: false }
+  : null)
+const solarHeaderLabel = computed(() => solarSummary.value.current?.statusLabel || (solarHeaderTerm.value ? solarTermStatusLabel(solarHeaderTerm.value) : ''))
+const solarHeaderIllustration = computed(() => solarTermIllustration(solarHeaderTerm.value))
 const headerBgSrc = computed(() => {
+  if (isSolarSection.value) return SOLAR_TERM_ASSETS.background
   // 公益小红花：游戏公告图本身就是该活动的主题头图，必须使用，
   // 否则切换到本活动时头图会空（深色背景），体验割裂。
   // 注意：雨落成诗 / 鹊桥各自有专属背景图，不能被公告图覆盖。
@@ -152,15 +179,44 @@ const headerBgSrc = computed(() => {
   return '/activity/star-festival/star-sky.png'
 })
 
-const activeSection = ref<ActivitySectionKey | ''>('journey')
+const activeSection = ref<ActivitySectionKey | ''>('milk-tea')
+const route = useRoute()
+const solarPanel = ref<{ refresh: () => Promise<void> } | null>(null)
+interface SolarSummary { accountId: string, claimable: number, loading: boolean, current?: { id: number, title: string, statusLabel: string } }
+const solarSummary = ref<SolarSummary>({ accountId: '', claimable: 0, loading: false })
+function updateSolarSummary(value: SolarSummary) {
+  if (value.accountId === String(currentAccountId.value)) solarSummary.value = value
+}
+watch(() => route.query.section, (value) => {
+  if (value === 'notes') activeSection.value = 'notes'
+}, { immediate: true })
 const showActivityAnalysis = ref(false)
+const activityPanelId = useId()
+const activityTabNav = ref<HTMLElement | null>(null)
+const activityHeading = computed(() => {
+  if (activeSection.value === 'milk-tea') return milkTeaActivity.value?.title || '奶茶热销中'
+  if (isSolarSection.value) return '节令小礼'
+  return sections.value.find(section => section.key === activeSection.value)?.label || '活动一览'
+})
+const refreshingActivity = computed(() => isSolarSection.value ? solarSummary.value.loading
+  : heluLoading.value || qixiLoading.value || rainPoemLoading.value || redFlowerLoading.value
+    || wishSignLoading.value || shareRewardLoading.value || milkTeaLoading.value)
+function moveActivityTabFocus(event: KeyboardEvent, index: number) {
+  if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  const length = sections.value.length
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? length - 1
+    : (index + (event.key === 'ArrowRight' ? 1 : -1) + length) % length
+  activityTabNav.value?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus()
+}
 
 const sections = computed<ActivitySection[]>(() => ([
+  // 主活动优先，进入页面先展示奶茶；高度自动化的节令小礼放到列表最后。
+  { key: 'milk-tea' as const, label: '奶茶热销中', icon: 'i-carbon-cafe', count: milkTeaActivity.value?.summary?.hasUnclaimedWage ? 1 : 0 },
   { key: 'qixi' as const, label: '鹊桥寄情', icon: 'i-carbon-favorite', count: qixiActivity.value?.gift.remainingCount || 0 },
   { key: 'journey' as const, label: '千星游记', icon: 'i-carbon-map', count: activity.value?.passport?.claimableLevels || 0 },
   { key: 'records' as const, label: '观星礼录', icon: 'i-carbon-star', count: activity.value?.starRecord?.claimableCount || 0 },
   { key: 'shop' as const, label: '星砂兑换商店', icon: 'i-carbon-store', count: activity.value?.exchangeShop?.length || 0 },
-  { key: 'notes' as const, label: '节令小札', icon: 'i-carbon-notebook', count: activity.value?.solarTerms?.claimableCount || 0 },
   { key: 'qingmei' as const, label: '青酿换万金', icon: 'i-carbon-fruit-bowl', count: activity.value?.qingmei?.claimable ? 1 : 0 },
   // 新活动统一放在列表末尾，避免与「星许千灯」主活动主题在视觉上叠压。
   ...(rainPoemActivityActive.value ? [{ key: 'rain-poem' as const, label: '雨落成诗', icon: 'i-carbon-rain-heavy', count: rainPoemActivity.value?.items?.badges || 0 }] : []),
@@ -173,14 +229,33 @@ const sections = computed<ActivitySection[]>(() => ([
   // 返厂时从 HIDDEN_ACTIVITIES 移除对应 key 即自动恢复展示。
   { key: 'wish-sign' as const, label: '秋祈良愿', icon: 'i-carbon-moon', count: wishSignActivity.value?.remainingCount || 0 },
   { key: 'share-reward' as const, label: '快乐不独享', icon: 'i-carbon-favorite-filled', count: shareRewardActivity.value?.milestones?.some(m => m.state === 2) ? shareRewardActivity.value.milestones.filter(m => m.state === 2).length : 0 },
-  // 奶茶热销中（S4，2026-10-15 上线）：当前在期的常规活动 tab。
-  { key: 'milk-tea' as const, label: '奶茶热销中', icon: 'i-carbon-cafe', count: milkTeaActivity.value?.summary?.hasUnclaimedWage ? 1 : 0 },
+  { key: 'notes' as const, label: '节令小礼', icon: 'i-carbon-notebook', count: solarSummary.value.accountId === String(currentAccountId.value) ? solarSummary.value.claimable : 0 },
 ]).filter(section => !isActivityHidden(section.key)))
 
-async function fetchGameBulletinBanner() {
+let disposed = false
+let pageEpoch = 0
+let readController = new AbortController()
+const scopeController = new AbortController()
+let pageFlight: { key: string, promise: Promise<void> } | undefined
+let queued: Promise<void> | undefined
+let dirty = false
+let bulletinOnce: Promise<void> | undefined
+onScopeDispose(() => {
+  disposed = true
+  pageEpoch++
+  dirty = false
+  readController.abort()
+  scopeController.abort()
+})
+function fetchGameBulletinBanner() {
+  if (!bulletinOnce) bulletinOnce = readGameBulletinBanner()
+  return bulletinOnce
+}
+async function readGameBulletinBanner() {
   try {
     bulletinLoading.value = true
-    const res = await api.get('/api/announcement/game')
+    const res = await api.get('/api/announcement/game', { signal: scopeController.signal })
+    if (disposed) return
     if (res.data?.ok && res.data?.data?.bulletins?.length) {
       gameBulletinPic.value = res.data.data.bulletins[0].pic || ''
     }
@@ -189,39 +264,71 @@ async function fetchGameBulletinBanner() {
     }
   }
   catch {
-    gameBulletinPic.value = ''
+    if (!disposed) gameBulletinPic.value = ''
   }
   finally {
-    bulletinLoading.value = false
+    if (!disposed) bulletinLoading.value = false
   }
 }
 
-async function refreshAll() {
-  if (currentAccountId.value) {
-    const requests = []
-    // 心许千灯星垂野（journey/records/shop/notes）整体下线后这些 tab 不再展示，
-    // 相应请求会返回「活动已结束」，无需再拉取。
-    const starSectionsVisible = sections.value.some(s => ['journey', 'records', 'shop', 'notes'].includes(s.key))
-    if (starSectionsVisible) requests.push(activityStore.fetchHeluActivity(currentAccountId.value))
-    if (!isActivityHidden('qixi'))
-      requests.push(activityStore.fetchQixiActivity(String(currentAccountId.value)))
-    if (rainPoemActivityActive.value)
-      requests.push(activityStore.fetchRainPoemActivity(String(currentAccountId.value)))
-    if (redFlowerActivityActive.value)
-      requests.push(activityStore.fetchRedFlowerActivity(String(currentAccountId.value)))
-    // 秋祈良愿 / 快乐不独享：仅在活动可见时拉取（过期活动已进 HIDDEN_ACTIVITIES，
-    // 不再无条件请求，避免为已下线活动持续轮询后端）。
-    if (!isActivityHidden('wish-sign'))
-      requests.push(activityStore.fetchWishSignActivity(String(currentAccountId.value)))
-    if (!isActivityHidden('share-reward'))
-      requests.push(activityStore.fetchShareRewardActivity(String(currentAccountId.value)))
-    if (!isActivityHidden('milk-tea'))
-      requests.push(activityStore.fetchMilkTeaActivity(String(currentAccountId.value), milkTeaPage.value))
-    // 同步取最新游戏公告头图作为活动页 header 背景（当前活动 banner）。
-    requests.push(fetchGameBulletinBanner())
-    // 用 allSettled 避免雨落成诗 fetch（可能进入好友农场，耗时较久）把其它请求一起拖崩。
-    await Promise.allSettled(requests)
+function refreshAll(): Promise<void> {
+  const id = String(currentAccountId.value || '')
+  const section = activeSection.value
+  const key = `${id}:${pageEpoch}:${section}:${milkTeaPage.value}`
+  if (disposed || !id || !section || isActivityHidden(section)) return Promise.resolve()
+  // The unified solar child owns its single read, quiz and reward flow. Never
+  // fetch the retired Helu tree as another copy of the same calendar.
+  if (section === 'notes') return solarPanel.value?.refresh() || Promise.resolve()
+  if (pageFlight?.key === key) return pageFlight.promise
+  if (pageFlight) return queueRefresh()
+  const signal = readController.signal
+  const page = milkTeaPage.value
+  activityStore.setReadSignal(signal)
+  const flight = { key, promise: (async () => {
+    try {
+      if (signal.aborted || disposed) return
+      if (['journey', 'records', 'shop', 'qingmei'].includes(section)) await activityStore.fetchHeluActivity(id, signal)
+      else if (section === 'qixi') await activityStore.fetchQixiActivity(id, signal)
+      else if (section === 'rain-poem') await activityStore.fetchRainPoemActivity(id, signal)
+      else if (section === 'honghua') await activityStore.fetchRedFlowerActivity(id, signal)
+      else if (section === 'wish-sign') await activityStore.fetchWishSignActivity(id, signal)
+      else if (section === 'share-reward') await activityStore.fetchShareRewardActivity(id, signal)
+      else if (section === 'milk-tea') {
+        const result = await activityStore.fetchMilkTeaActivity(id, page, {}, signal)
+        if (result?.ok && !disposed && !signal.aborted && id === String(currentAccountId.value)) milkTeaProgressUncertain.value = false
+      }
+      // 萌宠日记由子组件自行读取。
+    }
+    catch (error: any) {
+      if (!disposed && !signal.aborted && key === `${currentAccountId.value}:${pageEpoch}:${activeSection.value}:${milkTeaPage.value}` && !isReadCanceled(error)) toast.error(error?.message || '活动加载失败')
+    }
+  })().finally(() => {
+    if (pageFlight === flight) pageFlight = undefined
+  }) }
+  pageFlight = flight
+  return flight.promise
+}
+function queueRefresh(): Promise<void> {
+  if (disposed) return Promise.resolve()
+  const key = `${currentAccountId.value}:${pageEpoch}:${activeSection.value}:${milkTeaPage.value}`
+  if (pageFlight?.key === key) {
+    dirty = false
+    return pageFlight.promise
   }
+  dirty = true
+  if (!queued) {
+    const previous = pageFlight?.promise
+    queued = Promise.resolve().then(async () => {
+      await previous
+      queued = undefined
+      if (!disposed && dirty) {
+        dirty = false
+        if (readController.signal.aborted) readController = new AbortController()
+        await refreshAll()
+      }
+    }).catch(() => { queued = undefined })
+  }
+  return queued
 }
 
 function handleRainPoemWindowChange() {
@@ -236,161 +343,62 @@ watch(redFlowerActivityActive, () => {
     refreshAll()
 })
 
-async function buildQixi() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.buildQixiBridge(String(currentAccountId.value))
-  result?.ok ? toast.success(result.completed ? '鹊桥已全部完成' : '驻建鹊桥成功') : toast.error(result?.error || '驻建鹊桥失败')
-}
-async function useQixiDew() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.useQixiDew(String(currentAccountId.value))
-  result?.ok
-    ? toast.success(result.usedCount ? `已使用 ${result.usedCount} 个鹊羽灵露` : result.reason === 'daily_limit' ? '今日使用次数已达上限' : '暂无符合条件的土地')
-    : toast.error(result?.error || '使用鹊羽灵露失败')
-}
-
-async function giftQixi(friendGid: number, count: number) {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.sendQixiSachet(String(currentAccountId.value), friendGid, count)
-  result?.ok ? toast.success(`已赠送 ${result.sentCount || count} 个鹊羽香囊`) : toast.error(result?.error || '香囊赠送失败')
-}
-
-async function claimRecords() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.claimStarRecords(currentAccountId.value)
-  if (result?.ok) {
-    const count = result.recordIds?.length || 0
-    toast.success(count ? `已点亮并领取 ${count} 个星宿奖励` : '观星礼录领取完成')
+async function runOperation(run: (id: string) => Promise<any>, success: (result: any) => string, failure: string) {
+  const id = String(currentAccountId.value || '')
+  const epoch = pageEpoch
+  if (!id || disposed) return
+  const current = () => !disposed && epoch === pageEpoch && id === String(currentAccountId.value)
+  try {
+    const result = await run(id)
+    if (!current() || result?.canceled || result?.stale) return
+    if (result?.ok) toast.success(success(result))
+    else toast.error(result?.error || result?.message || failure)
   }
-  else {
-    toast.error(result?.error || '观星礼录领取失败')
+  catch (error: any) {
+    if (current() && !isReadCanceled(error)) toast.error(error?.response?.data?.error || error?.message || failure)
   }
 }
-
-async function claimPassport() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.claimHeluPassport(currentAccountId.value)
-  result?.ok ? toast.success('千星游记奖励领取完成') : toast.error(result?.error || '千星游记领取失败')
-}
-
-async function claimSolar(term: { id: number, title?: string }) {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.claimHeluSolar(currentAccountId.value, term.id)
-  result?.ok
-    ? toast.success(`节令小札领取完成：${term.title || term.id}`)
-    : toast.error(result?.error || '节令小札领取失败')
-}
-
-async function claimQingmei() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.claimQingmeiSeeds(currentAccountId.value)
-  result?.ok
-    ? toast.success(result.alreadyClaimed ? '今日青梅种子已领取' : `已领取青梅种子 ×${result.claimedCount || 24}`)
-    : toast.error(result?.error || '青梅种子领取失败')
-}
-
-async function sellQingmeiWine() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.brewAndSellQingmeiWine(currentAccountId.value)
-  result?.ok
-    ? toast.success(`青梅酿售卖完成，获得金币 ${Number(result.sell?.gold || 0).toLocaleString()}`)
-    : toast.error(result?.error || '青梅酿售卖失败')
-}
-
-// —— 秋祈良愿（中秋祈愿）——
-async function drawWishSign() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.operateWishSignActivity(String(currentAccountId.value), 'draw')
-  r?.ok ? toast.success(r.message || '祈愿成功') : toast.error(r?.error || '祈愿失败')
-}
-
-async function claimWishSign() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.operateWishSignActivity(String(currentAccountId.value), 'claim')
-  r?.ok ? toast.success(r.message || '签文奖励领取成功') : toast.error(r?.error || '签文领取失败')
-}
-
-// —— 快乐不独享（分享奖励）——
-async function shareRewardShare() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.operateShareRewardActivity(String(currentAccountId.value), 'share')
-  r?.ok ? toast.success(r.message || '首次分享成功') : toast.error(r?.message || '分享失败')
-}
-
-async function claimShareDaily() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.operateShareRewardActivity(String(currentAccountId.value), 'daily')
-  r?.ok ? toast.success(r.message || '每日奖励领取成功') : toast.error(r?.message || '每日领取失败')
-}
-
-async function claimShareMilestones() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.operateShareRewardActivity(String(currentAccountId.value), 'milestones')
-  r?.ok ? toast.success(r.message || '里程碑奖励领取成功') : toast.error(r?.message || '里程碑领取失败')
-}
-
-async function onRedFlowerDonateLove() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.donateRedFlowerLove(String(currentAccountId.value))
-  r?.ok ? toast.success(r.message || '送爱心值成功') : toast.error(r?.message || '送爱心值失败')
-}
-
-async function onRedFlowerDonateFund() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.donateRedFlowerFund(String(currentAccountId.value))
-  r?.ok ? toast.success(r.message || '公益金捐赠成功') : toast.error(r?.message || '公益金捐赠失败')
-}
-
-async function onRedFlowerClaimShare() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.claimRedFlowerShare(String(currentAccountId.value))
-  r?.ok ? toast.success(r.message || '分享奖励领取成功') : toast.error(r?.message || '领取失败')
-}
-
-async function onRedFlowerClaimTiers() {
-  if (!currentAccountId.value)
-    return
-  const r = await activityStore.claimRedFlowerTiers(String(currentAccountId.value))
-  r?.ok ? toast.success(r.message || '档位奖励领取成功') : toast.error(r?.message || '领取失败')
-}
+const buildQixi = () => runOperation(id => activityStore.buildQixiBridge(id), r => r.completed ? '鹊桥已全部完成' : '驻建鹊桥成功', '驻建鹊桥失败')
+const useQixiDew = () => runOperation(id => activityStore.useQixiDew(id), r => r.usedCount ? `已使用 ${r.usedCount} 个鹊羽灵露` : r.reason === 'daily_limit' ? '今日使用次数已达上限' : '暂无符合条件的土地', '使用鹊羽灵露失败')
+const giftQixi = (friendGid: number, count: number) => runOperation(id => activityStore.sendQixiSachet(id, friendGid, count), r => `已赠送 ${r.sentCount || count} 个鹊羽香囊`, '香囊赠送失败')
+const claimRecords = () => runOperation(id => activityStore.claimStarRecords(id), r => r.recordIds?.length ? `已点亮并领取 ${r.recordIds.length} 个星宿奖励` : '观星礼录领取完成', '观星礼录领取失败')
+const claimPassport = () => runOperation(id => activityStore.claimHeluPassport(id), () => '千星游记奖励领取完成', '千星游记领取失败')
+const claimQingmei = () => runOperation(id => activityStore.claimQingmeiSeeds(id), r => r.alreadyClaimed ? '今日青梅种子已领取' : `已领取青梅种子 ×${r.claimedCount || 24}`, '青梅种子领取失败')
+const sellQingmeiWine = () => runOperation(id => activityStore.brewAndSellQingmeiWine(id), r => `青梅酿售卖完成，获得金币 ${Number(r.sell?.gold || 0).toLocaleString()}`, '青梅酿售卖失败')
+const drawWishSign = () => runOperation(id => activityStore.operateWishSignActivity(id, 'draw'), r => r.message || '祈愿成功', '祈愿失败')
+const claimWishSign = () => runOperation(id => activityStore.operateWishSignActivity(id, 'claim'), r => r.message || '签文奖励领取成功', '签文领取失败')
+const shareRewardShare = () => runOperation(id => activityStore.operateShareRewardActivity(id, 'share'), r => r.message || '首次分享成功', '分享失败')
+const claimShareDaily = () => runOperation(id => activityStore.operateShareRewardActivity(id, 'daily'), r => r.message || '每日奖励领取成功', '每日领取失败')
+const claimShareMilestones = () => runOperation(id => activityStore.operateShareRewardActivity(id, 'milestones'), r => r.message || '里程碑奖励领取成功', '里程碑领取失败')
+const onRedFlowerDonateLove = () => runOperation(id => activityStore.donateRedFlowerLove(id), r => r.message || '送爱心值成功', '送爱心值失败')
+const onRedFlowerDonateFund = () => runOperation(id => activityStore.donateRedFlowerFund(id), r => r.message || '公益金捐赠成功', '公益金捐赠失败')
+const onRedFlowerClaimShare = () => runOperation(id => activityStore.claimRedFlowerShare(id), r => r.message || '分享奖励领取成功', '领取失败')
+const onRedFlowerClaimTiers = () => runOperation(id => activityStore.claimRedFlowerTiers(id), r => r.message || '档位奖励领取成功', '领取失败')
 
 // —— 奶茶热销中（S4）——
 async function onMilkTeaNavigate(page: string) {
   if (!currentAccountId.value)
     return
   milkTeaPage.value = page
-  // 已有缓存则直接用，否则拉取该页
-  if (!milkTeaPages.value[page])
-    await activityStore.fetchMilkTeaActivity(String(currentAccountId.value), page)
 }
 
 async function onMilkTeaOperate(action: string, input: Record<string, unknown> = {}) {
   if (!currentAccountId.value)
     return
   const accountId = String(currentAccountId.value)
+  const epoch = pageEpoch
+  const signal = readController.signal
+  const valid = () => !disposed && !signal.aborted && epoch === pageEpoch && accountId === String(currentAccountId.value)
+  try {
   // 内部动作：仅切档位后重新拉取雇佣列表，不属于真实操作
   if (action === '__fetchHire') {
-    await activityStore.fetchMilkTeaActivity(accountId, 'hireList', input)
+    await activityStore.fetchMilkTeaActivity(accountId, 'hireList', input, signal)
     return
   }
   const result = await activityStore.operateMilkTeaActivity(accountId, action, input)
+  if (!valid() || result?.canceled || result?.stale) return
   if (result?.ok) {
+    milkTeaProgressUncertain.value = true
     const gain = (result.rewards || []).length
     const labels: Record<string, string> = {
       create: '店铺已开业', rename: '店名已修改', claim: '收益已领取', boost: '加速成功',
@@ -404,25 +412,28 @@ async function onMilkTeaOperate(action: string, input: Record<string, unknown> =
     if (['exchange', 'unlock', 'fundClaim'].includes(action)) refreshPages.add('fund')
     if (action === 'exchange') refreshPages.add('exchange')
     if (['wages', 'interact'].includes(action)) refreshPages.add('work')
-    await Promise.allSettled([...refreshPages].map(p => activityStore.fetchMilkTeaActivity(accountId, p)))
+    const refreshed = await Promise.allSettled([...refreshPages].map(p => activityStore.fetchMilkTeaActivity(accountId, p, {}, signal)))
+    if (valid() && refreshed.every(reply => reply.status === 'fulfilled' && reply.value?.ok)) milkTeaProgressUncertain.value = false
   }
   else {
+    milkTeaProgressUncertain.value = true
     toast.error(result?.error || '奶茶活动操作失败')
+  }
+  }
+  catch (error: any) {
+    if (valid()) milkTeaProgressUncertain.value = true
+    if (valid() && !isReadCanceled(error)) toast.error(error?.message || '奶茶活动操作失败')
   }
 }
 
-async function exchangeStarSand(item: { id: number, itemName?: string, name?: string }, count: number) {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.exchangeStarSand(currentAccountId.value, item.id, count)
-  result?.ok
-    ? toast.success(`${L.exchangeDone}${item.itemName || item.name || item.id} ×${count}`)
-    : toast.error(result?.error || L.exchangeFail)
-}
+const exchangeStarSand = (item: { id: number, itemName?: string, name?: string }, count: number) =>
+  runOperation(id => activityStore.exchangeStarSand(id, item.id, count), () => `${L.exchangeDone}${item.itemName || item.name || item.id} ×${count}`, L.exchangeFail)
 
+const activityContent = ref<HTMLElement | null>(null)
+const { select: slideActivitySection, selected: selectedSection } = useSlidingTabs(activeSection, () => activityContent.value,
+  () => sections.value.map(section => section.key), () => currentAccountId.value)
 function selectSection(key: ActivitySectionKey) {
-  // 所有活动（含萌宠日记）均作为常规 tab 在主体区切换展示；不再进入独立沉浸式全屏视图。
-  activeSection.value = key
+  slideActivitySection(key)
 }
 
 function backToList() {
@@ -437,11 +448,20 @@ function backToList() {
 }
 
 watch(currentAccountId, () => {
+  pageEpoch++
+  readController.abort()
+  readController = new AbortController()
   activityStore.clearActivityData()
-  refreshAll()
+  solarSummary.value = { accountId: '', claimable: 0, loading: false }
+  milkTeaProgressUncertain.value = false
+  if (activeSection.value !== 'notes') void queueRefresh()
+}, { flush: 'sync' })
+watch([activeSection, milkTeaPage], () => {
+  // Mounting SolarCalendar triggers exactly its own account-scoped read.
+  if (activeSection.value !== 'notes') void queueRefresh()
 })
 onMounted(() => {
-  // 若默认 tab（千星游记）已下线，回退到首个可见 tab；
+  // 若默认主活动（奶茶）已下线，回退到首个可见 tab；
   // 若所有常规活动都被隐藏（sections 为空），则置空显示「暂无进行中的活动」空态，
   // 避免面板残留渲染已隐藏的下线活动（如之前残留的千星游记）。
   if (isActivityHidden(activeSection.value)) {
@@ -449,8 +469,8 @@ onMounted(() => {
     activeSection.value = first?.key ?? ''
   }
   // 先取最新游戏公告头图作为活动页 header 背景，无账号时也要展示。
-  fetchGameBulletinBanner()
-  refreshAll()
+  void fetchGameBulletinBanner()
+  if (activeSection.value !== 'notes') void queueRefresh()
   nowTimer = window.setInterval(() => { nowMs.value = Date.now() }, 60_000)
 })
 onUnmounted(() => {
@@ -460,153 +480,81 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="space-y-4">
-    <header
-      class="relative min-h-40 overflow-hidden rounded-lg shadow-sm"
-      :class="activeSection === 'honghua' ? 'bg-black' : activeSection === 'pet-diary' ? 'bg-[#123a1c]' : activeSection === 'wish-sign' ? 'bg-[#3a2b14]' : activeSection === 'share-reward' ? 'bg-[#2a160f]' : activeSection === 'milk-tea' ? 'bg-[#3a2415]' : 'bg-[#071b43]'"
-    >
-      <img
-        v-if="headerBgSrc"
-        :src="headerBgSrc"
-        alt=""
-        class="absolute inset-0 h-full w-full object-cover object-center"
-        :class="gameBulletinPic || activeSection === 'honghua' ? 'opacity-100' : activeSection === 'pet-diary' ? 'opacity-70' : 'opacity-80'"
-      >
-      <div
-        class="absolute inset-0"
-        :class="(activeSection === 'honghua' || (gameBulletinPic && activeSection !== 'pet-diary'))
-          ? 'bg-gradient-to-r from-black/55 via-black/20 to-transparent'
-          : activeSection === 'rain-poem'
-            ? 'bg-gradient-to-r from-[#081824]/95 via-[#102b3c]/80 to-[#173445]/35'
-            : activeSection === 'pet-diary'
-              ? 'bg-gradient-to-r from-[#08260f]/95 via-[#0f3d1f]/75 to-[#123a1c]/25'
-              : activeSection === 'wish-sign'
-                ? 'bg-gradient-to-r from-[#2a1d0a]/95 via-[#4a3411]/80 to-[#5c4214]/25'
-                : activeSection === 'share-reward'
-                  ? 'bg-gradient-to-r from-[#331209]/95 via-[#5c2411]/80 to-[#7a3014]/25'
-                  : activeSection === 'milk-tea'
-                    ? 'bg-gradient-to-r from-[#2f1b0d]/95 via-[#5a3418]/80 to-[#7d4a1f]/25'
-                    : 'bg-gradient-to-r from-[#061632]/95 via-[#0b2e61]/80 to-[#0b2e61]/25'"
-      />
-      <img
-        v-if="activeSection !== 'qixi' && activeSection !== 'rain-poem' && activeSection !== 'honghua' && activeSection !== 'pet-diary' && activeSection !== 'wish-sign' && activeSection !== 'share-reward' && activeSection !== 'milk-tea'"
-        src="/activity/star-festival/star-farm.png"
-        alt=""
-        class="pointer-events-none absolute -bottom-32 right-0 hidden h-96 w-96 object-contain opacity-85 lg:block"
-      >
-      <!-- 萌宠成长日记主题活动装饰：上游本活动的比熊立绘，替换已下线的千星游记星空装饰。 -->
-      <img
-        v-else-if="activeSection === 'pet-diary'"
-        src="/activity/pet-diary/img_s3BattlePass_pet.png"
-        alt=""
-        class="pointer-events-none absolute bottom-1 right-6 hidden h-36 w-36 object-contain drop-shadow-[0_4px_12px_rgba(0,0,0,0.45)] lg:block"
-      >
-
-      <div class="relative flex min-h-40 flex-col justify-between gap-4 p-4 xl:flex-row xl:items-center">
-        <div class="min-w-0">
-          <img
-            v-if="activeSection === 'qixi'"
-            src="/activity/qixi/event-banner.png"
-            :alt="qixiActivity?.title || '鹊桥寄情'"
-            class="h-auto w-72 max-w-full object-contain object-left"
-          >
-          <h1
-            v-else-if="activeSection === 'rain-poem'"
-            class="text-3xl font-semibold tracking-wide text-white drop-shadow"
-          >
-            {{ rainPoemActivity?.title || '雨落成诗' }}
-          </h1>
-          <h1
-            v-else-if="activeSection === 'honghua'"
-            class="flex items-center gap-2 text-3xl font-semibold tracking-wide text-white drop-shadow"
-          >
-            <span class="i-carbon-favorite-filled text-rose-200" />
-            {{ redFlowerActivity?.title || '公益小红花' }}
-          </h1>
-          <img
-            v-else-if="activeSection === 'pet-diary'"
-            src="/activity/pet-diary/img_s3main_title.png"
-            alt="萌宠成长日记"
-            class="h-auto w-72 max-w-full object-contain object-left drop-shadow-[0_2px_8px_rgba(0,0,0,0.55)]"
-          >
-          <h1
-            v-else-if="activeSection === 'wish-sign'"
-            class="flex items-center gap-2 text-3xl font-semibold tracking-wide text-amber-100 drop-shadow"
-          >
-            <span class="i-carbon-launch text-amber-200" />
-            {{ wishSignActivity?.title || '秋祈良愿' }}
-          </h1>
-          <h1
-            v-else-if="activeSection === 'share-reward'"
-            class="flex items-center gap-2 text-3xl font-semibold tracking-wide text-orange-100 drop-shadow"
-          >
-            <span class="i-carbon-favorite-filled text-orange-200" />
-            {{ shareRewardActivity?.title || '快乐不独享' }}
-          </h1>
-          <h1
-            v-else-if="activeSection === 'milk-tea'"
-            class="flex items-center gap-2 text-3xl font-semibold tracking-wide text-amber-100 drop-shadow"
-          >
-            <span class="i-carbon-cafe text-amber-200" />
-            {{ milkTeaActivity?.title || '奶茶热销中' }}
-          </h1>
-          <img
-            v-else
-            src="/activity/star-festival/event-title.png"
-            :alt="activity?.title || L.heluTitle"
-            class="h-auto w-72 max-w-full object-contain object-left"
-          >
-          <div class="mt-1 text-xs text-sky-100/75">
-            活动中心 · {{ L.currentAccount }} {{ currentAccount?.name || L.none }}
-          </div>
-        </div>
-        <div class="flex min-w-0 flex-wrap items-center gap-2 xl:max-w-[68%] xl:justify-end">
-          <span
-            v-if="activeSection !== 'rain-poem' && activeSection !== 'honghua' && activeSection !== 'pet-diary' && activeSection !== 'wish-sign' && activeSection !== 'share-reward' && activeSection !== 'milk-tea'"
-            class="inline-flex items-center rounded-lg border border-sky-200/20 bg-[#071b43]/70 px-3 py-1.5 text-xs text-sky-50 backdrop-blur-sm"
-          >
-            <img src="/activity/star-festival/star-token.png" alt="" class="mr-1.5 h-5 w-7 object-contain">
-            {{ L.heluBalance }} {{ Number(activity?.starSandBalance || 0).toLocaleString() }}
-          </span>
-          <div class="min-w-0 max-w-full">
-                    <div class="inline-flex flex-wrap gap-1.5 p-1 border border-sky-200/20 rounded-xl bg-[#071b43]/70 backdrop-blur-sm">
-                      <button
-                        v-for="section in sections"
-                        :key="section.key"
-                        class="px-3 py-1 text-sm transition whitespace-nowrap rounded-lg"
-                        :class="activeSection === section.key ? 'text-white font-medium' : 'text-sky-100/80 hover:text-white'"
-                        :style="activeSection === section.key ? { backgroundColor: 'var(--theme-primary)' } : {}"
-                        @click="selectSection(section.key)"
-                      >
-                        {{ section.label }}
-                        <span v-if="section.count" class="ml-1 opacity-80">{{ section.count }}</span>
-                      </button>
-                    </div>
-                  </div>
-          <BaseButton variant="primary" :loading="heluLoading || rainPoemLoading" :disabled="!currentAccountId" @click="refreshAll">
-            {{ L.refresh }}
+  <section class="activity-page space-y-4">
+    <header class="activity-header space-y-4">
+      <div class="ui-page-heading">
+        <div><h1>{{ L.title }}</h1><p>参与当期活动，查看经营进度与节令奖励。</p></div>
+        <div class="activity-header-controls">
+          <BaseButton class="activity-header-refresh w-24 shrink-0" variant="secondary" :loading="refreshingActivity" :disabled="!currentAccountId" @click="refreshAll">
+            <span class="i-carbon-renew mr-1.5" aria-hidden="true" />{{ L.refresh }}
           </BaseButton>
           <BaseButton v-if="userStore.isAdmin" variant="secondary" @click="showActivityAnalysis = true">
-            <span class="i-carbon-analytics mr-1.5" />
-            活动分析
+            <span class="i-carbon-analytics mr-1.5" aria-hidden="true" />活动分析
           </BaseButton>
         </div>
       </div>
+      <nav ref="activityTabNav" v-sliding-tabs class="activity-tabs ui-tabs" role="tablist" aria-label="活动分类">
+        <button
+          v-for="(section, index) in sections" :id="`${activityPanelId}-${section.key}`" :key="section.key"
+          type="button" role="tab" class="ui-tab ui-tab-counted font-medium"
+          :data-active="selectedSection === section.key" :aria-selected="selectedSection === section.key"
+          :aria-controls="`${activityPanelId}-panel`" :tabindex="selectedSection === section.key ? 0 : -1"
+          data-motion-nav @click="selectSection(section.key)" @keydown="moveActivityTabFocus($event, index)"
+        >
+          <span class="ui-tab-icon" aria-hidden="true"><span :class="section.icon" /></span><span class="ui-tab-label">{{ section.label }}</span>
+          <span
+            class="activity-tab-count ui-tab-count inline-block w-6 shrink-0 text-center tabular-nums"
+            :class="{ invisible: !section.count }" :aria-hidden="!section.count"
+          >{{ (section.count || 0) > 99 ? '99+' : section.count || 0 }}</span>
+        </button>
+      </nav>
+      <!-- Official art belongs only to this small banner; page navigation never changes theme. -->
+      <div v-if="sections.length" class="activity-banner ui-card">
+        <img v-if="headerBgSrc" :src="headerBgSrc" alt="" class="activity-banner-art" aria-hidden="true">
+        <div class="activity-header-identity min-w-0">
+          <h2>{{ activityHeading }}</h2>
+          <p class="activity-banner-description">
+            <template v-if="isSolarSection && solarHeaderTerm">{{ solarTermName(solarHeaderTerm) }} · {{ solarHeaderLabel }}</template>
+            <template v-else-if="isSolarSection">节令小礼与答题奖励，随四时一同收集。</template>
+            <template v-else-if="activeSection === 'milk-tea'">经营店铺，制作奶茶与领取活动奖励。</template>
+            <template v-else>查看当前活动进度与可领取奖励。</template>
+          </p>
+          <!-- Keep the same schedule row in both tabs so switching never shifts navigation. -->
+          <p
+            class="activity-header-schedule"
+            :class="{ invisible: activeSection !== 'milk-tea' }" :aria-hidden="activeSection !== 'milk-tea'"
+          >
+            <span>经营至 <strong>{{ milkTeaSchedule.businessEnd }}</strong></span><span>领奖至 <strong>{{ milkTeaSchedule.rewardEnd }}</strong></span><span>北京时间</span>
+          </p>
+        </div>
+        <img
+          v-if="isSolarSection && solarHeaderIllustration" :src="solarHeaderIllustration"
+          alt="QQ农场官方冬季节令插画" width="337" height="239"
+          class="activity-solar-art h-14 w-auto shrink-0 object-contain sm:h-16" aria-hidden="true"
+        >
+        <span v-if="showStarTheme && activity" class="activity-balance">
+          <img src="/activity/star-festival/star-token.png" alt="" class="h-5 w-7 object-contain">
+          {{ L.heluBalance }} {{ Number(activity.starSandBalance || 0).toLocaleString() }}
+        </span>
+      </div>
     </header>
 
-    <div v-if="!currentAccountId" class="rounded-lg bg-white p-10 text-center text-sm text-gray-500 shadow dark:bg-gray-800">
-      {{ L.needAccount }}
+    <div :id="`${activityPanelId}-panel`" ref="activityContent" class="tab-motion-viewport" role="tabpanel" :aria-labelledby="`${activityPanelId}-${activeSection}`" tabindex="0">
+      <div class="space-y-4" data-motion-entry>
+    <div v-if="!currentAccountId" class="ui-empty-state activity-empty" role="status">
+      <span class="i-carbon-gift" aria-hidden="true" />
+      <h3>{{ accountEmptyState.title }}</h3><p>{{ accountEmptyState.description }}</p>
     </div>
     <template v-else>
       <!-- 星许千灯系的全局提示只属于该主活动，切到萌宠日记 / 秋祈良愿 / 快乐不独享 / 奶茶热销中时不再展示，避免串台。 -->
-      <template v-if="activeSection !== 'pet-diary' && activeSection !== 'wish-sign' && activeSection !== 'share-reward' && activeSection !== 'milk-tea'">
-        <div v-if="heluError" class="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
+      <template v-if="activeSection !== 'notes' && activeSection !== 'pet-diary' && activeSection !== 'wish-sign' && activeSection !== 'share-reward' && activeSection !== 'milk-tea'">
+        <div v-if="heluError" class="ui-notice" data-tone="danger" role="status">
           {{ heluError }}
         </div>
-        <div v-if="activity?.warning" class="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-100">
+        <div v-if="activity?.warning" class="ui-notice" data-tone="warning" role="status">
           {{ activity.warning }}
         </div>
-        <div v-if="heluLoading && !activity" class="rounded-lg bg-sky-50 px-4 py-3 text-sm text-sky-900 dark:bg-sky-900/20 dark:text-sky-100">
+        <div v-if="heluLoading && !activity" class="ui-notice" role="status">
           {{ L.loading }}
         </div>
       </template>
@@ -618,7 +566,7 @@ onUnmounted(() => {
         @claim="claimRecords"
       />
       <div v-else-if="activeSection === 'shop'" class="space-y-3">
-        <div v-if="activity?.shopWarning" class="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-900/20 dark:text-amber-100">
+        <div v-if="activity?.shopWarning" class="ui-notice" data-tone="warning" role="status">
           {{ activity.shopWarning }}
         </div>
         <HeluExchangePanel
@@ -637,12 +585,11 @@ onUnmounted(() => {
         :labels="L"
         @claim="claimPassport"
       />
-      <HeluSolarTermsPanel
+      <SolarCalendar
         v-else-if="activeSection === 'notes'"
-        :solar-terms="activity?.solarTerms"
-        :loading="solarClaimLoading"
-        :labels="L"
-        @claim="claimSolar"
+        ref="solarPanel"
+        embedded
+        @summary="updateSolarSummary"
       />
       <QixiActivityPanel
         v-else-if="activeSection === 'qixi'"
@@ -656,7 +603,7 @@ onUnmounted(() => {
         @gift="giftQixi"
       />
       <QingmeiActivityPanel
-        v-else-if="!isActivityHidden('qingmei')"
+        v-else-if="activeSection === 'qingmei' && !isActivityHidden('qingmei')"
         :activity="activity?.qingmei"
         :loading="qingmeiClaimLoading"
         :sell-loading="qingmeiSellLoading"
@@ -713,17 +660,23 @@ onUnmounted(() => {
       <MilkTeaActivityPanel
         v-else-if="activeSection === 'milk-tea'"
         :activity="milkTeaActivity"
+        :account-id="String(currentAccountId || '')"
+        :overview="milkTeaTodo"
         :page="milkTeaPage"
         :loading="milkTeaLoading"
         :operate-loading="milkTeaOperateLoading"
+        embedded
         @navigate="onMilkTeaNavigate"
         @operate="onMilkTeaOperate"
       />
       <!-- 当所有常规活动都被下架、无可见 tab 时，展示空态，不再残留渲染已下线的默认面板。 -->
-      <div v-if="sections.length === 0" class="rounded-lg bg-white p-10 text-center text-sm text-gray-500 shadow dark:bg-gray-800">
-        <p class="text-sm">当前没有进行中的活动，请耐心等待新版活动上线。</p>
+      <div v-if="sections.length === 0" class="ui-empty-state" role="status">
+        <span class="i-carbon-calendar" aria-hidden="true" /><h3>暂无进行中的活动</h3>
+        <p>当前没有进行中的活动，请耐心等待新版活动上线。</p>
       </div>
     </template>
+      </div>
+    </div>
 
     <AutoActivityPanel v-if="discovery.newActivity" class="mt-4" />
 
@@ -760,6 +713,20 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.activity-page { min-width: 0; color: var(--theme-text); }
+.activity-header-controls { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.activity-tabs { position: relative; z-index: 1; }
+.activity-tab-count { font-size: 11px; font-weight: 600; }
+.activity-banner { position: relative; display: flex; align-items: center; gap: 18px; min-height: 128px; padding: 16px 20px; overflow: hidden; background: var(--surface-1); isolation: isolate; }
+.activity-banner-art { position: absolute; top: 0; right: 0; width: 40%; height: 100%; object-fit: cover; object-position: center; opacity: .12; pointer-events: none; z-index: 0; mask-image: linear-gradient(to right, transparent, #000); }
+.activity-header-identity { position: relative; z-index: 1; flex: 1; }
+.activity-header-identity h2 { margin: 0; color: var(--theme-text); font-size: 18px; font-weight: 600; line-height: 1.5; }
+.activity-banner-description { margin: 4px 0 0; color: var(--muted-text); font-size: 13px; line-height: 1.7; }
+.activity-header-schedule { display: flex; flex-wrap: wrap; gap: 2px 12px; min-height: 18px; margin: 8px 0 0; color: var(--muted-text); font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums; }
+.activity-header-schedule strong { color: var(--theme-text); font-weight: 600; }
+.activity-solar-art { position: relative; z-index: 1; pointer-events: none; }
+.activity-balance { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid var(--surface-border); border-radius: var(--radius-control); background: var(--surface-2); color: var(--theme-text); font-size: 12px; white-space: nowrap; }
+@media (max-width: 640px) { .activity-header-controls { gap: 8px; } .activity-banner { gap: 12px; min-height: 128px; padding: 16px; } .activity-header-schedule { min-height: 36px; } .activity-header-identity h2 { font-size: 16px; } .activity-banner-art { width: 48%; } .activity-solar-art { position: absolute; top: 18px; right: 14px; opacity: .2; z-index: 0; } .activity-balance { position: absolute; right: 12px; top: 12px; } }
 /*
  * 萌宠成长日记面板上游原本按「自带视口高度 + 面板内部 .pet-scroll 滚动」设计
  * （.pet-diary 为 max(520px, calc(100dvh - 128px))，内部滚动）。

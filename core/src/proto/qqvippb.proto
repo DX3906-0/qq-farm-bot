@@ -30,3 +30,23 @@ message ClaimQQVipRewardsRequest {
 message ClaimQQVipRewardsReply {
     repeated corepb.Item items = 3;  // 奖励物品列表
 }
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message QQVipRewardStatus {
+    int32 type = 1;
+    repeated corepb.Item rewards = 2;
+    bool is_enable = 3;
+    int64 activity_id = 4;
+    int64 reward_type = 5;
+    int64 reward_multiplier = 6;
+    int64 begin_time = 7;
+    int64 end_time = 8;
+}
+
+message VipInfoUpdatedNTF {
+    int64 vip_type = 1;
+    int64 vip_level = 2;
+}

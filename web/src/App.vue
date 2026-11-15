@@ -1,21 +1,7 @@
 <script setup lang="ts">
-import type { Theme } from '@/stores/app'
-import { onMounted } from 'vue'
 import { RouterView } from 'vue-router'
 import ToastContainer from '@/components/ToastContainer.vue'
-import { useAppStore } from '@/stores/app'
-
-const appStore = useAppStore()
-
-// 立即应用保存的主题（在组件挂载前）
-const savedTheme = localStorage.getItem('ui_theme') as Theme
-if (savedTheme && appStore.themes[savedTheme]) {
-  appStore.applyTheme(savedTheme)
-}
-
-onMounted(() => {
-  appStore.fetchTheme()
-})
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 </script>
 
 <template>
@@ -27,16 +13,23 @@ onMounted(() => {
       <div class="decor-edge decor-edge-l" />
       <div class="decor-edge decor-edge-r" />
     </div>
-    <RouterView />
+    <div class="app-content-shell" :class="{ 'app-local-readonly': LOCAL_UI_READONLY }">
+      <div class="app-route-host"><RouterView /></div>
+    </div>
     <ToastContainer />
   </div>
 </template>
 
 <style>
 /* Global styles */
+.app-content-shell, .app-route-host { height: 100%; min-height: 0; }
+.app-local-readonly { display: flex; flex-direction: column; }
+.app-local-readonly .app-route-host { flex: 1; min-height: 0; height: auto; }
+.app-local-readonly .app-route-host > div { height: 100% !important; }
+.tab-motion-viewport { min-width: 0; overflow: clip; }
 body {
   margin: 0;
-  font-family: 'DM Sans', sans-serif;
+  font-family: 'DM Sans', 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
   background: var(--app-bg);
   color: var(--theme-text);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
@@ -56,9 +49,21 @@ body {
   --surface-3: #F0ECDD;
   --surface-border: #ECE5D6;
   --surface-border-strong: #E1D9C5;
-  --surface-shadow: 0 18px 48px rgba(70, 58, 34, 0.10);
-  --surface-shadow-soft: 0 8px 24px rgba(70, 58, 34, 0.07);
-  --muted-text: #8b8270;
+  --surface-shadow: 0 12px 32px rgba(70, 58, 34, 0.14);
+  --surface-shadow-card: 0 2px 8px rgba(70, 58, 34, 0.07);
+  --surface-shadow-soft: 0 1px 4px rgba(70, 58, 34, 0.06);
+  --muted-text: #625b4d;
+  --radius-control: 8px;
+  --radius-card: 12px;
+  --radius-panel: 16px;
+  --action-bg: #416d3b;
+  --action-hover: #355b31;
+  --action-text: #ffffff;
+  --status-success: #327047;
+  --status-danger: #b4232c;
+  --status-warning: #875719;
+  --status-info: #245b96;
+  --focus-ring: color-mix(in srgb, var(--theme-primary) 65%, #1d4ed8);
   --input-bg: rgba(255, 255, 255, 0.92);
   --panel-glow: color-mix(in srgb, var(--theme-primary) 16%, transparent);
 }
@@ -71,9 +76,14 @@ body {
   --surface-3: #2E3427;
   --surface-border: rgba(255, 255, 255, 0.08);
   --surface-border-strong: rgba(255, 255, 255, 0.13);
-  --surface-shadow: 0 20px 55px rgba(0, 0, 0, 0.40);
-  --surface-shadow-soft: 0 10px 28px rgba(0, 0, 0, 0.30);
-  --muted-text: #9aa089;
+  --surface-shadow: 0 14px 36px rgba(0, 0, 0, 0.40);
+  --surface-shadow-card: 0 3px 10px rgba(0, 0, 0, 0.26);
+  --surface-shadow-soft: 0 1px 4px rgba(0, 0, 0, 0.24);
+  --muted-text: #c1c8b7;
+  --status-success: #98d7a8;
+  --status-danger: #ffaaaa;
+  --status-warning: #f1c980;
+  --status-info: #9ac7f6;
   --input-bg: rgba(18, 22, 14, 0.6);
   --panel-glow: color-mix(in srgb, var(--theme-primary) 20%, transparent);
 }
@@ -96,24 +106,60 @@ body {
   background-color: var(--surface-3) !important;
 }
 
+/* Page headings, navigation and read states share one theme-aware vocabulary. */
+.ui-page-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 0 2px; }
+.ui-page-heading h1 { margin: 0; color: var(--theme-text); font-size: 24px; line-height: 1.35; font-weight: 600; }
+.ui-page-heading p { margin: 6px 0 0; color: var(--muted-text); font-size: 13px; line-height: 1.6; }
+.ui-tabs { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; padding: 8px; border: 1px solid var(--surface-border); border-radius: var(--radius-card); background: var(--surface-1); }
+.ui-tab { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 8px 14px; border: 1px solid transparent; border-radius: var(--radius-control); background: transparent; color: var(--theme-text); font: inherit; font-size: 14px; font-weight: 500; line-height: 1.5; cursor: pointer; transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease; }
+.ui-tab:hover { background: var(--surface-2); color: var(--theme-text); }
+.ui-tab[data-active='true'] { background: var(--action-bg); color: var(--action-text); }
+[data-sliding-tabs] { position: relative; isolation: isolate; }
+[data-sliding-tabs] > .ui-tab { position: relative; z-index: 1; }
+[data-sliding-tabs] > .ui-tab[data-active='true'] { background: transparent !important; color: var(--theme-text) !important; }
+[data-sliding-tabs] > .ui-tab[data-active='true'] > .ui-tab-icon,
+[data-sliding-tabs] > .ui-tab[data-active='true'] > [aria-hidden='true'] { color: var(--theme-primary); }
+.ui-tab-selection { position: absolute; top: 0; left: 0; z-index: 0; border-radius: var(--radius-control); pointer-events: none; opacity: 0; background: color-mix(in srgb, var(--theme-primary) 15%, var(--surface-1)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-primary) 16%, transparent); }
+.ui-tab-selection[data-ready='true'] { opacity: 1; }
+.ui-tab-label { transition: transform 90ms ease; }
+/* Equal side rails center the label itself, not an asymmetric icon/badge group.
+   The badge rail is always reserved, including zero/unknown counts. */
+.ui-tab.ui-tab-counted { display: inline-grid; grid-template-columns: 24px auto 24px; column-gap: 8px; }
+.ui-tab-counted > .ui-tab-icon { display: grid; place-items: center; width: 24px; height: 24px; font-size: 14px; }
+.ui-tab-counted > .ui-tab-count { width: 24px; min-width: 24px; text-align: center; font-variant-numeric: tabular-nums; }
+.ui-tab-counted > .ui-tab-label { text-align: center; }
+.ui-tab:active .ui-tab-label { transform: scale(.97); }
+.ui-empty-state { display: grid; place-items: center; align-content: center; gap: 10px; min-height: 176px; padding: 32px 18px; border: 1px dashed var(--surface-border-strong); border-radius: var(--radius-card); background: color-mix(in srgb, var(--surface-1) 72%, transparent); color: var(--muted-text); text-align: center; font-size: 13px; line-height: 1.7; }
+.ui-empty-state > span { font-size: 28px; }
+.ui-empty-state h2, .ui-empty-state h3 { margin: 0; color: var(--theme-text); font-size: 15px; font-weight: 600; }
+.ui-empty-state p { max-width: 42em; margin: 0; }
+.ui-notice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px; border: 1px solid var(--surface-border); border-left: 3px solid var(--theme-primary); border-radius: var(--radius-control); background: var(--surface-1); color: var(--muted-text); font-size: 13px; line-height: 1.7; }
+.ui-notice > span:first-child { flex-shrink: 0; margin-top: 3px; font-size: 16px; color: var(--theme-primary); }
+.ui-notice p { margin: 0; }
+.ui-notice[data-tone='danger'] { border-left-color: var(--status-danger); color: var(--status-danger); }
+.ui-notice[data-tone='warning'] { border-left-color: var(--status-warning); color: var(--status-warning); }
+@media (max-width: 640px) { .ui-page-heading h1 { font-size: 20px; } .ui-tabs { gap: 4px; padding: 6px; } .ui-tab { min-height: 44px; padding: 8px 10px; font-size: 13px; } .ui-empty-state { min-height: 156px; padding: 28px 16px; } }
+@media (pointer: coarse) { .ui-tab { min-height: 44px; } }
+@media (prefers-reduced-motion: reduce) { .ui-tab, .ui-tab-label { transition: none; } .ui-tab:active .ui-tab-label { transform: none; } }
+
 .ui-card {
   border: 1px solid var(--surface-border);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 96%, #ffffff 4%), var(--surface-1));
+  background: var(--surface-1);
   box-shadow: var(--surface-shadow-soft);
-  border-radius: 1.25rem;
+  border-radius: var(--radius-card);
 }
 
 .ui-card-elevated {
   border: 1px solid var(--surface-border);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 92%, #ffffff 8%), var(--surface-1));
-  box-shadow: var(--surface-shadow);
-  border-radius: 1.25rem;
+  background: var(--surface-1);
+  box-shadow: var(--surface-shadow-card);
+  border-radius: var(--radius-panel);
 }
 
 .ui-subtle-panel {
   border: 1px solid var(--surface-border);
   background: color-mix(in srgb, var(--surface-2) 86%, transparent);
-  border-radius: 1rem;
+  border-radius: var(--radius-card);
 }
 
 .glass-panel {
@@ -123,30 +169,23 @@ body {
   box-shadow: var(--surface-shadow-soft);
 }
 
-/* 统一卡片圆角为农场大圆角，使全站与「自动控制」页面视觉一致 */
-.rounded-lg {
-  border-radius: 1.25rem !important;
-}
-
-/* ===== 农场律动层：让静止的卡片拥有自然的呼吸与流动 ===== */
-
-/* 卡片轻柔上浮淡入（切换标签/加载时重播，营造节奏感） */
-@keyframes card-reveal {
-  from { opacity: 0; transform: translateY(16px) scale(0.992); }
-  to   { opacity: 1; transform: none; }
-}
+/* Controls keep their small utility radius; surfaces own their explicit tier. */
+.ui-card.rounded-lg,
+.ui-subtle-panel.rounded-lg,
+.glass-panel.rounded-lg { border-radius: var(--radius-card); }
+.ui-card-elevated.rounded-lg { border-radius: var(--radius-panel); }
 
 .ui-card,
 .ui-card-elevated {
-  animation: card-reveal 0.55s cubic-bezier(0.22, 1, 0.36, 1) backwards;
-  transition: box-shadow 0.35s ease, border-color 0.35s ease;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
 /* hover 时只柔化阴影与边框，不再整体上移：避免弹窗/卡片在鼠标移入移出时产生"闪一下"的位移跳动 */
-.ui-card:hover,
-.ui-card-elevated:hover {
-  box-shadow: var(--surface-shadow);
-  border-color: color-mix(in srgb, var(--theme-primary) 32%, var(--surface-border));
+button.ui-card:hover,
+a.ui-card:hover,
+.ui-card[data-interactive='true']:hover,
+.ui-card-elevated[data-interactive='true']:hover {
+  border-color: color-mix(in srgb, var(--theme-primary) 26%, var(--surface-border));
 }
 
 /* 弹窗/二维码等固定层自身不做入场动画与 hover 位移，避免覆盖层内容跳动 */
@@ -234,10 +273,64 @@ body {
   to   { transform: rotate(2.5deg) translateY(-6px); }
 }
 
+/* One clipped, compositor-painted content snapshot; navigation/header and
+   buttons stay live. No DOM exit transition, duplicate page or blurred text. */
+:root[data-content-motion] { --content-slide-x: 0%; --content-slide-y: 100%; --content-duration: 460ms; --content-easing: cubic-bezier(.24, .08, .2, 1); }
+:root[data-content-motion='panel'] { --content-slide-x: 100%; --content-slide-y: 0%; --content-duration: 420ms; --content-easing: cubic-bezier(.24, .08, .2, 1); }
+:root[data-content-direction='back'] { --content-slide-y: -100%; }
+:root[data-content-motion='panel'][data-content-direction='back'] { --content-slide-x: -100%; --content-slide-y: 0%; }
+:root::view-transition,
+:root::view-transition-group(farm-content),
+:root::view-transition-image-pair(farm-content),
+:root::view-transition-old(farm-content),
+:root::view-transition-new(farm-content) { pointer-events: none; }
+:root::view-transition-group(farm-content) {
+  animation: none;
+  clip-path: inset(0 round var(--radius-card, 12px));
+}
+:root::view-transition-image-pair(farm-content) { isolation: isolate; overflow: clip; }
+:root[data-content-motion='prime']::view-transition-old(farm-content) { animation: none; opacity: 0; }
+:root[data-content-motion='prime']::view-transition-new(farm-content) { animation: none; }
+:root::view-transition-old(farm-content),
+:root::view-transition-new(farm-content) {
+  width: 100%; height: 100%;
+  object-fit: none; object-position: top left;
+  transform-origin: 50% 32%;
+  mix-blend-mode: normal;
+}
+:root::view-transition-old(farm-content) {
+  z-index: 1;
+  animation: content-snapshot-out var(--content-duration, 460ms) var(--content-easing) both;
+}
+:root::view-transition-new(farm-content) {
+  z-index: 2;
+  animation: content-snapshot-in var(--content-duration, 460ms) var(--content-easing) both;
+}
+/* Equal distances, timing and easing keep the two opaque painted pages joined
+   edge-to-edge, with no zoom/fade and no content escaping the viewport clip. */
+@keyframes content-snapshot-out {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(calc(var(--content-slide-x) * -1), calc(var(--content-slide-y) * -1), 0); }
+}
+@keyframes content-snapshot-in {
+  from { transform: translate3d(var(--content-slide-x), var(--content-slide-y), 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  :root::view-transition-old(farm-content), :root::view-transition-new(farm-content) { animation: none; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    scroll-behavior: auto !important;
+  }
   .farm-decor::before { animation: none; }
-  .ui-card,
-  .ui-card-elevated { animation: none; }
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring, #416d3b);
+  outline-offset: 3px;
 }
 
 .metric-card {

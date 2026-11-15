@@ -23,9 +23,12 @@ const { TsdkRuntime } = require('../utils/tsdk-runtime');
 const { AceService } = require('../services/ace-service');
 const { createGatewayToken } = require('../utils/gateway-token');
 const { getDataDir } = require('../config/runtime-paths');
+const { getOldestPendingAgeMs, evaluateGatewayHealth } = require('../utils/gateway-health');
+const { isSafeReadRequest } = require('../utils/request-priority');
 
-// 微信 loginBuffer 持久化目录：扫码后落盘，断线重连时据此重新 issueCode 换新一次性 code
-const WX_LOGIN_DIR = path.join(getDataDir(), 'wx-login');
+// 独立微信实例使用专属凭据目录；主网关不得读写其滚动 token。
+const ISOLATED_WX_GATEWAY = process.env.FARM_WX_GATEWAY === '1';
+const WX_LOGIN_DIR = path.join(getDataDir(), ISOLATED_WX_GATEWAY ? 'wx-gateway' : 'wx-login');
 const WX_APP_ID = 'wx5306c5978fdb76e4';
 
 // 延迟加载 store 模块避免循环依赖（与 network.js 同款实现）
@@ -36,8 +39,22 @@ function getStoreModule() {
 }
 
 const SOCK_PATH = process.env.FARM_GATEWAY_SOCK || '/tmp/qq-farm-gateway.sock';
+
+/** 隔离实例只托管微信2号；主网关重启后也不得重新抢占委托账号。 */
+function gatewayOwnsAccount(accountId, requireActive = true) {
+    const { readGatewayDelegation } = require('./gateway-routing');
+    const delegation = readGatewayDelegation();
+    if (ISOLATED_WX_GATEWAY) {
+        return SOCK_PATH === '/sock/qq-farm-wx.sock'
+            && String(accountId) === '2'
+            && !!delegation
+            && delegation.accountIds.includes('2')
+            && (!requireActive || delegation.phase === 'active');
+    }
+    return !delegation || String(accountId) !== '2';
+}
 const HEARTBEAT_TIMEOUT = 30000;
-const MAX_HEARTBEAT_MISS = 6; // 更宽容：连续 6 次心跳超时（约 3 分钟）才判死，避免误杀活连接
+const MAX_HEARTBEAT_MISS = 6; // 有界告警计数，绝不单凭 HB miss 判死
 const RECONNECT_ALERT_AFTER = 30; // 重连达此次数发一次告警（Code 可能失效），但仍持续重试不放弃
 const RECONNECT_BASE_DELAY_MS = 2000;
 const RECONNECT_MAX_DELAY_MS = 30000;
@@ -46,9 +63,9 @@ const CODE_INVALID_MAX = 6;
 // 【亚健康退避】连接亚健康（业务请求开始连续超时，但还没到判死阈值）时，通知 worker 暂停发业务请求、
 // 给心跳让路自愈。核心思路来自上游社区（health-backoff gate）：凌晨服务端一静默，请求会一个接一个
 // 挂十几十秒；若 worker 仍按固定间隔发农场/好友任务，pending 队列会被打满、连心跳都排不上，最终判死掉线。
-// 这里在 requestTimeoutStreak 达到判死阈值(DEAD_REQUEST_TIMEOUT_STREAK=5)之前，先送出 degraded 信号，
+// 业务超时先送出 degraded 信号；次数只控制退避，不作为判死时长，
 // 让 worker 主动退避、把连接留给心跳+ACE，从根上避免"假死→判死→重连被拒→崩溃停拉"的恶性链条。
-const HEALTH_DEGRADED_STREAK = 2;          // 业务请求连续 N 次超时视为"亚健康"（远低于判死的 5 次/150s）
+const HEALTH_DEGRADED_STREAK = 2;          // 已发送业务超时达到两次即通知退避
 const HEALTH_BACKOFF_BASE_MS = 30000;      // 亚健康退避基数（首次退避时长）
 const HEALTH_BACKOFF_MAX_MS = 180000;      // 亚健康退避上限（指数退避封顶 3 分钟）
 // QQ Code 失效防风暴策略：QQ code 可复用，存储/重连的短暂重试放宽至不断（且成功即清零，不误伤）；
@@ -69,21 +86,8 @@ const WX_REFRESH_TIMEOUT_MS = 30000;
 // worker 业务请求在网关侧的超时：假死时请求发到死连接永不回包，必须超时快速失败，
 // 否则 worker 侧 Promise 永久挂起，前端表现为"什么都加载不出来"
 const WORKER_REQUEST_TIMEOUT_MS = 30000;
-// 假死判死阈值（业务级，取代早期的心跳级误杀）：连续 N 次业务请求全部超时，才判定连接真死并主动重连。
-// 为何用"业务请求连续超时"而非"心跳超时"：
-//   - 心跳超时：服务器可能只是暂不回心跳包，业务请求仍能正常回包；早期 HEARTBEAT_DEAD_MISS 按心跳判死，
-//     会在网络抖动时误杀活连接、白白消耗一次性 Code，是账号无故掉线的根因（已移除）。
-//   - 业务请求连续超时：说明该连接已完全无法干活（土地/种子/商店/好友全部取不到数据，前端一片空白），
-//     继续保活毫无价值，此时重连是唯一出路，且不会比"永久假死"更差。
-// ⭐ 2026-10-31 由 5 提到 7（150s → 210s）。依据 72h 实测数据：
-//   - 假死重连 115 次（≈每天 38 次），其中第 1 次重连后仍需第 2 次的占 42/66 = 64%，
-//     **首次重连成功率只有 36%** —— 说明大量"假死"其实是服务端短时静默，连接本身没坏，
-//     重连反而白白消耗一次 Code（微信一次一码，QQ code 也被反复消耗）。
-//   - 心跳超时全部集中在 174.9s（6×25s+检测延迟，跨度仅 15ms），证明这是本地阈值判定，
-//     不是真实网络时长；真实抖动可能远短于判死阈值。
-//   - 210s 仍能保证"真死"的连接在 3.5 分钟内被发现，对农场收益无实质影响。
-// 连续 7 次 × 30s：单次网络抖动通常只影响 1~2 个请求，不会误触发。
-const DEAD_REQUEST_TIMEOUT_STREAK = 7;
+// 判死使用真实 210 秒静默窗口，不能把并发 RPC 的超时次数相乘当作时间。
+// 还须业务无响应、HB/ACE 未恢复且同一 WS 连接稳定；具体见 isTrulySilent。
 // 【假死重连风暴防护】判死后重连若仍不通（Code/loginBuffer 已失效：连得上但服务器不回业务包），
 // 会在约 150s 后再次判死并再次重连，若无上限即形成"每 2 分钟重连一次"的无限风暴
 // （实测 3 小时内单个账号触发 100 次）。gateway 是单进程 Node，风暴会拖垮事件循环，
@@ -197,6 +201,10 @@ function logAce(level, message) {
 
 // accountId -> Conn
 const accounts = new Map();
+let gatewayShuttingDown = false;
+let gatewayShutdownFlight = null;
+const shutdownWrites = new Set();
+let finishShutdownDrain = null;
 
 function getAccount(accountId) { return accounts.get(String(accountId)); }
 
@@ -236,7 +244,7 @@ function createConn(accountId) {
         connectedAt: 0,
         // 是否已成功登录过：QQ 一次性 Code 登录即用即废，置位后断链重连不能再拿同一 Code 冲服务器（否则被顶号）
         loggedInOnce: false,
-        lastHeartbeatResponse: Date.now(),
+        lastHeartbeatResponse: 0,
         heartbeatMissCount: 0,
         heartbeatTimer: null,
         workerSock: null,
@@ -245,84 +253,419 @@ function createConn(accountId) {
         // 累计达阈值即停止自动重连并告警，避免无限 1006 刷屏把日志打爆
         wxCodeFailCount: 0,
         wxBufferAlerted: false,
+        // 票据陈旧需扫码告警：只发一次，登录成功/新扫码后复位，避免每轮重试都刷屏。
+        wxRescanAlerted: false,
         // ⭐ 2026-11-01 排查补充：以下三个字段由 10-31 的改动引入，必须在此显式初始化。
         // 缺省会依赖 `undefined || 0` 的隐式兜底，一旦某处写成 `account.x += 1` 就变 NaN 且永久污染。
         // wxTempFailCount：临时性换码失败计数（40188/超时/网络），与 wxCodeFailCount 分开，
         //   避免网络抖动被误判成"凭证失效、必须扫码"。
         wxTempFailCount: 0,
+        wxRetryAfter: 0,
         // wxLastCodeError：最近一次换码失败原因，供 classifyWxCodeError 判定临时/永久。
         wxLastCodeError: '',
         // connectingAt：建连闸门时间戳。>0 且距今 <5s 时拒绝重复 connect，
         //   防止同一账号并发建连产生"孤儿 socket"（服务器侧同 code 多连接 → 顶号/1006）。
         connectingAt: 0,
+        connectionEpoch: 0,
+        wxConnectFlight: null,
+        wxConnectController: null,
+        wxIssueFlight: null,
+        wxCredentialGeneration: '',
+        loginPromise: null,
+        finishLogin: null,
+        lastGameResponseAt: 0,
+        connectionDead: false,
+        sendQueue: [],
+        operations: new Set(),
+        criticalFlights: new Map(),
+        sendDraining: false,
+        requestTimeoutStreak: 0,
+        businessNoResponseSince: 0,
+        lastInboundAt: 0,
+        lastBusinessReplyAt: 0,
+        lastBusinessSuccessAt: 0,
+        lastAceResponseAt: 0,
+        healthBackoffTimer: null,
+        healthBackoffUntil: 0,
+        healthEpoch: 0,
+        deadConfirmTimer: null,
+        deadReconnectTimer: null,
+        reconnectTimer: null,
+        reconnectGeneration: 0,
+        workerSession: 0,
+        workerSocketSerial: 0,
     };
 }
 
 // ============ 编码与发送 ============
-async function encodeMsg(account, service, method, bodyBytes, clientSeqValue) {
-    cryptoWasm.setRuntime(account.tsdkRuntime);
+const BUSINESS_REQUEST_LIMIT = 32;
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+const DEAD_SILENCE_MS = 210000;
+const MAX_REQUEST_TIMEOUT_MS = 60000;
+const WRITE_SETTLEMENT_TIMEOUT_MS = 120000;
+
+function boundedRequestTimeoutMs(value) {
+    return typeof value === 'number' && Number.isFinite(value)
+        ? Math.min(MAX_REQUEST_TIMEOUT_MS, Math.max(1, Math.floor(value))) : WORKER_REQUEST_TIMEOUT_MS;
+}
+
+function armOperationTimeout(account, op, at) {
+    clearTimeout(op.timer);
+    const timer = setTimeout(() => {
+        if (op.timer !== timer || op.done) return;
+        const current = operationCurrent(account, op);
+        finishOperation(account, op, requestError('网关请求超时', 'REQUEST_TIMEOUT', op));
+        if (current && op.sent && op.kind === 'business') noteBusinessTimeout(account, op.sentAt);
+    }, Math.max(1, at - Date.now()));
+    op.timer = timer;
+}
+
+function requestKind(service, method) {
+    if (service === 'gamepb.userpb.UserService' && method === 'Heartbeat') return 'heartbeat';
+    if (service === 'gamepb.acepb.AceService' && method === 'AntiData') return 'ace';
+    if (service === 'gamepb.userpb.UserService' && method === 'Login') return 'login';
+    return 'business';
+}
+
+function operationCurrent(account, op) {
+    return !op.done && !account.networkStopped && account.ws === op.socket
+        && account.tsdkRuntime === op.runtime && account.connectionEpoch === op.epoch
+        && op.socket && op.socket.readyState === op.socket.OPEN;
+}
+
+function requestError(message, code, op) {
+    const outcomeUnknown = !!op?.sent && !op.read;
+    return Object.assign(new Error(message), {
+        code, errorCode: code, stage: op?.sent ? 'response' : 'queue_or_encoding',
+        sent: !!op?.sent, outcomeUnknown, retryable: false,
+        resultState: !op?.sent ? 'not_sent' : outcomeUnknown ? 'unknown' : 'failed',
+        connectionEpoch: op?.epoch,
+    });
+}
+
+function respondOperationError(account, op, error) {
+    if (op.waiterDetached) return;
+    const cb = op.callback;
+    if (cb.reject) cb.reject(error);
+    else if (cb.workerSock && cb.workerSeq != null) sendFrame(cb.workerSock, {
+        t: 'response', accountId: account.accountId, seq: cb.workerSeq,
+        error: error.message, body: '', meta: {
+            errorCode: error.code, stage: error.stage, sent: error.sent,
+            outcomeUnknown: error.outcomeUnknown, retryable: false, resultState: error.resultState,
+            timeoutMs: op.timeoutMs, settlementTimeoutMs: op.settlementTimeoutMs || 0,
+            sentAt: op.sentAt || 0,
+            ...(error.retryAfterMs != null ? { retryAfterMs: error.retryAfterMs } : {}),
+            ...(error.serverSeq != null ? { serverSeq: error.serverSeq } : {}),
+            ...(error.service ? { service: error.service, method: error.method } : {}),
+        },
+    }, op.epoch);
+}
+
+function finishOperation(account, op, error) {
+    if (op.done) return;
+    op.done = true;
+    clearTimeout(op.timer);
+    account.operations.delete(op);
+    account.sendQueue = account.sendQueue.filter(value => value !== op);
+    if (account.pendingCallbacks.get(op.seq) === op.callback) account.pendingCallbacks.delete(op.seq);
+    if (account.criticalFlights.get(op.kind) === op) account.criticalFlights.delete(op.kind);
+    op.cancelEncoding();
+    op.finishSend(op.sent ? op.seq : -1);
+    try {
+        if (error) respondOperationError(account, op, error);
+    } finally {
+        if (shutdownWrites.delete(op) && shutdownWrites.size === 0 && finishShutdownDrain) finishShutdownDrain();
+    }
+}
+
+function rejectBusinessDuringBackoff(account, op) {
+    if (op.sent) return false;
+    if (gatewayShuttingDown) {
+        finishOperation(account, op, requestError('网关正在排空关闭，未发送请求已取消', 'GATEWAY_SHUTTING_DOWN', op));
+        return true;
+    }
+    if (op.kind !== 'business' || Date.now() >= account.healthBackoffUntil) return false;
+    const error = requestError('网关业务健康退避中', 'HEALTH_BACKOFF', op);
+    error.retryAfterMs = account.healthBackoffUntil - Date.now();
+    finishOperation(account, op, error);
+    return true;
+}
+
+function cancelWorkerOperation(account, sock, frame) {
+    const op = Array.from(account.operations).find(value => value.callback.workerSock === sock
+        && value.callback.workerSeq === frame.seq && value.epoch === account.connectionEpoch);
+    if (!op || op.done || op.waiterDetached) return;
+    if (!op.sent) {
+        finishOperation(account, op, requestError('尚未发送的网关请求已取消', 'REQUEST_CANCELLED', op));
+    } else if (isSafeReadRequest(op.service, op.method)) {
+        // 已发只读仅解绑等待者；保留实际在途席位和原 deadline，防 cancel 被用来突破上限。
+        respondOperationError(account, op, requestError('只读请求等待已取消', 'REQUEST_CANCELLED', op));
+        op.waiterDetached = true;
+    }
+}
+
+async function encodeMsg(account, service, method, bodyBytes, clientSeqValue, op) {
     let finalBody = bodyBytes || Buffer.alloc(0);
-    if (finalBody.length > 0) finalBody = await cryptoWasm.encryptBuffer(finalBody);
-    const gatewayToken = account.initialGamePackInfo || createGatewayToken();
-    account.initialGamePackInfo = '';
+    if (finalBody.length > 0) finalBody = await cryptoWasm.encryptBuffer(finalBody, op.runtime,
+        () => operationCurrent(account, op) && Date.now() < op.deadline);
+    if (Date.now() >= op.deadline) throw requestError('网关请求超时', 'REQUEST_TIMEOUT', op);
+    if (!operationCurrent(account, op)) throw requestError('连接世代已变更，请求已取消', 'STALE_CONNECTION', op);
     const msg = types.GateMessage.create({
         meta: {
-            service_name: service,
-            method_name: method,
-            message_type: 1,
-            client_seq: toLong(clientSeqValue),
-            server_seq: toLong(account.serverSeq),
+            service_name: service, method_name: method, message_type: 1,
+            client_seq: toLong(clientSeqValue), server_seq: toLong(account.serverSeq),
         },
         body: finalBody,
-        auth_token: gatewayToken,
+        auth_token: account.initialGamePackInfo || createGatewayToken(),
     });
     return types.GateMessage.encode(msg).finish();
 }
 
-// callback 为对象：可含 { workerSeq, workerSock, isLogin, onLoginSuccess, isHeartbeat, resolve, reject, timer }
-async function sendMsg(account, service, method, bodyBytes, callback) {
-    if (!account.ws || account.ws.readyState !== account.ws.OPEN) {
-        if (callback && callback.reject) { try { clearTimeout(callback.timer); } catch { } callback.reject(new Error('WebSocket 未连接')); }
-        return -1;
-    }
-    const seq = account.clientSeq + 1;
-    account.clientSeq = seq;
-    if (callback) account.pendingCallbacks.set(seq, callback);
+async function drainSendQueue(account) {
+    if (account.sendDraining) return;
+    account.sendDraining = true;
     try {
-        const encoded = await encodeMsg(account, service, method, bodyBytes, seq);
-        account.ws.send(encoded);
-        return seq;
-    } catch (err) {
-        if (callback) { account.pendingCallbacks.delete(seq); if (callback.reject) { try { clearTimeout(callback.timer); } catch { } callback.reject(err); } }
-        return -1;
+        while (account.sendQueue.length) {
+            const criticalIndex = account.sendQueue.findIndex(op => op.kind !== 'business');
+            const [op] = account.sendQueue.splice(criticalIndex < 0 ? 0 : criticalIndex, 1);
+            if (op.done) continue;
+            try {
+                if (!operationCurrent(account, op)) throw requestError('WebSocket 未连接或世代已变更', 'STALE_CONNECTION', op);
+                if (rejectBusinessDuringBackoff(account, op)) continue;
+                op.seq = ++account.clientSeq;
+                const encoded = await Promise.race([
+                    encodeMsg(account, op.service, op.method, op.body, op.seq, op),
+                    op.encodingCancelled,
+                ]);
+                if (op.done) continue;
+                if (Date.now() >= op.deadline) throw requestError('网关请求超时', 'REQUEST_TIMEOUT', op);
+                if (!operationCurrent(account, op)) throw requestError('连接世代已变更，请求已取消', 'STALE_CONNECTION', op);
+                if (rejectBusinessDuringBackoff(account, op)) continue;
+                // 串行只覆盖编码至实际 send，绝不等待游戏回复；超时后的写入绝不重放。
+                account.pendingCallbacks.set(op.seq, op.callback);
+                op.sent = true;
+                op.sentAt = Date.now();
+                // 排队期限只约束尚未 wire；发送后读/critical 重新计时，业务写固定保留真实结算窗口。
+                op.settlementTimeoutMs = op.kind === 'business' && !op.read
+                    ? WRITE_SETTLEMENT_TIMEOUT_MS : op.timeoutMs;
+                op.deadline = op.sentAt + op.settlementTimeoutMs;
+                armOperationTimeout(account, op, op.deadline);
+                op.socket.send(encoded);
+                account.initialGamePackInfo = '';
+                op.finishSend(op.seq);
+                if (op.callback.workerSock && op.callback.workerSeq != null) {
+                    try {
+                        sendFrame(op.callback.workerSock, {
+                            t: 'request_sent', accountId: account.accountId, seq: op.callback.workerSeq,
+                            sentAt: op.sentAt, settlementDeadline: op.deadline, readOnly: op.read,
+                        }, op.epoch);
+                    } catch {
+                        // IPC确认丢失不能取消已发游戏写；仍保留原结算timer与席位。
+                        logWarn('gateway', `account ${account.accountId} epoch=${op.epoch} 发送确认回传失败，保留游戏请求结算`);
+                    }
+                }
+            } catch (error) {
+                finishOperation(account, op, requestError(error.message, error.code || 'SEND_FAILED', op));
+            }
+        }
+    } finally {
+        account.sendDraining = false;
     }
+}
+
+function sendMsg(account, service, method, bodyBytes, callback = {}) {
+    const kind = requestKind(service, method);
+    const op = {
+        service, method, body: bodyBytes || Buffer.alloc(0), callback, kind,
+        socket: account.ws, runtime: account.tsdkRuntime, epoch: account.connectionEpoch,
+        startedAt: Date.now(), sent: false, done: false, read: isSafeReadRequest(service, method),
+    };
+    op.timeoutMs = boundedRequestTimeoutMs(callback.timeoutMs);
+    op.queueDeadline = Math.min(op.startedAt + op.timeoutMs,
+        typeof callback.deadline === 'number' && Number.isFinite(callback.deadline) ? callback.deadline : Infinity);
+    op.deadline = op.queueDeadline;
+    callback.operation = op;
+    clearTimeout(callback.timer);
+    const sent = new Promise(resolve => { op.finishSend = resolve; });
+    op.encodingCancelled = new Promise(resolve => { op.cancelEncoding = () => resolve(null); });
+    const businessCount = Array.from(account.operations).filter(value => value.kind === 'business').length;
+    if (!operationCurrent(account, op)) {
+        finishOperation(account, op, requestError('WebSocket 未连接', 'DISCONNECTED', op));
+    } else if (Date.now() >= op.queueDeadline) {
+        finishOperation(account, op, requestError('网关请求等待期限已到', 'REQUEST_TIMEOUT', op));
+    } else if (rejectBusinessDuringBackoff(account, op)) {
+        return sent;
+    } else if (op.body.length > MAX_REQUEST_BODY_BYTES || (kind === 'business' && businessCount >= BUSINESS_REQUEST_LIMIT)
+        || (kind !== 'business' && account.criticalFlights.has(kind))) {
+        finishOperation(account, op, requestError('网关队列已满或关键请求正在执行', 'QUEUE_FULL', op));
+    } else {
+        account.operations.add(op);
+        if (kind !== 'business') account.criticalFlights.set(kind, op);
+        armOperationTimeout(account, op, op.queueDeadline);
+        account.sendQueue.push(op);
+        void drainSendQueue(account);
+    }
+    return sent;
 }
 
 function gatewaySendRequest(account, service, method, bodyBytes, timeout = 20000) {
     return new Promise((resolve, reject) => {
-        const cb = {
-            resolve,
-            reject,
-            timer: setTimeout(() => {
-                account.pendingCallbacks.forEach((v, k) => { if (v === cb) account.pendingCallbacks.delete(k); });
-                reject(new Error('网关请求超时'));
-            }, timeout),
-        };
-        sendMsg(account, service, method, bodyBytes, cb).then((seq) => {
-            if (seq < 0) { try { clearTimeout(cb.timer); } catch { } reject(new Error('WebSocket 未连接')); }
-        });
+        void sendMsg(account, service, method, bodyBytes, { resolve, reject, timeoutMs: timeout });
     });
 }
 
-// 清空待回调队列：对带 reject 的回调先拒绝再清，避免假死/重连时请求永久挂起
 function rejectAllPending(account, reason) {
-    account.pendingCallbacks.forEach((cb) => {
-        if (cb && typeof cb.reject === 'function') {
-            try { clearTimeout(cb.timer); } catch { }
-            try { cb.reject(new Error(reason)); } catch { }
-        }
-    });
+    for (const op of Array.from(account.operations)) {
+        finishOperation(account, op, requestError(reason, 'REQUEST_CANCELLED', op));
+    }
     account.pendingCallbacks.clear();
+}
+
+function cancelReconnectTimers(account) {
+    account.reconnectGeneration += 1;
+    for (const name of ['reconnectTimer', 'deadReconnectTimer']) {
+        clearTimeout(account[name]);
+        account[name] = null;
+    }
+}
+
+function clearHealthTimers(account) {
+    account.healthEpoch += 1;
+    clearTimeout(account.healthBackoffTimer);
+    clearTimeout(account.deadConfirmTimer);
+    account.healthBackoffTimer = null;
+    account.deadConfirmTimer = null;
+    account.healthBackoffChanging = false;
+    account.healthBackoffUntil = 0;
+    account.connectionDead = false;
+}
+
+function isTrulySilent(account) {
+    const now = Date.now();
+    const inbound = account.lastInboundAt || account.connectedAt;
+    return !account.networkStopped && !!account.userState.gid && account.ws?.readyState === 1
+        && account.businessNoResponseSince > 0 && now - account.businessNoResponseSince >= DEAD_SILENCE_MS
+        && now - inbound >= DEAD_SILENCE_MS && now - account.connectedAt >= DEAD_SILENCE_MS
+        && (!account.lastHeartbeatResponse || now - account.lastHeartbeatResponse >= DEAD_SILENCE_MS)
+        && (!account.lastAceResponseAt || now - account.lastAceResponseAt >= DEAD_SILENCE_MS);
+}
+
+function armDeadConfirmation(account) {
+    if (gatewayShuttingDown || account.deadConfirmTimer || account.connectionDead || !account.businessNoResponseSince || account.networkStopped
+        || !account.userState.gid || account.ws?.readyState !== 1) return;
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
+    const healthEpoch = account.healthEpoch;
+    const due = Math.max(account.businessNoResponseSince, account.lastInboundAt || account.connectedAt,
+        account.connectedAt, account.lastHeartbeatResponse, account.lastAceResponseAt) + DEAD_SILENCE_MS;
+    const timer = setTimeout(() => {
+        if (account.deadConfirmTimer !== timer || account.ws !== socket || account.connectionEpoch !== epoch
+            || account.healthEpoch !== healthEpoch || account.networkStopped) return;
+        account.deadConfirmTimer = null;
+        if (isTrulySilent(account)) confirmDeadConnection(account);
+        else if (account.businessNoResponseSince && socket?.readyState === 1) armDeadConfirmation(account);
+    }, Math.max(1, due - Date.now()));
+    account.deadConfirmTimer = timer;
+}
+
+function confirmDeadConnection(account) {
+    if (account.connectionDead || !isTrulySilent(account)) return;
+    account.connectionDead = true;
+    account.deadReconnectCount = Math.min(getDeadReconnectMax(account) + 1, account.deadReconnectCount + 1);
+    logWarn('gateway', `account ${account.accountId} epoch=${account.connectionEpoch} 真实静默判死：入站静默 ${Math.floor((Date.now() - (account.lastInboundAt || account.connectedAt)) / 1000)}s，业务无响应 ${Math.floor((Date.now() - account.businessNoResponseSince) / 1000)}s，判死恢复第 ${account.deadReconnectCount} 次`);
+    emitEvent(account, 'connection_dead', {
+        timeoutStreak: account.requestTimeoutStreak, deadReconnectCount: account.deadReconnectCount,
+        lastInboundAt: account.lastInboundAt, businessNoResponseSince: account.businessNoResponseSince,
+        silenceMs: Date.now() - (account.lastInboundAt || account.connectedAt),
+    });
+    cancelReconnectTimers(account);
+    if (account.deadReconnectCount > getDeadReconnectMax(account)) {
+        account.deadReconnectAlerted = true;
+        emitEvent(account, 'dead_reconnect_exhausted', { deadReconnectCount: account.deadReconnectCount });
+        stopNetwork(account, '真实静默重连预算已耗尽');
+        return;
+    }
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
+    const generation = account.reconnectGeneration;
+    const timer = setTimeout(() => {
+        if (account.deadReconnectTimer !== timer || account.reconnectGeneration !== generation
+            || account.ws !== socket || account.connectionEpoch !== epoch || !account.connectionDead
+            || !isTrulySilent(account)) return;
+        account.deadReconnectTimer = null;
+        reconnect(account, null).catch(error => logWarn('gateway', `account ${account.accountId} 静默恢复失败: ${error.message}`));
+    }, getDeadReconnectBackoffMs(account, account.deadReconnectCount));
+    account.deadReconnectTimer = timer;
+}
+
+function noteBusinessTimeout(account, sentAt) {
+    if (gatewayShuttingDown) return;
+    account.requestTimeoutStreak = Math.min(BUSINESS_REQUEST_LIMIT, account.requestTimeoutStreak + 1);
+    account.businessNoResponseSince = account.businessNoResponseSince || Math.max(sentAt, account.lastBusinessReplyAt);
+    if (account.requestTimeoutStreak >= HEALTH_DEGRADED_STREAK && !account.healthBackoffChanging) {
+        account.healthBackoffChanging = true;
+        const backoffMs = Math.min(HEALTH_BACKOFF_BASE_MS * (2 ** Math.min(16, account.degradedStreak)), HEALTH_BACKOFF_MAX_MS);
+        account.degradedStreak = Math.min(16, account.degradedStreak + 1);
+        account.healthBackoffUntil = Date.now() + backoffMs;
+        for (const op of Array.from(account.operations)) rejectBusinessDuringBackoff(account, op);
+        const socket = account.ws;
+        const epoch = account.connectionEpoch;
+        const healthEpoch = account.healthEpoch;
+        const timer = setTimeout(() => {
+            if (account.healthBackoffTimer !== timer || account.ws !== socket || account.connectionEpoch !== epoch
+                || account.healthEpoch !== healthEpoch) return;
+            account.healthBackoffTimer = null;
+            account.healthBackoffChanging = false;
+            account.healthBackoffUntil = 0;
+        }, backoffMs);
+        account.healthBackoffTimer = timer;
+        logWarn('gateway', `account ${account.accountId} epoch=${account.connectionEpoch} 业务亚健康：真实入站静默 ${Math.floor((Date.now() - (account.lastInboundAt || account.connectedAt)) / 1000)}s，业务无响应 ${Math.floor((Date.now() - account.businessNoResponseSince) / 1000)}s，超时计数 ${account.requestTimeoutStreak}，退避 ${Math.floor(backoffMs / 1000)}s（次数不作判死时长）`);
+        emitEvent(account, 'connection_degraded', { backoffMs, degradedStreak: account.degradedStreak });
+    }
+    armDeadConfirmation(account);
+}
+
+function noteInbound(account, meta, cb) {
+    const now = Date.now();
+    const inboundSilenceSeconds = Math.floor((now - (account.lastInboundAt || account.connectedAt)) / 1000);
+    const businessSilenceSeconds = account.businessNoResponseSince ? Math.floor((now - account.businessNoResponseSince) / 1000) : 0;
+    account.lastInboundAt = now;
+    account.serverSeq = Math.max(account.serverSeq, toNum(meta.server_seq) || 0);
+    const wasDead = account.connectionDead || !!account.deadReconnectTimer;
+    const wasBusinessDegraded = wasDead || account.requestTimeoutStreak > 0 || account.degradedStreak > 0
+        || account.healthBackoffChanging || account.businessNoResponseSince > 0;
+    if (wasDead) {
+        cancelReconnectTimers(account);
+        account.connectionDead = false;
+        log('gateway', `account ${account.accountId} epoch=${account.connectionEpoch} 链路入站恢复：此前静默 ${inboundSilenceSeconds}s，已取消静默重连，业务健康尚未确认`);
+        emitEvent(account, 'connection_recovered', { linkRecovered: true, businessHealthy: false });
+    }
+    if (cb?.operation?.kind === 'heartbeat' && !toNum(meta.error_code)) {
+        account.lastHeartbeatResponse = now;
+        account.heartbeatMissCount = 0;
+        account.heartbeatWarned = false;
+    }
+    if (cb?.operation?.kind === 'ace' && !toNum(meta.error_code)) account.lastAceResponseAt = now;
+    if (cb?.operation?.kind === 'business') {
+        account.lastBusinessReplyAt = now;
+        // 错误证明此刻链路有回包，但既有无响应观察不能丢失，否则退避后再无 RPC 会永久僵死。
+        account.businessNoResponseSince = toNum(meta.error_code)
+            && (account.businessNoResponseSince || account.requestTimeoutStreak) ? now : 0;
+        if (!toNum(meta.error_code)) {
+            account.lastBusinessSuccessAt = now;
+            account.lastGameResponseAt = now;
+            account.requestTimeoutStreak = 0;
+            clearHealthTimers(account);
+            account.degradedStreak = 0;
+            if (wasBusinessDegraded) {
+                log('gateway', `account ${account.accountId} epoch=${account.connectionEpoch} 业务回复恢复：此前无响应 ${businessSilenceSeconds}s，解除业务退避`);
+                emitEvent(account, 'connection_recovered', { linkRecovered: true, businessHealthy: true });
+            }
+        }
+    }
+    clearTimeout(account.deadConfirmTimer);
+    account.deadConfirmTimer = null;
+    armDeadConfirmation(account);
 }
 
 // ============ 安全运行时 / ACE ============
@@ -330,6 +673,7 @@ function createTsdkRuntime(accountId, deviceProtocol) {
     const customDevice = deviceProtocol && deviceProtocol.enabled ? deviceProtocol : null;
     return new TsdkRuntime({
         accountId: String(accountId),
+        ...(ISOLATED_WX_GATEWAY ? { dataDir: path.join(WX_LOGIN_DIR, 'tsdk', String(accountId)) } : {}),
         gameId: CONFIG.tsdkGameId,
         appKey: CONFIG.tsdkAppKey,
         deviceInfo: {
@@ -340,37 +684,51 @@ function createTsdkRuntime(accountId, deviceProtocol) {
             imei: customDevice && customDevice.imei,
             platform: CONFIG.os,
         },
-        logger: logAce,
+        logger: (level, message) => logAce(level, `account ${accountId} ${message}`),
     });
 }
 
 async function startSecurityRuntime(account, deviceProtocol) {
     stopSecurityRuntime(account, '重新初始化');
     if (!CONFIG.tsdkAceEnabled) throw new Error('TSDK/ACE 已通过 FARM_TSDK_ACE_ENABLED=false 关闭');
-    account.tsdkRuntime = createTsdkRuntime(account.accountId, deviceProtocol);
+    const runtime = createTsdkRuntime(account.accountId, deviceProtocol);
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
+    account.tsdkRuntime = runtime;
     account.initialGamePackInfo = '';
-    cryptoWasm.setRuntime(account.tsdkRuntime);
-    await account.tsdkRuntime.init();
+    await runtime.init();
+    if (account.tsdkRuntime !== runtime || account.ws !== socket || account.connectionEpoch !== epoch || account.networkStopped) {
+        runtime.destroy();
+        throw new Error('安全运行时所属连接已失效');
+    }
 }
 
 function startAceService(account) {
     if (!account.tsdkRuntime || !account.tsdkRuntime.ready) return;
     try {
         if (account.aceService) account.aceService.stop('重新启动');
+        const runtime = account.tsdkRuntime;
+        const socket = account.ws;
+        const epoch = account.connectionEpoch;
+        const current = () => account.tsdkRuntime === runtime && account.ws === socket
+            && account.connectionEpoch === epoch && !account.networkStopped && socket?.readyState === 1;
         account.aceService = new AceService({
-            runtime: account.tsdkRuntime,
-            sendRequest: (svc, method, body, timeout) => gatewaySendRequest(account, svc, method, body, timeout),
-            isConnected: () => !!(account.ws && account.ws.readyState === account.ws.OPEN),
+            runtime,
+            sendRequest: (svc, method, body, timeout) => current()
+                ? gatewaySendRequest(account, svc, method, body, timeout)
+                : Promise.reject(new Error('ACE 所属连接已失效')),
+            isConnected: current,
             types,
-            logger: logAce,
+            logger: (level, message) => logAce(level, `account ${account.accountId} ${message}`),
         });
         account.aceService.start();
     } catch (e) {
-        logWarn('ACE', `启动失败: ${e.message}`);
+        logWarn('ACE', `account ${account.accountId} 启动失败: ${e.message}`);
     }
 }
 
 function stopSecurityRuntime(account, reason) {
+    rejectAllPending(account, reason || '安全运行时已停止');
     try { if (account.aceService) account.aceService.stop(reason); } catch { }
     try { if (account.tsdkRuntime) account.tsdkRuntime.destroy(); } catch { }
     account.aceService = null;
@@ -405,25 +763,25 @@ function buildLoginDeviceInfo(deviceProtocol) {
 }
 
 function decodeLoginReply(account, decryptedBody) {
-    try {
-        const reply = types.LoginReply.decode(decryptedBody);
-        if (reply.basic) {
-            const b = reply.basic;
-            account.userState.gid = toNum(b.gid);
-            account.userState.name = String(b.name || '');
-            account.userState.level = toNum(b.level);
-            account.userState.gold = toNum(b.gold);
-            account.userState.exp = toNum(b.exp);
-            account.userState.openId = String(b.open_id || '');
-            account.userState.avatar = String(b.avatar_url || '');
-            if (account.tsdkRuntime && account.userState.openId) {
-                account.tsdkRuntime.bindUser(account.userState.openId);
-                account.initialGamePackInfo = account.tsdkRuntime.getEncryptedInitInfo();
-            }
-        }
-    } catch (e) {
-        logWarn('gateway', `登录解码失败: ${e.message}`);
+    const reply = types.LoginReply.decode(decryptedBody);
+    const b = reply && reply.basic;
+    const gid = b && toNum(b.gid);
+    if (!Number.isSafeInteger(gid) || gid <= 0) {
+        throw new Error('登录回复缺少有效 GID，未建立游戏会话');
     }
+    // 只接受本次成功回复的身份，不能借用上一条连接残留的 gid。
+    account.userState.gid = gid;
+    account.userState.name = String(b.name || '');
+    account.userState.level = toNum(b.level);
+    account.userState.gold = toNum(b.gold);
+    account.userState.exp = toNum(b.exp);
+    account.userState.openId = String(b.open_id || '');
+    account.userState.avatar = String(b.avatar_url || '');
+    if (account.tsdkRuntime && account.userState.openId) {
+        account.tsdkRuntime.bindUser(account.userState.openId);
+        account.initialGamePackInfo = account.tsdkRuntime.getEncryptedInitInfo();
+    }
+    return true;
 }
 
 async function sendLogin(account, onLoginSuccess) {
@@ -438,7 +796,15 @@ async function sendLogin(account, onLoginSuccess) {
             minigame_channel: 'other', minigame_platid: 2, req_id: '', trackid: '',
         },
     })).finish();
-    await sendMsg(account, 'gamepb.userpb.UserService', 'Login', body, { isLogin: true, onLoginSuccess });
+    await new Promise((resolve, reject) => {
+        const cb = {
+            isLogin: true,
+            reject,
+            onLoginSuccess() { onLoginSuccess(); resolve(true); },
+            timeoutMs: WORKER_REQUEST_TIMEOUT_MS,
+        };
+        sendMsg(account, 'gamepb.userpb.UserService', 'Login', body, cb).catch(reject);
+    });
 }
 
 // ============ WebSocket ============
@@ -454,7 +820,9 @@ function buildWebSocketHeaders(deviceProtocol) {
 }
 
 function connect(account, code) {
-    account.networkStopped = false;
+    if (!gatewayOwnsAccount(account.accountId)) return;
+    if (account.networkStopped || gatewayShuttingDown) return false;
+    if (account.ws && (account.ws.readyState === 0 || account.ws.readyState === 1)) return false;
     if (code) account.savedCode = code;
     if (!account.savedCode) {
         logWarn('gateway', `account ${account.accountId} 无有效 code，跳过建连（需重新抓包）`);
@@ -475,18 +843,21 @@ function connect(account, code) {
     // 正确语义：**只有在"上一次建连的 socket 仍然活着"时才需要拦截**。
     // 若 account.ws 已为 null / 已 CLOSED，说明上次建连已经结束（无论成功或失败），
     // 此时的 connect 是合法的新尝试，必须放行。
-    const now = Date.now();
-    const prevWsAlive = !!(account.ws && account.ws.readyState === account.ws.OPEN);
-    if (prevWsAlive && account.connectingAt && now - account.connectingAt < 5000) {
-        logWarn('gateway', `account ${account.accountId} 建连进行中(${now - account.connectingAt}ms)且旧连接仍活，跳过重复 connect，避免孤儿 socket 顶号`);
-        return;
-    }
-    account.connectingAt = now;
+    account.connectingAt = Date.now();
     const plat = account.platform || CONFIG.platform;
     const url = `${CONFIG.serverUrl}?platform=${plat}&os=${CONFIG.os}&ver=${CONFIG.clientVersion}&code=${account.savedCode}&openID=`;
     closeCurrentWs(account, { terminate: true });
     // 记录本次建连时间：风控熔断据此判断会话是"短命被踢"还是"稳定健康"
+    account.connectionEpoch += 1;
     account.connectedAt = Date.now();
+    account.lastInboundAt = 0;
+    account.lastHeartbeatResponse = 0;
+    account.lastAceResponseAt = 0;
+    account.lastBusinessReplyAt = 0;
+    account.lastBusinessSuccessAt = 0;
+    account.lastGameResponseAt = 0;
+    account.businessNoResponseSince = 0;
+    account.requestTimeoutStreak = 0;
 
     let deviceProtocol = null;
     try {
@@ -497,22 +868,34 @@ function connect(account, code) {
     }
     account.deviceProtocol = deviceProtocol;
 
-    const socket = new WebSocket(url, { headers: buildWebSocketHeaders(deviceProtocol) });
+    const socket = new WebSocket(url, {
+        headers: buildWebSocketHeaders(deviceProtocol), handshakeTimeout: WORKER_REQUEST_TIMEOUT_MS,
+    });
     account.ws = socket;
     socket.binaryType = 'arraybuffer';
 
+    const epoch = account.connectionEpoch || 0;
+    account.loginPromise = new Promise(resolve => { account.finishLogin = resolve; });
     socket.on('open', async () => {
-        account.reconnectAttempts = 0;
+        if (account.ws !== socket || account.networkStopped || (account.connectionEpoch || 0) !== epoch) return;
         try {
             await startSecurityRuntime(account, deviceProtocol);
+            if (account.ws !== socket || account.networkStopped || (account.connectionEpoch || 0) !== epoch) return;
             await sendLogin(account, () => onAccountLogin(account));
         } catch (error) {
-            logWarn('gateway', `account ${account.accountId} 安全运行时启动失败: ${error.message}`);
+            if (account.ws !== socket || account.connectionEpoch !== epoch) return;
+            logWarn('gateway', `account ${account.accountId} 游戏登录失败: ${error.message}`);
+            emitEvent(account, 'login_error', { message: error.message, code: error.code ?? null });
             closeCurrentWs(account, { terminate: true });
+            stopSecurityRuntime(account, '登录失败');
+            rejectAllPending(account, '游戏登录失败');
+            account.userState.gid = 0;
+            if (account.platform === 'wx') handleWxCodeFailure(account, error);
+            else scheduleReconnect(account, 'login_failed');
         }
     });
     socket.on('message', (data) => {
-        handleMessage(account, Buffer.isBuffer(data) ? data : Buffer.from(data));
+        if (account.ws === socket && account.connectionEpoch === epoch) handleMessage(account, Buffer.isBuffer(data) ? data : Buffer.from(data), socket, epoch);
     });
     socket.on('close', (code) => {
         // 只处理"当前连接"的关闭：reconnect 时旧 ws 会被异步关闭，其延迟 close 事件到达时
@@ -521,6 +904,14 @@ function connect(account, code) {
         if (isCurrent) account.ws = null;
         logWarn('gateway', `account ${account.accountId} 连接关闭 (code=${code})${isCurrent ? '' : ' [旧连接延迟关闭，忽略]'}`);
         if (isCurrent) {
+            account.connectionEpoch += 1;
+            clearHealthTimers(account);
+            cancelReconnectTimers(account);
+            if (account.finishLogin) { account.finishLogin(false); account.finishLogin = null; }
+            stopSecurityRuntime(account, '连接已关闭');
+            rejectAllPending(account, '游戏连接已关闭');
+            if (account.heartbeatTimer) { clearInterval(account.heartbeatTimer); account.heartbeatTimer = null; }
+            account.userState.gid = 0;
             // 1006 表示 Code 被拒（一次性 Code 已失效）；计数用于在连续失败后停止重连，避免重复登录顶下线
             // 【风控视角】1006 更常见的成因是腾讯风控拒连/封禁，而非网络抖动 —— 越重连封得越久。
             if (Number(code) === 1006) {
@@ -538,16 +929,15 @@ function connect(account, code) {
                 }
                 // 计入全局 1006 窗口统计（跨账号），达到阈值触发全局暂停
                 noteGlobal1006();
-                // 微信：1006 几乎必然是 loginBuffer 过期被服务器拒绝（ManualAuth rejected）。
-                // issueCode 只是本地编码、永不抛错，快路径无法感知过期，会反复用废 buffer 生成 code → 永久 1006。
-                // 这里显式置位，让下次重连的 issueWxCodeFromBuffer 跳过快路径、直接走 refreshtoken 续期。
-                if (account.platform === 'wx') account.wxNeedsRefresh = true;
+                // 1006 只表示游戏 WebSocket 非正常断开，不能推断 OAuth 或原生票据过期。
+                // 微信恢复先复用已认证原生会话，授权刷新只由其自身期限/明确票据拒绝触发。
             }
-            emitEvent(account, 'disconnect', { code });
+            emitEvent(account, 'disconnect', { code }, epoch);
             scheduleReconnect(account, `close:${code}`);
         }
     });
     socket.on('error', (err) => {
+        if (account.ws !== socket || account.connectionEpoch !== epoch) return;
         const message = err && err.message ? String(err.message) : '';
         const match = message.match(/Unexpected server response:\s*(\d+)/i);
         if (match) {
@@ -559,6 +949,12 @@ function connect(account, code) {
 
 function closeCurrentWs(account, { terminate = false } = {}) {
     const current = account.ws;
+    account.connectionEpoch += 1;
+    clearHealthTimers(account);
+    cancelReconnectTimers(account);
+    rejectAllPending(account, '连接已重置');
+    if (account.finishLogin) { account.finishLogin(false); account.finishLogin = null; }
+    if (account.heartbeatTimer) { clearInterval(account.heartbeatTimer); account.heartbeatTimer = null; }
     if (!current) return;
     account.ws = null;
     try { current.removeAllListeners(); } catch { }
@@ -569,69 +965,65 @@ function closeCurrentWs(account, { terminate = false } = {}) {
 }
 
 // ============ 消息处理 ============
-function handleMessage(account, buffer) {
+function handleMessage(account, buffer, socket = account.ws, epoch = account.connectionEpoch) {
+    if (socket !== account.ws || epoch !== account.connectionEpoch || account.networkStopped) return;
     try {
-        cryptoWasm.setRuntime(account.tsdkRuntime);
         const gateMessage = types.GateMessage.decode(buffer);
         const meta = gateMessage.meta || {};
-        const msgType = meta.message_type;
+        const msgType = toNum(meta.message_type);
+        if (msgType !== 2 && msgType !== 3) return;
         const body = gateMessage.body || Buffer.alloc(0);
-        // 注意：响应体为明文（network.js 从不 decrypt），直接透传 GateMessage.body
-
-        if (msgType === 2) {
-            const clientSeq = toNum(meta.client_seq);
-            const cb = account.pendingCallbacks.get(clientSeq);
-            if (cb) {
-                account.pendingCallbacks.delete(clientSeq);
-                // 收到任何回包 = 连接仍在工作，清空"业务请求连续超时"计数（假死判死依据）
-                account.requestTimeoutStreak = 0;
-                // 亚健康恢复：若之前发过 connection_degraded（健康退避），现在业务已恢复，
-                // 通知 worker 立刻解除退避，别白白静默满整个退避窗口
-                if (account.healthBackoffChanging) {
-                    account.healthBackoffChanging = false;
-                    account.degradedStreak = 0;
-                    emitEvent(account, 'connection_recovered', {});
-                    log('gateway', `account ${account.accountId} 亚健康已恢复，通知 worker 结束退避`);
-                }
-                // 收到回包 = 连接在干活。但**只有会话稳定存活足够久**才清零故障计数：
-                // 否则"连上→3 秒后 1006"的循环里每次登录成功都会清零，
-                // DEAD_RECONNECT_MAX 上限永远触发不了（2026-09-09 三账号封禁的直接教训）。
-                clearFaultsIfSessionStable(account);
-                account.serverSeq = toNum(meta.server_seq) || account.serverSeq;
-                if (cb.isLogin) {
-                    decodeLoginReply(account, body);
-                    if (cb.onLoginSuccess) cb.onLoginSuccess();
-                } else if (cb.resolve) {
-                    try { clearTimeout(cb.timer); } catch { }
-                    cb.resolve({ body, meta: { serverSeq: account.serverSeq } });
-                } else if (cb.isHeartbeat) {
-                    account.lastHeartbeatResponse = Date.now();
-                    account.heartbeatMissCount = 0;
-                    // 心跳恢复：清掉告警标记，下次再超时还能重新告警
-                    if (account.heartbeatWarned) {
-                        account.heartbeatWarned = false;
-                        log('gateway', `account ${account.accountId} 心跳已恢复`);
-                    }
-                } else if (cb.workerSock && cb.workerSeq != null) {
-                    try { clearTimeout(cb.timer); } catch { }
-                    sendFrame(cb.workerSock, {
-                        t: 'response',
-                        accountId: account.accountId,
-                        seq: cb.workerSeq,
-                        error: '',
-                        body: Buffer.from(body).toString('base64'),
-                        meta: { serverSeq: account.serverSeq },
-                    });
-                }
+        const candidate = msgType === 2 ? account.pendingCallbacks.get(toNum(meta.client_seq)) : null;
+        const cb = candidate?.operation?.sent && operationCurrent(account, candidate.operation) ? candidate : null;
+        // 包括 notify、超时后的迟到回复及错误回复：事实入站与业务成功分开记录。
+        noteInbound(account, meta, cb);
+        if (msgType === 3) {
+            sendFrame(account.workerSock, { t: 'notify', accountId: account.accountId, body: Buffer.from(buffer).toString('base64') });
+            return;
+        }
+        if (!cb) return;
+        const op = cb.operation;
+        const errorCode = toNum(meta.error_code);
+        if (errorCode) {
+            const error = requestError(`${meta.service_name || op.service}.${meta.method_name || op.method} 错误: code=${errorCode} ${meta.error_message || ''}`, errorCode, op);
+            error.stage = cb.isLogin ? 'game_login' : 'game_request';
+            error.outcomeUnknown = false;
+            error.resultState = 'failed';
+            error.serverSeq = account.serverSeq;
+            error.service = meta.service_name || op.service;
+            error.method = meta.method_name || op.method;
+            if (cb.isLogin) account.userState.gid = 0;
+            finishOperation(account, op, error);
+            return;
+        }
+        if (cb.isLogin) {
+            try { decodeLoginReply(account, body); }
+            catch (error) {
+                account.userState.gid = 0;
+                const failure = requestError(error.message, 'INVALID_LOGIN_REPLY', op);
+                failure.stage = 'game_login';
+                failure.resultState = 'failed';
+                failure.outcomeUnknown = false;
+                finishOperation(account, op, failure);
+                return;
             }
-        } else if (msgType === 3) {
-            if (account.workerSock) {
-                sendFrame(account.workerSock, {
-                    t: 'notify',
-                    accountId: account.accountId,
-                    body: Buffer.from(buffer).toString('base64'),
-                });
-            }
+        }
+        finishOperation(account, op);
+        clearFaultsIfSessionStable(account);
+        if (op.waiterDetached) return;
+        if (cb.isLogin) {
+            if (cb.onLoginSuccess) cb.onLoginSuccess();
+        } else if (cb.resolve) {
+            cb.resolve({ body, meta: { serverSeq: account.serverSeq, connectionEpoch: op.epoch,
+                sent: true, resultState: 'completed', outcomeUnknown: false, retryable: false,
+                timeoutMs: op.timeoutMs, settlementTimeoutMs: op.settlementTimeoutMs, sentAt: op.sentAt } });
+        } else if (cb.workerSock && cb.workerSeq != null) {
+            sendFrame(cb.workerSock, {
+                t: 'response', accountId: account.accountId, seq: cb.workerSeq, error: '',
+                body: Buffer.from(body).toString('base64'), meta: { serverSeq: account.serverSeq,
+                    sent: true, resultState: 'completed', outcomeUnknown: false, retryable: false,
+                    timeoutMs: op.timeoutMs, settlementTimeoutMs: op.settlementTimeoutMs, sentAt: op.sentAt },
+            }, op.epoch);
         }
     } catch (e) {
         logWarn('gateway', `account ${account.accountId} 消息解码失败: ${e.message}`);
@@ -648,11 +1040,15 @@ function onAccountLogin(account) {
     // 避免"登录成功即清零"让上限形同虚设。
     clearFaultsIfSessionStable(account);
     // 登录成功说明当前 Code/凭证有效：清除"微信登录态失效"终态，恢复自动重连能力
-    account.wxCodeFailCount = 0;
-    account.wxBufferAlerted = false;
+    account.wxRescanAlerted = false;
+    if (account.platform === 'wx') clearWxTemporaryFailures(account);
+    else { account.wxCodeFailCount = 0; account.wxBufferAlerted = false; }
     account.networkStopped = false;
     // 标记"已成功登录过"：QQ 一次性 Code 登录即用即废，之后断链重连绝不能再拿同一 Code 冲服务器（否则被顶号）
     account.loggedInOnce = true;
+    account.connectionDead = false;
+    cancelReconnectTimers(account);
+    if (account.finishLogin) { account.finishLogin(true); account.finishLogin = null; }
     // 本次用 refreshtoken 续期换码已成功登录，清零"需刷新"标记，下次正常断链重连仍可先试快路径
     account.wxNeedsRefresh = false;
     if (account.workerSock) {
@@ -665,13 +1061,14 @@ function onAccountLogin(account) {
 // ============ 心跳 ============
 function startHeartbeat(account) {
     if (account.heartbeatTimer) clearInterval(account.heartbeatTimer);
-    account.lastHeartbeatResponse = Date.now();
     account.heartbeatMissCount = 0;
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
     account.heartbeatTimer = setInterval(() => {
-        if (!account.userState.gid) return;
-        const timeSince = Date.now() - account.lastHeartbeatResponse;
+        if (account.ws !== socket || account.connectionEpoch !== epoch || account.networkStopped || !account.userState.gid) return;
+        const timeSince = Date.now() - (account.lastHeartbeatResponse || account.connectedAt);
         if (timeSince > HEARTBEAT_TIMEOUT) {
-            account.heartbeatMissCount += 1;
+            account.heartbeatMissCount = Math.min(MAX_HEARTBEAT_MISS, account.heartbeatMissCount + 1);
             if (account.heartbeatMissCount >= MAX_HEARTBEAT_MISS) {
                 // 【关键】绝不主动 close / 重连 —— 这是账号"自己下线"的元凶。
                 // 心跳超时往往只是网络抖动，底层连接其实还活着；此时主动断开等于 bot
@@ -688,39 +1085,46 @@ function startHeartbeat(account) {
                 // 继续往下发心跳，给连接恢复的机会（不 return）
             }
         }
+        if (account.criticalFlights.has('heartbeat')) return;
         const body = types.HeartbeatRequest.encode(types.HeartbeatRequest.create({
             gid: toLong(account.userState.gid),
             client_version: CONFIG.clientVersion,
         })).finish();
-        sendMsg(account, 'gamepb.userpb.UserService', 'Heartbeat', body, { isHeartbeat: true });
+        void sendMsg(account, 'gamepb.userpb.UserService', 'Heartbeat', body, { isHeartbeat: true, timeoutMs: HEARTBEAT_TIMEOUT });
     }, CONFIG.heartbeatInterval || 30000);
 }
 
 // ============ 重连 ============
 function getReconnectDelayMs(account) {
-    const delay = RECONNECT_BASE_DELAY_MS * (2 ** Math.max(0, account.reconnectAttempts - 1));
+    const delay = RECONNECT_BASE_DELAY_MS * (2 ** Math.min(16, Math.max(0, account.reconnectAttempts - 1)));
     return Math.min(RECONNECT_MAX_DELAY_MS, delay);
 }
 
 function scheduleReconnect(account, reason) {
-    if (account.networkStopped || !account.savedCode) return;
+    if (gatewayShuttingDown || account.networkStopped || !account.savedCode || account.reconnectTimer || account.deadReconnectTimer) return;
+    if (account.ws && (account.ws.readyState === 0 || account.ws.readyState === 1)) return;
     // 全局风控熔断：暂停期内连 timer 都不排，避免暂停结束时一次性涌出堆积的重连
     if (globalReconnectPaused(account)) return;
-    account.reconnectAttempts += 1;
+    account.reconnectAttempts = Math.min(1000000, account.reconnectAttempts + 1);
     // 达到次数阈值时仅发一次告警（Code 可能已失效），但不放弃：
     // 网关会持续以最大间隔重试，gameserver 恢复或用户重抓 Code 后 /start 即可重新连上，已登录的号不会因重连策略激进而被踢下线。
     if (account.reconnectAttempts === RECONNECT_ALERT_AFTER) {
         emitEvent(account, 'reconnect_failed', { attempts: account.reconnectAttempts, reason: reason || '' });
     }
-    const delay = getReconnectDelayMs(account) + Math.floor(Math.random() * 3000); // jitter 避免同批账号齐重连
+    const delay = Math.max(getReconnectDelayMs(account) + Math.floor(Math.random() * 3000),
+        account.platform === 'wx' ? (account.wxRetryAfter || 0) - Date.now() : 0); // 尊重微信冷却
     // 必须先清掉上一次的待执行 timer：否则每次 close 都新建一个，多 timer 并存时
     // 即使 reconnect 判定"Code 失效已停止"，其余 timer 仍会继续重连（实测 1006 停不下来）。
-    if (account.reconnectTimer) clearTimeout(account.reconnectTimer);
-    account.reconnectTimer = setTimeout(() => {
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
+    const generation = account.reconnectGeneration;
+    const timer = setTimeout(() => {
+        if (account.reconnectTimer !== timer || account.ws !== socket || account.connectionEpoch !== epoch
+            || account.reconnectGeneration !== generation || account.networkStopped) return;
         account.reconnectTimer = null;
-        if (account.networkStopped) return;
-        reconnect(account, null);
+        reconnect(account, null).catch(error => logWarn('gateway', `account ${account.accountId} 重连失败: ${error.message}`));
     }, delay);
+    account.reconnectTimer = timer;
 }
 
 // 从 store 取账号对象（兼容 getAccounts() 返回数组或 {accounts:[...]}）
@@ -737,7 +1141,7 @@ function getStoreAccount(accountId) {
 // （注意不是 openId —— openId 是游戏侧返回的另一个 ID，用作 key 会永远查不到文件）
 function readStoreWxBufferKey(accountId) {
     const acc = getStoreAccount(accountId);
-    return acc ? String(acc.wxid || acc.openId || '') : '';
+    return acc ? String(acc.wxid || '') : '';
 }
 
 // 从 store 补全账号 platform：platform 原先只在 /start 命令路径赋值，网关重启后为空
@@ -748,150 +1152,391 @@ function syncAccountPlatform(account) {
     if (acc && acc.platform) account.platform = acc.platform;
 }
 
-// 扫描 wx-login 目录，取最近修改的 loginBuffer 文件作为兜底
-// （落盘 key 是扫码时的微信 openid，可能与 userState.openId 不是同一个 ID）
-function findLatestWxBufferFile() {
-    try {
-        if (!fs.existsSync(WX_LOGIN_DIR)) return null;
-        const files = fs.readdirSync(WX_LOGIN_DIR).filter(f => f.endsWith('.json'));
-        if (!files.length) return null;
-        files.sort((a, b) =>
-            fs.statSync(path.join(WX_LOGIN_DIR, b)).mtimeMs -
-            fs.statSync(path.join(WX_LOGIN_DIR, a)).mtimeMs);
-        return path.join(WX_LOGIN_DIR, files[0]);
-    } catch { return null; }
+function wxCredentialFile(accountId) {
+    const key = readStoreWxBufferKey(accountId);
+    return key && path.basename(key) === key && !/[\\/]/.test(key)
+        ? path.join(WX_LOGIN_DIR, `${key}.json`) : null;
 }
 
-// 微信 code 一次性：用持久化的 loginBuffer 重新 issueCode 换新 code。
-// 【保活关键】loginBuffer 有效期很短（实测仅数分钟），断线重连时往往已经过期，
-// 直接拿它换码会被微信拒绝（ManualAuth rejected）；此时必须凭落盘的 refreshtoken
-// 续期出新的 loginBuffer 再换码 —— 这才是微信账号真正的"保活"路径。
-// 早期实现只落盘 loginBuffer、注释还写着"不依赖 refreshtoken"，
-// 导致 loginBuffer 一过期就彻底无法自愈，只能重新扫码（用户反馈"扫码没 5 分钟就掉线"的根因）。
-async function issueWxCodeFromBuffer(account) {
-    // 落盘 key = 扫码 session.openid = 账号的 wxid；openId/userState.openId 是游戏侧的另一个 ID，仅作兜底
-    const openid = readStoreWxBufferKey(account.accountId) || account.userState.openId;
-    let file = openid ? path.join(WX_LOGIN_DIR, `${openid}.json`) : null;
-    if (!file || !fs.existsSync(file)) {
-        // openid 对不上时退化为取最新文件（单微信账号场景可正常自愈；多微信账号会取到别人的，故打 warn）
-        const latest = findLatestWxBufferFile();
-        if (!latest) {
-            logWarn('gateway', `account ${account.accountId} 微信换码跳过：loginBuffer 文件不存在 ${file || '(无 openid)'}（需重新扫码）`);
-            account.wxLastCodeError = 'loginBuffer 文件不存在';
-            return null;
-        }
-        logWarn('gateway', `account ${account.accountId} 微信 openid 未精确匹配（${openid || '空'}），改用最新 loginBuffer 文件 ${path.basename(latest)}`);
-        file = latest;
+function readWxCredential(accountId) {
+    const file = wxCredentialFile(accountId);
+    if (!file || !fs.existsSync(file)) return null;
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const key = readStoreWxBufferKey(accountId);
+    if (!rec || (rec.openid && rec.openid !== key)) {
+        throw Object.assign(new Error('wxid 对应凭证不匹配'), { stage: 'local_credential_missing' });
     }
-    let rec;
-    try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) {
-        logWarn('gateway', `account ${account.accountId} 微信换码失败：loginBuffer 解析异常 ${e.message}`);
-        account.wxLastCodeError = `loginBuffer 解析异常 ${e.message}`;
-        return null;
-    }
-    if (!rec || !rec.loginBuffer) {
-        logWarn('gateway', `account ${account.accountId} 微信换码失败：loginBuffer 为空`);
-        account.wxLastCodeError = 'loginBuffer 为空';
-        return null;
-    }
+    return { file, rec, key };
+}
+
+function wxSessionBinding(rec, key) {
+    return `wx-login:${key}:${rec.credentialGeneration}`;
+}
+
+function wxCredentialStatus(accountId) {
     try {
+        const source = readWxCredential(accountId);
+        if (!source) return { available: false };
+        const rec = source.rec;
+        const { hasNativeSession } = require('../services/wx-login/native-protocol');
+        return {
+            available: true, refreshBusinessId: rec.refreshBusinessId || rec.refresh_business_id || 'pc_yyb',
+            credentialSource: rec.credentialSource || 'legacy_pc_yyb',
+            tokenCheckedAt: rec.tokenCheckedAt || null, accessTokenExpiresAt: rec.accessTokenExpiresAt || null,
+            accessTokenExpirySource: rec.accessTokenExpirySource || (rec.accessTokenExpiresAt ? 'legacy_unverified' : 'unknown'),
+            accessTokenCookieExpiresAt: rec.accessTokenCookieExpiresAt || null,
+            accessTokenCookieExpirySource: rec.accessTokenCookieExpirySource || 'unknown',
+            nativeReverify: rec.nativeReverify ? { attemptedAt: rec.nativeReverify.attemptedAt, state: rec.nativeReverify.state } : null,
+            tokenLastSuccessAt: rec.tokenLastSuccessAt || null,
+            tokenRetryAfter: rec.tokenRetryAfter || 0, tokenError: rec.tokenError || null,
+            bufferRetryAfter: rec.bufferRetryAfter || 0, bufferError: rec.bufferError || null,
+            codeRetryAfter: rec.codeRetryAfter || 0, codeError: rec.codeError || null,
+            nativeSessionUsable: hasNativeSession(rec.nativeSession, wxSessionBinding(rec, source.key)),
+            nativeSessionExpiresAt: rec.nativeSession?.expiresAt || null,
+            scannedAt: rec.scannedAt || null,
+        };
+    } catch { return { available: false, reason: 'credential_unavailable' }; }
+}
+
+function wxFailureState(error) {
+    const classification = classifyWxCodeError(error);
+    return {
+        stage: String(error?.stage || 'unknown'), reason: classification.reason,
+        code: typeof error?.code === 'number' || typeof error?.code === 'string' ? error.code : null,
+        serverCode: typeof error?.serverCode === 'number' ? error.serverCode : null,
+        wechatCode: typeof error?.wechatCode === 'number' ? error.wechatCode : null,
+        at: Date.now(),
+    };
+}
+
+function wxLayerBackoff(count) {
+    return Math.min(WX_TEMP_FAIL_ACCOUNT_MAX_MS, WX_TEMP_FAIL_BACKOFF_BASE_MS * (2 ** Math.min(15, Math.max(0, count - 1))));
+}
+
+function wxLayerCooling(rec, layer) {
+    const at = Number(rec[`${layer}RetryAfter`]) || 0;
+    if (at <= Date.now()) return;
+    const error = new Error(`微信 ${layer} 操作处于冷却期`);
+    error.stage = `${layer}_cooldown`;
+    error.retryAfter = at;
+    throw error;
+}
+
+function wxTokenDue(rec) {
+    if (rec.tokenRefreshPending === true) return true;
+    const expiresAt = Number(rec.accessTokenExpiresAt);
+    if (Number.isSafeInteger(expiresAt) && expiresAt > 0) return Date.now() + WX_TOKEN_REFRESH_SKEW_MS >= expiresAt;
+    // 旧凭据没有服务端有效期时沿用运营兜底窗口，不能据此宣称 token 保证有效两小时。
+    const checked = Number(rec.tokenCheckedAt || rec.scannedAt || rec.loginBufferUpdatedAt || 0);
+    return checked <= 0 || Date.now() - checked >= WX_KEEPALIVE_MIN_AGE_MS;
+}
+
+const wxCredentialFlights = new Map();
+function withWxCredentialContext(file, snapshot, operation, options = {}) {
+    const previous = wxCredentialFlights.get(file) || Promise.resolve();
+    const flight = previous.catch(() => {}).then(async () => {
+        if (options.signal?.aborted) throw options.signal.reason;
+        const { withWxCredentialOperation } = require('../services/wx-login/credential-storage');
+        return withWxCredentialOperation(file, undefined, async current => {
+            const key = path.basename(file, '.json');
+            if ((current.openid && current.openid !== key)
+                || (snapshot.credentialGeneration && current.credentialGeneration !== snapshot.credentialGeneration)
+                || (!snapshot.credentialGeneration && JSON.stringify(current) !== JSON.stringify(snapshot))) {
+                throw Object.assign(new Error('微信凭据世代已变更，拒绝旧授权操作'), { stage: 'credential_conflict' });
+            }
+            const context = {
+                rec: current, file, key,
+                save(patch) {
+                    context.rec = persistWxCredentials(file, context.rec, patch);
+                    return context.rec;
+                },
+                session() { return { ...context.rec, openid: key }; },
+                check() {
+                    if (options.signal?.aborted) throw options.signal.reason;
+                    if (options.deadline && Date.now() >= options.deadline) throw new Error('微信凭据操作超时');
+                    if (JSON.stringify(JSON.parse(fs.readFileSync(file, 'utf8'))) !== JSON.stringify(context.rec)) {
+                        throw Object.assign(new Error('微信凭据已被并发更新'), { stage: 'credential_conflict' });
+                    }
+                },
+            };
+            if (!current.credentialGeneration) {
+                context.save({ credentialGeneration: require('node:crypto').randomBytes(16).toString('hex'), nativeSession: null, pendingCode: null });
+            }
+            context.check();
+            return operation(context);
+        });
+    });
+    wxCredentialFlights.set(file, flight);
+    const clear = () => { if (wxCredentialFlights.get(file) === flight) wxCredentialFlights.delete(file); };
+    flight.then(clear, clear);
+    return flight;
+}
+
+// 恢复顺序：一次性扫码 Code → 已认证原生会话 → 保存票据；
+// 只有原生票据明确拒绝才获取新 buffer。token-only 续期独立调度，不由游戏1006推断。
+function issueWxCodeFromBuffer(account) {
+    if (account.wxIssueFlight) return account.wxIssueFlight;
+    const flight = issueWxCodeFromBufferOnce(account);
+    account.wxIssueFlight = flight;
+    const clear = () => { if (account.wxIssueFlight === flight) account.wxIssueFlight = null; };
+    flight.then(clear, clear);
+    return flight;
+}
+
+async function issueWxCodeFromBufferOnce(account) {
+    if (!gatewayOwnsAccount(account.accountId)) return null;
+    try {
+        const source = readWxCredential(account.accountId);
+        if (!source) throw Object.assign(new Error('loginBuffer 文件不存在'), { stage: 'local_credential_missing' });
+        const { file, rec } = source;
         const { WxLoginService } = require('../services/wx-login/service');
         const svc = new WxLoginService();
-        // 超时兜底见下方模块级 withTimeout（保活定时器与换码逻辑共用）
-
-        // 微信换码策略：loginBuffer 实际有效期 > 2h（长效），refreshtoken 约 2h 绝对失效。
-        // 网关改为低频（120min）兜底续期（而非 30min 高频轮询），故重连仍默认走快路径用
-        // loginBuffer 换码；仅当连接被 1006 拒绝（buffer 确已废，close 处理器置 wxNeedsRefresh）
-        // 才回退 refreshtoken 续期。与旧 worker 直连一致且更稳，且不触发腾讯风控频率特征。
-        const preferRefresh = !!account.wxNeedsRefresh;
-        if (!preferRefresh) {
-            // 1) 快路径：loginBuffer 仍在有效期内，直接换码
-            try {
-                return await withTimeout(
-                    svc.issueCode({ loginBuffer: rec.loginBuffer }, WX_APP_ID),
-                    WX_ISSUE_TIMEOUT_MS, '换码');
-            } catch (firstErr) {
-                log('gateway', `account ${account.accountId} loginBuffer 直接换码失败（${String(firstErr.message).slice(0, 80)}），尝试 refreshtoken 续期`);
+        const options = { signal: account.wxConnectController?.signal, deadline: Date.now() + WX_CREDENTIAL_OPERATION_TIMEOUT_MS };
+        return await withWxCredentialContext(file, rec, async context => {
+            const pending = context.rec.pendingCode;
+            const now = Date.now();
+            if (pending && pending.generation === context.rec.credentialGeneration && pending.consumed === false
+                && typeof pending.value === 'string' && pending.value
+                && Number.isSafeInteger(pending.issuedAt) && pending.issuedAt <= now
+                && Number.isSafeInteger(pending.expiresAt) && pending.expiresAt > now
+                && pending.expiresAt <= pending.issuedAt + 60000) {
+                const code = pending.value;
+                context.save({ pendingCode: { ...pending, value: null, consumed: true, consumedAt: now } });
+                context.check();
+                log('gateway', `account ${account.accountId} 领取同世代扫码 Code（一次性交接）`);
+                return code;
             }
-        } else {
-            log('gateway', `account ${account.accountId} loginBuffer 被 1006 拒绝过（wxNeedsRefresh），跳过快路径直接 refreshtoken 续期`);
-        }
-
-        // 2) 保活路径：loginBuffer 已过期 → 用 refreshtoken 续期后重试
-        if (!rec.refreshtoken) {
-            logWarn('gateway', `account ${account.accountId} loginBuffer 已失效且无 refreshtoken（旧版落盘未保存凭证），请重新扫码一次以启用自动保活`);
-            account.wxLastCodeError = '无 refreshtoken（旧版落盘未保存凭证）';
-            return null;
-        }
-        const session = {
-            openid: rec.openid || openid,
-            loginBuffer: rec.loginBuffer,
-            refreshtoken: rec.refreshtoken,
-            accesstoken: rec.accesstoken || '',
-        };
-        const refreshed = await withTimeout(
-            svc.refreshLoginBuffer(session), WX_REFRESH_TIMEOUT_MS, '刷新 loginBuffer');
-        if (!refreshed || !refreshed.loginBuffer) {
-            logWarn('gateway', `account ${account.accountId} refreshtoken 续期未返回有效 loginBuffer（需重新扫码）`);
-            return null;
-        }
-
-        // 滚动凭证：必须把新的 loginBuffer/refreshtoken/accesstoken 回写，
-        // 否则下次仍用旧凭证，必然再次失败（refreshtoken 刷新后旧值即失效）
-        persistRefreshedWxBuffer(file, rec, refreshed);
-        log('gateway', `account ${account.accountId} 微信 loginBuffer 已通过 refreshtoken 续期（保活成功）`);
-        return await withTimeout(
-            svc.issueCode({ loginBuffer: refreshed.loginBuffer }, WX_APP_ID),
-            WX_ISSUE_TIMEOUT_MS, '换码');
-    } catch (e) {
-        // ⭐ 同上：第1步 refresh 成功、第2步换 loginBuffer 失败时，error 上带着**已轮换**的新 token。
-        // 这里不回写，磁盘就永久停留在已作废的旧 refreshtoken —— 正是"换码成功却立即 1006"与
-        // "40188 永远好不了"的共同根因。
-        const saved = persistRotatedCredentialsOnError(file, rec, e);
-        // ⭐ 记录失败原因到 account，供调用方 classifyWxCodeError 判定临时/永久
-        account.wxLastCodeError = String(e && e.message || '');
-        logWarn('gateway', `account ${account.accountId} 微信换码/续期失败${saved ? '（已回写新 refreshtoken）' : ''}: ${e.message}`);
+            wxLayerCooling(context.rec, 'code');
+            const binding = wxSessionBinding(context.rec, context.key);
+            // 短链失败不会证明缓存票无效；仅当本次实际复用旧会话时，才允许有预算的重建。
+            let dropCachedTicket = false;
+            let lastIssueCachedSession = null;
+            const issue = async (forceNew = false) => {
+                context.check();
+                const cached = !forceNew && !dropCachedTicket && svc.hasNativeSession(context.rec.nativeSession, binding)
+                    ? context.rec.nativeSession : null;
+                lastIssueCachedSession = cached;
+                if (!cached && !context.rec.loginBuffer) {
+                    throw Object.assign(new Error('loginBuffer 为空且无可用原生会话'), { stage: 'local_credential_missing' });
+                }
+                return svc.issueCode(context.session(), WX_APP_ID, {
+                    signal: options.signal, deadline: options.deadline, timeoutMs: WX_ISSUE_TIMEOUT_MS,
+                    session: cached, sessionBinding: binding,
+                    onSession(nativeSession) {
+                        if (nativeSession.binding !== binding) throw Object.assign(new Error('原生会话世代不匹配'), { stage: 'credential_conflict' });
+                        context.save({ nativeSession, nativeSessionUpdatedAt: Date.now(), nativeReverify: null });
+                        context.check();
+                    },
+                });
+            };
+            // 短链解码/认证失败不能证明缓存票被拒。ManualAuth只能验证当前loginBuffer，
+            // 其-10也不能反向证明旧PSK票过期。单票预算先落盘，跨调用/进程不反复认证。
+            const reverifyTicketOnce = async (error, cached) => {
+                context.check();
+                const ticketFingerprint = require('node:crypto').createHash('sha256')
+                    .update(`${binding}:${cached.ticket}`).digest('hex');
+                const previous = context.rec.nativeReverify;
+                if (previous?.generation === context.rec.credentialGeneration
+                    && previous.ticketFingerprint === ticketFingerprint) throw error;
+                context.save({ nativeReverify: {
+                    generation: context.rec.credentialGeneration, ticketFingerprint,
+                    attemptedAt: Date.now(), state: 'attempted', failure: wxFailureState(error)
+                } });
+                const marker = context.rec.nativeReverify;
+                dropCachedTicket = true;
+                const age = Number(cached.createdAt) > 0
+                    ? ((Date.now() - Number(cached.createdAt)) / 3600000).toFixed(1) : 'unknown';
+                const expiresAt = Number(cached.expiresAt);
+                log('gateway', `account ${account.accountId} 短链响应无法解码，ticket=${ticketFingerprint.slice(0, 12)} age=${age}h `
+                    + `expires=${Number.isSafeInteger(expiresAt) ? new Date(expiresAt).toISOString() : 'unknown'}，`
+                    + '用loginBuffer重建一次，不判旧票失效');
+                try {
+                    return await issue(true);
+                } catch (retryError) {
+                    // onSession若已保存新票则清旧预算；仅失败于保存新会话前才保留旧票失败记录。
+                    if (context.rec.nativeReverify?.ticketFingerprint === marker.ticketFingerprint
+                        && retryError.stage !== 'credential_conflict' && retryError.stage !== 'persist_native_session') {
+                        context.check();
+                        context.save({ nativeReverify: { ...marker, state: 'failed', failure: wxFailureState(retryError) } });
+                    }
+                    retryError.ticketRebuildAttempted = true;
+                    throw retryError;
+                }
+            };
+            const issueVerified = async () => {
+                try { return await issue(); }
+                catch (error) {
+                    // 冷启动onSession写入的是本次的新票，不能拿它当成复用了旧票再认证一次。
+                    if (!error?.ticketUnverified || error.stage !== 'shortlink' || !lastIssueCachedSession
+                        || !context.rec.loginBuffer) throw error;
+                    return reverifyTicketOnce(error, lastIssueCachedSession);
+                }
+            };
+            try {
+                let code;
+                try { code = await issueVerified(); }
+                catch (error) {
+                    context.check();
+                    // 只有ManualAuth明确拒绝当前loginBuffer时才更新缓冲，不把它误写成缓存票失效。
+                    if (error.code !== 'WX_MANUAL_AUTH_REJECTED' || error.serverCode !== -10) throw error;
+                    log('gateway', `account ${account.accountId} 当前loginBuffer认证被拒（ManualAuth -10），按需更新缓冲`);
+                    await refreshWxBufferInContext(context, svc, options);
+                    try {
+                        code = await issue(true);
+                    } catch (finalError) {
+                        // 换新 buffer 后仍被拒：这才是可对外告警的"需要重新扫码"，不贴临时故障标签。
+                        if (finalError.code === 'WX_MANUAL_AUTH_REJECTED' && finalError.serverCode === -10) {
+                            finalError.ticketRejected = true; // 兼容旧调用，只代表当前buffer恢复未成功
+                            finalError.needRescan = true;
+                            finalError.recoveryExhausted = true;
+                        }
+                        throw finalError;
+                    }
+                }
+                context.check();
+                if (typeof code !== 'string' || !code) throw Object.assign(new Error('微信换码返回空 Code'), { stage: 'js_login' });
+                context.save({ codeFailureCount: 0, codeRetryAfter: 0, codeError: null });
+                return code;
+            } catch (error) {
+                if (options.signal?.aborted) throw options.signal.reason;
+                if (error.stage !== 'credential_conflict' && error.stage !== 'persist_native_session'
+                    && error.stage !== 'persist_rotated' && error.stage !== 'local_credential_missing') {
+                    if (error.stage === 'token_refresh' || error.stage === 'token_cooldown') error.retryAfter = context.rec.tokenRetryAfter;
+                    else if (error.stage === 'login_buffer' || error.stage === 'buffer_cooldown') error.retryAfter = context.rec.bufferRetryAfter;
+                    else if (error.stage !== 'code_cooldown') {
+                        const count = Math.min(16, (Number(context.rec.codeFailureCount) || 0) + 1);
+                        context.save({ codeFailureCount: count, codeRetryAfter: Date.now() + wxLayerBackoff(count), codeError: wxFailureState(error) });
+                        error.retryAfter = context.rec.codeRetryAfter;
+                    }
+                }
+                throw error;
+            }
+        }, options);
+    } catch (error) {
+        account.wxLastCodeError = error;
+        logWarn('gateway', `account ${account.accountId} 微信恢复失败 stage=${error.stage || 'unknown'} reason=${classifyWxCodeError(error).reason}`);
         return null;
     }
 }
 
-// 回写续期后的微信凭证（滚动凭证必须持久化，否则下次必然失败）
+function persistWxCredentials(file, expected, patch) {
+    const { writeWxCredential } = require('../services/wx-login/credential-storage');
+    return writeWxCredential(file, patch, expected);
+}
+
 function persistRefreshedWxBuffer(file, oldRec, refreshed) {
+    return persistWxCredentials(file, oldRec, {
+        loginBuffer: refreshed.loginBuffer,
+        refreshtoken: refreshed.refreshtoken || oldRec.refreshtoken || '',
+        accesstoken: refreshed.accesstoken || oldRec.accesstoken || '',
+        loginBufferUpdatedAt: Date.now(),
+        bufferRefreshPending: false,
+        bufferRetryAfter: 0,
+        bufferFailureCount: 0,
+        bufferError: null,
+        bufferLastSuccessAt: Date.now(),
+    });
+}
+
+async function refreshWxTokenInContext(context, svc, options = {}) {
+    context.check();
+    wxLayerCooling(context.rec, 'token');
+    let rotatedSaved = false;
     try {
-        fs.writeFileSync(file, JSON.stringify({
-            ...(oldRec || {}),
-            loginBuffer: refreshed.loginBuffer,
-            refreshtoken: refreshed.refreshtoken || (oldRec && oldRec.refreshtoken) || '',
-            accesstoken: refreshed.accesstoken || (oldRec && oldRec.accesstoken) || '',
-            updatedAt: Date.now(),
-        }));
-    } catch (e) {
-        logWarn('gateway', `微信 loginBuffer 续期回写失败: ${e.message}`);
+        const credentials = await svc.refreshCredentials(context.session(), {
+            ...options, timeoutMs: WX_REFRESH_TIMEOUT_MS,
+            onCredentialsRotated(rotated) {
+                // token 响应已产生副作用，先 CAS 保存，再检查取消；不动 buffer/原生会话。
+                context.save(rotated);
+                rotatedSaved = true;
+                context.check();
+            },
+        });
+        if (!rotatedSaved || !credentials?.accesstoken) throw Object.assign(new Error('微信 token 响应未保存'), { stage: 'persist_rotated' });
+        context.check();
+        context.save({ tokenRetryAfter: 0, tokenFailureCount: 0, tokenError: null,
+            tokenRefreshPending: false, tokenLastSuccessAt: Date.now() });
+        return credentials;
+    } catch (error) {
+        if (options.signal?.aborted) throw options.signal.reason;
+        if (error.stage !== 'credential_conflict' && error.stage !== 'persist_rotated') {
+            const failures = Math.min(16, (Number(context.rec.tokenFailureCount) || 0) + 1);
+            context.save({ tokenFailureCount: failures, tokenRetryAfter: Date.now() + wxLayerBackoff(failures),
+                tokenRefreshPending: true, tokenError: wxFailureState(error) });
+            error.retryAfter = context.rec.tokenRetryAfter;
+        }
+        throw error;
     }
+}
+
+async function refreshWxBufferInContext(context, svc, options = {}) {
+    context.check();
+    wxLayerCooling(context.rec, 'buffer');
+    // buffer 按需恢复优先当前 access；只在真实到期/独立token调度到期时才续token。
+    if (wxTokenDue(context.rec) || !context.rec.accesstoken) {
+        await refreshWxTokenInContext(context, svc, options);
+    }
+    try {
+        const refreshed = await svc.refreshBufferWithAccessToken(context.session(), {
+            ...options, timeoutMs: WX_REFRESH_TIMEOUT_MS,
+        });
+        context.check();
+        if (!refreshed?.loginBuffer) throw Object.assign(new Error('未收到有效 loginBuffer'), { stage: 'login_buffer' });
+        context.rec = persistRefreshedWxBuffer(context.file, context.rec, refreshed);
+        return refreshed;
+    } catch (error) {
+        if (options.signal?.aborted) throw options.signal.reason;
+        if (error.stage !== 'credential_conflict' && error.stage !== 'persist_rotated') {
+            const failures = Math.min(16, (Number(context.rec.bufferFailureCount) || 0) + 1);
+            context.save({ bufferRefreshPending: true, bufferFailureCount: failures,
+                bufferRetryAfter: Date.now() + wxLayerBackoff(failures), bufferError: wxFailureState(error) });
+            error.retryAfter = context.rec.bufferRetryAfter;
+        }
+        throw error;
+    }
+}
+
+// 完整授权操作串行；相同层的并发调用共享结果，跨层则排队后重读当前世代。
+const wxRefreshFlights = new Map();
+const wxTokenFlights = new Map();
+function refreshWxBufferSingleFlight(file, rec, session, svc, options = {}) {
+    if (wxRefreshFlights.has(file)) return wxRefreshFlights.get(file);
+    const flight = withWxCredentialContext(file, rec, context => refreshWxBufferInContext(context, svc, options), options);
+    wxRefreshFlights.set(file, flight);
+    const clear = () => { if (wxRefreshFlights.get(file) === flight) wxRefreshFlights.delete(file); };
+    flight.then(clear, clear);
+    return flight;
+}
+function refreshWxTokenSingleFlight(file, rec, svc, options = {}) {
+    if (wxTokenFlights.has(file)) return wxTokenFlights.get(file);
+    const flight = withWxCredentialContext(file, rec, async context => {
+        // 排队期间前一操作可能已续期成功；不能再次远端轮换。
+        if (!wxTokenDue(context.rec)) return { skipped: true, reason: 'token_not_due' };
+        return refreshWxTokenInContext(context, svc, options);
+    }, options);
+    wxTokenFlights.set(file, flight);
+    const clear = () => { if (wxTokenFlights.get(file) === flight) wxTokenFlights.delete(file); };
+    flight.then(clear, clear);
+    return flight;
 }
 
 // 模块级通用超时兜底（保活定时器与换码逻辑共用）：MMTLS 握手在服务器环境可能长时间不返回，
 // 若 await 卡死会拖累整个重连/保活流程——比失败更糟，故一律加超时。
 function withTimeout(promise, ms, label) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`${label}超时 ${ms}ms`)), ms)),
-    ]);
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}超时 ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// ============ 微信凭证主动保活（移植上游 keepWxCredentialAlive）============
-// 关键事实：loginBuffer 实际有效期 > 2h，但 refreshtoken 约 2h 绝对失效。
-// 历史教训：重启时 refreshtoken 静置过期 → 断线后无法续期只能重扫（约 80 分钟必退的根因）。
-//
-// ⚠️ 2026-09-05 行为调整（回撤高频轮询，按用户 8 月无 gateway 能长期在线的实证）：
-//   原来 30 分钟无条件轮询 refreshLoginBuffer → 腾讯对「同一 openid 每 30 分钟固定调用
-//   应用宝授权接口」判为高危频率特征，触发了 account 2 的 [40188 invalid scope] 频发。
-//   改为低频兜底（对齐 refreshtoken ~2h 失效窗口，临界期前才刷新一次）：
-//   - 不再高频打授权接口 → 大幅降低被风控打标签的概率；
-//   - 保留"refreshtoken 不落到过期临界"的兜底，不会因彻底停轮询而在 2h 后断线必重扫；
-//   - 真正换码续期仍由【重连路径 640-714 行】按需触发，与连接生命周期绑定。
-const WX_KEEPALIVE_INTERVAL_MS = 120 * 60 * 1000;
+// ============ 授权层独立续期 ============
+// 每两分钟只检查本地有效期，服务端声明到期前四分钟才发 token 请求；
+// 未下发期限的旧记录保留90分钟运营兜底，不伪造服务器期限。
+// 40188 是授权范围拒绝；仅凭历史日志不能断言由固定轮询、网络或风控导致。
+const WX_KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000; // 只读本地检查频率，不是授权请求频率
+const WX_TOKEN_REFRESH_SKEW_MS = 4 * 60 * 1000;
+const WX_CREDENTIAL_OPERATION_TIMEOUT_MS = WX_ISSUE_TIMEOUT_MS * 2 + WX_REFRESH_TIMEOUT_MS * 2;
 // 保活"最小凭证年龄"：凭证比这更新就跳过本轮保活（见 keepWxCredentialAlive 注释）。
 // 取 90 分钟，留 30 分钟余量给 refreshtoken 的约 2h 失效窗。
 const WX_KEEPALIVE_MIN_AGE_MS = 90 * 60 * 1000;
@@ -907,37 +1552,40 @@ const WX_KEEPALIVE_MIN_AGE_MS = 90 * 60 * 1000;
 // 结论：必须把"临时性失败"与"凭证真失效"分开计数，否则几次网络抖动就把账号打成必须扫码的状态。
 //
 // 永久性失败（凭证确实废了，等下一轮也没用）：
-//   - refreshtoken 刷新本身失败 / RefreshToken empty：第 1 步就死了，凭证真的失效
+//   - 仅明确本地凭据缺失需要扫码；token 阶段拒绝不证明凭据失效
 //   - 凭证文件缺失、loginBuffer 为空、openid 无对应文件：本地状态问题，重试无意义
 // 临时性失败（网络/腾讯侧限流，应退避后重试，不计入 scan-needed）：
 //   - 40188 invalid scope：临时 scope 拒绝
 //   - 换码超时 / 刷新超时（withTimeout 抛出）
 //   - ECONNRESET / ETIMEDOUT / socket hang up / network 等网络类错误
 //   - ManualAuth rejected：服务端拒绝但凭证未必失效，多为瞬时
-const WX_TEMP_FAIL_MAX = 5;                        // 临时性失败累计上限（超过才认为可能有真问题）
-const WX_TEMP_FAIL_BACKOFF_BASE_MS = 5 * 60 * 1000; // 临时失败退避基数 5 分钟
-const WX_TEMP_FAIL_BACKOFF_MAX_MS = 30 * 60 * 1000; // 临时失败退避封顶 30 分钟
+const WX_TEMP_FAIL_BACKOFF_BASE_MS = 5 * 60 * 1000;
+// 各层分别落盘指数退避，不互相禁用。12小时仅是本地请求预算，不保证授权最终恢复。
+const WX_TEMP_FAIL_ACCOUNT_MAX_MS = 12 * 60 * 60 * 1000;
 
 /**
  * 判定微信换码失败是"临时性"（可自愈）还是"永久性"（需重新扫码）。
- * @param {string} msg 错误信息
+ * @param {Error|string} error 服务实际错误或旧调用的错误消息
  * @returns {{temporary:boolean, reason:string}}
  */
-function classifyWxCodeError(msg) {
-    const s = String(msg || '');
-    // —— 永久性：本机凭证文件/字段问题，重试无意义 ——
-    if (/loginBuffer 文件不存在|loginBuffer 为空|loginBuffer 解析异常/i.test(s)) {
+function classifyWxCodeError(error) {
+    const s = String(error && error.message || error || '');
+    if (error && error.stage === 'local_credential_missing') {
         return { temporary: false, reason: 'local_credential_missing' };
     }
-    if (/无 refreshtoken|旧版落盘未保存凭证/i.test(s)) {
+    // —— 永久性：本机凭证文件/字段问题，重试无意义 ——
+    if (!(error && error.stage) && /loginBuffer 文件不存在|loginBuffer 为空|wxid 对应凭证不匹配/i.test(s)) {
+        return { temporary: false, reason: 'local_credential_missing' };
+    }
+    if (!(error && error.stage) && /无 refreshtoken|旧版落盘未保存凭证/i.test(s)) {
         return { temporary: false, reason: 'no_refreshtoken' };
     }
-    // —— 永久性：refreshtoken 本身失效（第 1 步 refresh 失败）——
-    if (/WeChat token refresh failed|RefreshToken empty|missing access_token/i.test(s)) {
-        return { temporary: false, reason: 'refreshtoken_dead' };
+    // token 阶段失败或服务返回 empty 也可能是临时拒绝，不能由阶段/累计次数推断凭据失效。
+    if (error && (error.stage === 'persist_rotated' || error.stage === 'credential_conflict')) {
+        return { temporary: true, reason: error.stage };
     }
     // —— 临时性 ——
-    if (/40188|invalid scope/i.test(s)) {
+    if (error?.wechatCode === 40188 || error?.code === 40188 || error?.serverCode === 40188 || /40188|invalid scope/i.test(s)) {
         return { temporary: true, reason: '40188_scope' };
     }
     if (/超时|timeout/i.test(s)) {
@@ -953,91 +1601,153 @@ function classifyWxCodeError(msg) {
     return { temporary: true, reason: 'unknown' };
 }
 
-// ⭐ 关键：刷新 refreshtoken 是**两步**请求（service.js::refreshLoginBuffer）：
-//   第1步 POST REFRESH_TOKEN_URL → 成功即轮换出新 refreshtoken（旧 token 当场作废）
-//   第2步 GET  LOGIN_BUFFER      → 可能失败（如 [40188]）
-// 第2步失败时，新 token 只挂在 error.refreshtoken 上。若调用方只打日志不落盘，
-// 磁盘上那份旧 token 已经作废，下一次保活必然再用废 token → 40188 永久复现。
-// 实测 2026-10-27：账号2 连续 8 次保活全部 40188，而凭证文件 23h 从未被写过，即此因。
-// 因此任何 catch 分支都**必须**尝试回写 rotated 凭证（service.js 注释亦明确要求调用方持久化）。
+// 兼容旧服务错误携带的新凭据；正式链路由 token 响应回调立即 CAS 保存。
+// 成功响应不代表 token 必然变化，也不能仅从响应推断旧 token 当场失效。
 function persistRotatedCredentialsOnError(file, rec, err) {
+    const nextRefresh = err && err.refreshtoken;
+    const nextAccess = err && err.accesstoken;
+    if (!nextRefresh && !nextAccess) return false;
+    persistWxCredentials(file, rec, {
+        ...(nextRefresh ? { refreshtoken: nextRefresh } : {}),
+        ...(nextAccess ? { accesstoken: nextAccess } : {}),
+    });
+    return true;
+}
+
+function clearWxTemporaryFailures(account, { cancelReconnect = true } = {}) {
+    account.wxTempFailCount = 0;
+    account.wxRetryAfter = 0;
+    account.wxLastCodeError = '';
+    account.wxCodeFailCount = 0;
+    account.wxBufferAlerted = false;
+    account.wxRescanAlerted = false;
+    if (cancelReconnect && account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
+}
+
+function armWxReconnectAt(account, at) {
+    if (gatewayShuttingDown || account.networkStopped || !gatewayOwnsAccount(account.accountId)) return;
+    if (!account.connectionDead && account.ws && account.ws.readyState === 1 && account.userState.gid) return;
+    cancelReconnectTimers(account);
+    const socket = account.ws;
+    const epoch = account.connectionEpoch;
+    const generation = account.reconnectGeneration;
+    const timer = setTimeout(() => {
+        if (account.reconnectTimer !== timer || account.ws !== socket || account.connectionEpoch !== epoch
+            || account.reconnectGeneration !== generation || account.networkStopped) return;
+        account.reconnectTimer = null;
+        reconnect(account).catch(error => {
+            logWarn('gateway', `account ${account.accountId} 微信恢复任务异常: ${error.message}`);
+        });
+    }, Math.max(1, at - Date.now()));
+    account.reconnectTimer = timer;
+    if (timer.unref) timer.unref();
+}
+
+function readWxCredentialGeneration(account) {
     try {
-        const nextRefresh = err && err.refreshtoken;
-        const nextAccess = err && err.accesstoken;
-        if (!nextRefresh && !nextAccess) return false;
-        // 只更新 token，保留原 loginBuffer（它仍是当前连接在用的那个）
-        fs.writeFileSync(file, JSON.stringify({
-            ...(rec || {}),
-            ...(nextRefresh ? { refreshtoken: nextRefresh } : {}),
-            ...(nextAccess ? { accesstoken: nextAccess } : {}),
-            updatedAt: Date.now(),
-        }));
-        return true;
-    } catch (e) {
-        logWarn('gateway', `微信 rotated 凭证回写失败: ${e.message}`);
+        const key = readStoreWxBufferKey(account.accountId);
+        if (!key || path.basename(key) !== key || /[\\/]/.test(key)) return '';
+        const record = JSON.parse(fs.readFileSync(path.join(WX_LOGIN_DIR, `${key}.json`), 'utf8'));
+        return record.credentialGeneration || '';
+    } catch { return ''; }
+}
+
+function connectWxSingleFlight(account) {
+    if (account.wxConnectFlight) return account.wxConnectFlight;
+    const epoch = account.connectionEpoch || 0;
+    const controller = new AbortController();
+    account.wxConnectController = controller;
+    const flight = (async () => {
+        if (gatewayShuttingDown || !gatewayOwnsAccount(account.accountId) || account.networkStopped) return false;
+        if (globalReconnectPaused(account) || account.shortSessionCount >= SHORT_SESSION_MAX || account.deadReconnectCount > WX_DEAD_RECONNECT_MAX) return false;
+        if (!account.connectionDead && account.ws && (account.ws.readyState === 0 || account.ws.readyState === 1)) {
+            return account.userState.gid > 0 || await (account.loginPromise || Promise.resolve(false));
+        }
+        const fresh = await issueWxCodeFromBuffer(account);
+        if (gatewayShuttingDown || (account.connectionEpoch || 0) !== epoch || !gatewayOwnsAccount(account.accountId) || account.networkStopped) return false;
+        // 静默退避已进入换码时旧 WS 仍可能恢复；恢复入站优先，不能拿新码顶掉恢复的会话。
+        if (!account.connectionDead && account.ws?.readyState === 1 && account.userState.gid) return true;
+        if (!fresh) return handleWxCodeFailure(account, account.wxLastCodeError);
+        // 取到 code 不等于登录成功。故障计数直到真实 LoginReply 才清零。
+        if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
+        stopSecurityRuntime(account, '微信重连');
+        closeCurrentWs(account, { terminate: true });
+        account.userState.gid = 0;
+        account.clientSeq = 0;
+        account.serverSeq = 0;
+        rejectAllPending(account, '连接重置，请求已取消');
+        account.savedCode = fresh;
+        connect(account, fresh);
+        return account.loginPromise ? await account.loginPromise : true;
+    })().catch(error => {
+        if ((account.connectionEpoch || 0) !== epoch || account.networkStopped || controller.signal.aborted) return false;
+        return handleWxCodeFailure(account, error);
+    });
+    account.wxConnectFlight = flight;
+    const clear = () => {
+        if (account.wxConnectFlight === flight) account.wxConnectFlight = null;
+        if (account.wxConnectController === controller) account.wxConnectController = null;
+    };
+    flight.then(clear, clear);
+    return flight;
+}
+
+function handleWxCodeFailure(account, error, { schedule = true } = {}) {
+    account.wxLastCodeError = error;
+    const cls = classifyWxCodeError(error);
+    if (schedule && account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
+    // 仅在缓冲更新后再次收到ManualAuth -10、且恢复链明确完成时建议重扫码。
+    // 单个旧ticketRejected标签或任何解码失败均不是扫码依据，仍保持退避不停止游戏网关。
+    if (error?.needRescan === true && error?.recoveryExhausted === true
+        && error.code === 'WX_MANUAL_AUTH_REJECTED' && error.serverCode === -10 && !account.wxRescanAlerted) {
+        account.wxRescanAlerted = true;
+        // worker 可能尚未连接；无论是否送达，都保留一条账号级记录可供面板查看。
+        emitEvent(account, 'code_invalid', {
+            reason: 'wx_buffer_auth_rejected', needRescan: true, networkStopped: false,
+            detail: 'loginBuffer刷新后ManualAuth仍拒绝，建议面板扫码；自动恢复继续按预算退避',
+        });
+    }
+    if (!cls.temporary) {
+        account.wxCodeFailCount += 1;
+        account.networkStopped = true;
+        if (!account.wxBufferAlerted) {
+            account.wxBufferAlerted = true;
+            emitEvent(account, 'code_invalid', { reason: 'wx_buffer_expired', needRescan: true, attempts: account.wxCodeFailCount, detail: cls.reason });
+        }
         return false;
     }
+    account.wxCodeFailCount = 0;
+    const cooled = Number(error?.retryAfter) > Date.now();
+    if (!cooled) account.wxTempFailCount = Math.min(16, (account.wxTempFailCount || 0) + 1);
+    const backoffMs = cooled ? Number(error.retryAfter) - Date.now() : wxLayerBackoff(account.wxTempFailCount || 1);
+    account.wxRetryAfter = Date.now() + backoffMs;
+    logWarn('gateway', `account ${account.accountId} 微信临时失败（${cls.reason}），冷却 ${Math.round(backoffMs / 60000)} 分钟，未判定需扫码`);
+    if (schedule && !account.networkStopped) armWxReconnectAt(account, account.wxRetryAfter);
+    return false;
 }
 
 async function keepWxCredentialAlive(accountId) {
+    if (!gatewayOwnsAccount(accountId)) return;
     const acc = getStoreAccount(accountId);
     if (!acc || acc.platform !== 'wx') return;
-    const openid = String(acc.wxid || acc.openId || '');
-    if (!openid) return;
-    const file = path.join(WX_LOGIN_DIR, `${openid}.json`);
-    let rec;
-    try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }
-    if (!rec || !rec.loginBuffer || !rec.refreshtoken) return; // 无 refreshtoken 无法主动续期（旧版落盘未存凭证），走被动 refresh
-
-    // ⭐ 2026-10-31 新增「按凭证年龄跳过」：
-    // 旧实现是无条件每 120 分钟打一次授权接口，实测日志出现精确的 `xx:17:34` 重复，
-    // 说明它完全不看凭证是否刚被刷新过——而重连路径（issueWxCodeFromBuffer）本来就会
-    // 轮换 refreshtoken 并回写 updatedAt。于是保活经常在"凭证才 5 分钟新"的情况下
-    // 又去刷一次，既无收益，又平白多一次被腾讯风控打标签的机会（8 月 40188 频发的成因之一）。
-    // 改为：仅当凭证距上次写入已超过 WX_KEEPALIVE_MIN_AGE_MS 时才刷新。
-    // 取 90 分钟（< refreshtoken 约 2h 失效窗），既留足余量，又避免与重连刷新重复做功。
-    const ageMs = Number(rec.updatedAt) > 0 ? (Date.now() - Number(rec.updatedAt)) : Infinity;
-    if (ageMs < WX_KEEPALIVE_MIN_AGE_MS) {
-        return; // 凭证足够新，本次保活无事可做（静默跳过，不打接口）
-    }
-
+    let source;
+    try { source = readWxCredential(accountId); }
+    catch { return; }
+    if (!source || !source.rec.refreshtoken || !wxTokenDue(source.rec)) return;
+    if (Number(source.rec.tokenRetryAfter) > Date.now()) return;
     try {
         const { WxLoginService } = require('../services/wx-login/service');
-        const svc = new WxLoginService();
-        const session = {
-            openid: rec.openid || openid,
-            loginBuffer: rec.loginBuffer,
-            refreshtoken: rec.refreshtoken,
-            accesstoken: rec.accesstoken || '',
-        };
-        const refreshed = await withTimeout(svc.refreshLoginBuffer(session), WX_REFRESH_TIMEOUT_MS, '保活刷新');
-        if (refreshed && refreshed.loginBuffer) {
-            persistRefreshedWxBuffer(file, rec, refreshed);
-            // 主动续期成功 → 当前 loginBuffer 有效，清除 1006 失效标志，下次重连走快路径
-            const live = getAccount(accountId);
-            if (live) live.wxNeedsRefresh = false;
-            log('gateway', `account ${accountId} 微信凭证主动保活成功（refreshtoken 已滚动续期，长效保活）`);
-        } else {
-            logWarn('gateway', `account ${accountId} 微信主动保活未返回有效 loginBuffer`);
+        const credentials = await refreshWxTokenSingleFlight(source.file, source.rec, new WxLoginService(), {
+            deadline: Date.now() + WX_REFRESH_TIMEOUT_MS,
+        });
+        if (!credentials.skipped) {
+            log('gateway', `account ${accountId} 微信 token-only 续期并落盘成功 business=${credentials.refreshBusinessId || 'pc_yyb'} `
+                + `expirySource=${credentials.accessTokenExpirySource || 'unknown'} tokenExpiresAt=${credentials.accessTokenExpiresAt ?? 'unknown'} `
+                + `cookieExpirySource=${credentials.accessTokenCookieExpirySource || 'unknown'}（未换码、未重连游戏）`);
         }
-    } catch (e) {
-        // ⭐ 必须先回写 rotated 凭证再判定失败：第1步 refresh 成功但第2步换 loginBuffer 失败时，
-        // error 上带着已经轮换成功的新 refreshtoken；不落盘就等于每次保活报废一次凭证。
-        const saved = persistRotatedCredentialsOnError(file, rec, e);
-        // 判断失败落在哪一步，决定是否值得重试：
-        //   - 'WeChat token refresh failed' / 'RefreshToken empty' → 第1步就死了，refreshtoken 真失效，需重扫
-        //   - 'login buffer refresh failed' / 'Unable to obtain WeChat login buffer' → 第1步成功，
-        //     凭证其实是好的，只是换 loginBuffer 被拒；下一轮很可能自愈，不该按"凭证废了"处理
-        const msg = String(e && e.message || '');
-        const tokenDead = /WeChat token refresh failed|RefreshToken empty|missing access_token/i.test(msg);
-        if (saved && !tokenDead) {
-            logWarn('gateway', `account ${accountId} 微信保活第2步失败但已回写新 refreshtoken（凭证未废，下轮重试）: ${msg.slice(0, 90)}`);
-        } else if (tokenDead) {
-            logWarn('gateway', `account ${accountId} 微信 refreshtoken 已失效（需重新扫码）: ${msg.slice(0, 90)}`);
-        } else {
-            // 滚动续期失败保持静默（可能 refreshtoken 已彻底失效），不告警避免误杀；等真正断线时再提示重扫
-            logWarn('gateway', `account ${accountId} 微信主动保活失败(静默): ${msg.slice(0, 100)}`);
-        }
+    } catch (error) {
+        // token 独立调度，绝不影响游戏WS、原生会话或已有的重连计数/计时器。
+        logWarn('gateway', `account ${accountId} 微信 token-only 续期失败 stage=${error.stage || 'unknown'} reason=${classifyWxCodeError(error).reason}`);
     }
 }
 
@@ -1049,18 +1759,29 @@ function startWxKeepalive() {
             const res = getStoreModule().getAccounts();
             const list = Array.isArray(res) ? res : ((res && res.accounts) || []);
             for (const acc of list) {
-                if (acc.platform === 'wx') keepWxCredentialAlive(acc.id).catch(() => {});
+                if (acc.platform === 'wx') keepWxCredentialAlive(acc.id).catch(error => {
+                    logWarn('gateway', `account ${acc.id} 微信凭据调度异常 stage=${error.stage || 'unknown'}`);
+                });
             }
         } catch (e) {
             logWarn('gateway', `微信主动保活定时器异常: ${String(e.message).slice(0, 100)}`);
         }
     };
     wxKeepaliveTimer = setInterval(tick, WX_KEEPALIVE_INTERVAL_MS);
-    tick(); // 启动立即跑一次，尽快锁定长效凭证（不等满 120 分钟；此后低频若 refreshtoken 未被腾讯回收则自然持续）
+    tick(); // 启动立即做本地年龄检查，实际授权仍受 90min 最小年龄约束
 }
 
 async function reconnect(account, newCode) {
-    if (account.networkStopped) return false;
+    if (!gatewayOwnsAccount(account.accountId)) return false;
+    if (gatewayShuttingDown || account.networkStopped) return false;
+    syncAccountPlatform(account);
+    if (!account.connectionDead && account.ws && (account.ws.readyState === 0 || account.ws.readyState === 1)) {
+        return account.userState.gid > 0 || await (account.loginPromise || Promise.resolve(false));
+    }
+    if (account.platform === 'wx' && account.wxRetryAfter > Date.now()) {
+        armWxReconnectAt(account, account.wxRetryAfter);
+        return false;
+    }
     // 【风控熔断·全局】全网 1006 风暴期间一律不重连（1006 多半是腾讯风控，越重连封得越久）
     if (globalReconnectPaused(account)) {
         if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
@@ -1131,108 +1852,7 @@ async function reconnect(account, newCode) {
     // 若此处仍写 `&& !newCode`，则主容器一带 code 就跳过本分支、直接用过期 code → 1006 死循环，
     // refreshtoken 续期路径永远走不到。故微信**始终**由网关自行从 wx-login 文件派生 code
     // （快路径用 buffer，过期则 refreshtoken 续期），不信任主容器带来的过期 code。
-    if (account.platform === 'wx') {
-        try {
-            const fresh = await issueWxCodeFromBuffer(account);
-            if (fresh) {
-                code = fresh;
-                account.savedCode = fresh;
-                // 换码成功即视为 Code 有效，清零失效计数，避免被 CODE_INVALID_MAX 误拦（否则微信号会卡在停止态无法自愈）
-                account.codeInvalidCount = 0;
-                account.wxCodeFailCount = 0;
-                account.wxBufferAlerted = false;
-                account.wxNeedsRefresh = false; // 重连成功说明当前 loginBuffer 有效，清除 1006 失效标志
-                account.networkStopped = false; // 恢复正常：允许后续断链重连，不再因本次失效被永久阻止
-                log('gateway', `account ${account.accountId} 微信已从 loginBuffer 换新 Code 重连`);
-            } else {
-                // 换码失败：issueWxCodeFromBuffer 内部已尝试"refreshtoken 续期"保活。
-                // ⭐ 2026-10-31 改造：不再一律按"凭证已失效"处理，先分类——
-                //   临时性（40188 / 超时 / 网络）：网络恢复后同一份凭证往往能直接换成功，
-                //     退避 5~30 分钟再试，**不计入 networkStopped**，避免几次抖动就把号打成必须扫码；
-                //   永久性（refreshtoken 真死 / 本地凭证缺失）：立即停止，等人工扫码。
-                // 关键：失败绝不再用旧 code 建连（否则必然 1006 → 反复死循环风暴，且 connect 帧每次
-                // 重置 deadReconnectCount 绕过 DEAD_RECONNECT_MAX 总闸，拖累同网关其它账号）。直接返回，不建连。
-                const cls = classifyWxCodeError(account.wxLastCodeError);
-                if (cls.temporary) {
-                    account.wxTempFailCount = (account.wxTempFailCount || 0) + 1;
-                    // 临时失败不算凭证失效：清掉永久失败计数，避免历史累积把号误判成需要扫码
-                    account.wxCodeFailCount = 0;
-                    // 指数退避：5min → 10min → 20min → 封顶 30min
-                    const backoffMs = Math.min(
-                        WX_TEMP_FAIL_BACKOFF_MAX_MS,
-                        WX_TEMP_FAIL_BACKOFF_BASE_MS * Math.pow(2, Math.max(0, account.wxTempFailCount - 1))
-                    );
-                    // 只有连续临时失败超过上限，才认为"可能真有问题"，此时才允许进入停止态
-                    if (account.wxTempFailCount >= WX_TEMP_FAIL_MAX) {
-                        if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                        account.networkStopped = true;
-                        if (!account.wxBufferAlerted) {
-                            account.wxBufferAlerted = true;
-                            logWarn('gateway', `account ${account.accountId} 微信换码连续临时失败 ${account.wxTempFailCount} 次（原因=${cls.reason}），已停止自动重连，请重新扫码`);
-                            emitEvent(account, 'code_invalid', { reason: 'wx_temp_fail_exhausted', needRescan: true, attempts: account.wxTempFailCount, detail: cls.reason });
-                        }
-                        return false;
-                    }
-                    logWarn('gateway', `account ${account.accountId} 微信换码临时失败（${cls.reason}，第 ${account.wxTempFailCount}/${WX_TEMP_FAIL_MAX} 次），退避 ${Math.round(backoffMs / 60000)} 分钟后重试（凭证未判定失效）`);
-                    // 主动排一次退避重连，而不是干等外层调度
-                    if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                    account.reconnectTimer = setTimeout(() => {
-                        account.reconnectTimer = null;
-                        if (account.networkStopped) return;
-                        reconnect(account).catch(() => {});
-                    }, backoffMs);
-                    if (account.reconnectTimer.unref) account.reconnectTimer.unref();
-                    return false; // 本轮不建连
-                }
-                // —— 永久性失败：凭证确实废了 ——
-                account.wxCodeFailCount = (account.wxCodeFailCount || 0) + 1;
-                if (account.wxCodeFailCount >= 3) {
-                    if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                    account.networkStopped = true; // 彻底停止自动重连，等用户重新扫码
-                    if (!account.wxBufferAlerted) {
-                        account.wxBufferAlerted = true;
-                        logWarn('gateway', `account ${account.accountId} 微信 loginBuffer 换码连续失败 ${account.wxCodeFailCount} 次（原因=${cls.reason}，登录态已失效），已停止自动重连，请重新扫码获取 loginBuffer`);
-                        emitEvent(account, 'code_invalid', { reason: 'wx_buffer_expired', needRescan: true, attempts: account.wxCodeFailCount, detail: cls.reason });
-                    }
-                } else {
-                    logWarn('gateway', `account ${account.accountId} 微信换码失败第 ${account.wxCodeFailCount} 次（${cls.reason}，登录态已失效），将在下次重连重试`);
-                }
-                return false; // 不建连，避免 1006 风暴
-            }
-        } catch (e) {
-            // ⭐ 2026-10-31：原先这里只要抛异常就 networkStopped=true ——
-            // 而 withTimeout 的"换码超时 20000ms / 刷新超时 30000ms"也会走到这，
-            // 等于**网络卡一下就永久停号**，这是比 40188 更致命的缺陷。
-            // 改为同样按分类处理：临时异常退避重试，只有永久性才停。
-            const cls = classifyWxCodeError(e && e.message);
-            if (cls.temporary) {
-                account.wxTempFailCount = (account.wxTempFailCount || 0) + 1;
-                const backoffMs = Math.min(
-                    WX_TEMP_FAIL_BACKOFF_MAX_MS,
-                    WX_TEMP_FAIL_BACKOFF_BASE_MS * Math.pow(2, Math.max(0, account.wxTempFailCount - 1))
-                );
-                if (account.wxTempFailCount >= WX_TEMP_FAIL_MAX) {
-                    logWarn('gateway', `account ${account.accountId} 微信换码异常连续 ${account.wxTempFailCount} 次（${cls.reason}），停止重连: ${e.message}`);
-                    account.networkStopped = true;
-                    if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                } else {
-                    logWarn('gateway', `account ${account.accountId} 微信换码异常（${cls.reason}，第 ${account.wxTempFailCount}/${WX_TEMP_FAIL_MAX} 次），退避 ${Math.round(backoffMs / 60000)} 分钟后重试: ${e.message}`);
-                    if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                    account.reconnectTimer = setTimeout(() => {
-                        account.reconnectTimer = null;
-                        if (account.networkStopped) return;
-                        reconnect(account).catch(() => {});
-                    }, backoffMs);
-                    if (account.reconnectTimer.unref) account.reconnectTimer.unref();
-                }
-                return false;
-            }
-            logWarn('gateway', `account ${account.accountId} 微信换码异常（永久性 ${cls.reason}），停止重连: ${e.message}`);
-            account.networkStopped = true;
-            if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-            return false;
-        }
-    }
+    if (account.platform === 'wx') return await connectWxSingleFlight(account);
     stopSecurityRuntime(account, '重连');
     closeCurrentWs(account, { terminate: true });
     account.userState.gid = 0;
@@ -1244,17 +1864,69 @@ async function reconnect(account, newCode) {
 }
 
 function stopNetwork(account, reason = '停止网络') {
+    account.connectionEpoch = (account.connectionEpoch || 0) + 1;
     account.networkStopped = true;
+    if (account.wxConnectController) account.wxConnectController.abort(new Error(reason));
+    cancelReconnectTimers(account);
+    clearHealthTimers(account);
     stopSecurityRuntime(account, reason);
     rejectAllPending(account, '网络已停止');
     closeCurrentWs(account, { terminate: true });
     account.userState.gid = 0;
 }
 
+function shutdownGateway() {
+    if (gatewayShutdownFlight) return gatewayShutdownFlight;
+    gatewayShuttingDown = true;
+    if (wxKeepaliveTimer) { clearInterval(wxKeepaliveTimer); wxKeepaliveTimer = null; }
+    for (const account of accounts.values()) {
+        for (const op of account.operations) {
+            if (op.sent && op.kind === 'business' && !op.read) shutdownWrites.add(op);
+        }
+    }
+    const deadline = Math.min(Date.now() + WRITE_SETTLEMENT_TIMEOUT_MS,
+        Math.max(Date.now(), ...Array.from(shutdownWrites, op => op.deadline))) + 5000;
+    let drainTimer;
+    const drained = new Promise(resolve => {
+        finishShutdownDrain = resolve;
+        if (shutdownWrites.size === 0) resolve();
+        else drainTimer = setTimeout(() => {
+            for (const account of accounts.values()) {
+                for (const op of Array.from(account.operations)) {
+                    if (shutdownWrites.has(op)) finishOperation(account, op,
+                        requestError('关闭排空结算期限已到', 'REQUEST_TIMEOUT', op));
+                }
+            }
+            resolve();
+        }, Math.max(1, deadline - Date.now()));
+    });
+    gatewayShutdownFlight = drained.then(() => {
+        clearTimeout(drainTimer);
+        finishShutdownDrain = null;
+        for (const account of accounts.values()) stopNetwork(account, '网关已完成写入排空');
+        log('gateway', '网关写入排空完成，关闭连接并退出');
+        process.exit(0);
+    });
+    // 不提前停止 runtime/WS；只停止新上报及恢复，原 operation timer/reply 负责结算唤醒。
+    for (const account of accounts.values()) {
+        cancelReconnectTimers(account);
+        clearHealthTimers(account);
+        if (account.heartbeatTimer) { clearInterval(account.heartbeatTimer); account.heartbeatTimer = null; }
+        if (account.aceService) account.aceService.stop('网关排空');
+        if (account.wxConnectController) account.wxConnectController.abort(new Error('网关排空'));
+        for (const op of Array.from(account.operations)) {
+            if (!shutdownWrites.has(op)) finishOperation(account, op,
+                requestError('网关排空，非写入结算请求已取消', 'GATEWAY_SHUTTING_DOWN', op));
+        }
+    }
+    log('gateway', `网关进入排空：已发业务写 ${shutdownWrites.size} 个，剩余最多 ${Math.ceil((deadline - Date.now()) / 1000)}s`);
+    return gatewayShutdownFlight;
+}
+
 // ============ worker 事件回传 ============
-function emitEvent(account, name, payload) {
+function emitEvent(account, name, payload, epoch = account.connectionEpoch) {
     if (account.workerSock) {
-        sendFrame(account.workerSock, { t: 'event', accountId: account.accountId, name, payload });
+        sendFrame(account.workerSock, { t: 'event', accountId: account.accountId, name, payload }, epoch);
     }
 }
 
@@ -1268,14 +1940,20 @@ function emitEventToAll(name, payload) {
 }
 
 // ============ IPC 服务器 ============
-function sendFrame(sock, obj) {
+function sendFrame(sock, obj, epoch = obj.connectionEpoch ?? getAccount(obj.accountId)?.connectionEpoch) {
     if (!sock || sock.destroyed) return;
-    sock.write(JSON.stringify(obj) + '\n');
+    // 新事件用当前账号世代；旧 operation 的回复显式传旧 epoch，不得被重新标成新会话。
+    const frame = epoch == null ? obj : {
+        ...obj, connectionEpoch: epoch,
+        ...(obj.meta ? { meta: { ...obj.meta, connectionEpoch: epoch } } : {}),
+    };
+    sock.write(JSON.stringify(frame) + '\n');
 }
 
 function startIpcServer() {
     try { fs.unlinkSync(SOCK_PATH); } catch { }
     const server = net.createServer((sock) => {
+        registerWorkerSocket(sock);
         let buf = '';
         sock.setEncoding('utf8');
         sock.on('data', (chunk) => {
@@ -1285,7 +1963,11 @@ function startIpcServer() {
                 const line = buf.slice(0, idx);
                 buf = buf.slice(idx + 1);
                 if (line.trim()) {
-                    try { handleWorkerFrame(sock, JSON.parse(line)); } catch { }
+                    try {
+                        handleWorkerFrame(sock, JSON.parse(line)).catch(error => {
+                            logWarn('gateway', `IPC请求失败: ${error.message}`);
+                        });
+                    } catch (error) { logWarn('gateway', `IPC帧无效: ${error.message}`); }
                 }
             }
         });
@@ -1298,14 +1980,131 @@ function startIpcServer() {
     });
 }
 
+function gatewayHealthStatus(account) {
+    const now = Date.now();
+    const age = at => at > 0 ? Math.max(0, now - at) : null;
+    const connected = !!(account?.ws?.readyState === 1 && account.userState.gid);
+    const ops = account ? Array.from(account.operations) : [];
+    const business = ops.filter(op => op.kind === 'business');
+    const heartbeatAgeMs = age(account?.lastHeartbeatResponse);
+    const businessAgeMs = age(account?.lastBusinessSuccessAt);
+    const oldestPendingAgeMs = getOldestPendingAgeMs(business.map(op => op.startedAt), now);
+    const health = evaluateGatewayHealth({
+        connected, heartbeatAgeMs: heartbeatAgeMs ?? Infinity,
+        oldestPendingAgeMs, businessAgeMs, businessObserved: !!account?.lastBusinessSuccessAt,
+        businessDegraded: !!account?.requestTimeoutStreak,
+    });
+    return {
+        ...health, connectionDead: !!account?.connectionDead,
+        lastInboundAt: account?.lastInboundAt || 0, inboundAgeMs: age(account?.lastInboundAt),
+        heartbeatAgeMs, aceAgeMs: age(account?.lastAceResponseAt), businessAgeMs,
+        businessReplyAgeMs: age(account?.lastBusinessReplyAt), oldestPendingAgeMs,
+        queueLength: account?.sendQueue.length || 0, pendingCount: account?.pendingCallbacks.size || 0,
+        businessPendingCount: business.length, criticalPendingCount: ops.length - business.length,
+        businessLimit: BUSINESS_REQUEST_LIMIT, criticalLimit: 3,
+        requestTimeoutLimitMs: MAX_REQUEST_TIMEOUT_MS, writeSettlementTimeoutMs: WRITE_SETTLEMENT_TIMEOUT_MS,
+        writePendingCount: business.filter(op => op.sent && !op.read).length,
+        quiescing: gatewayShuttingDown,
+        requestTimeoutStreak: account?.requestTimeoutStreak || 0,
+        businessNoResponseSince: account?.businessNoResponseSince || 0,
+        healthBackoffUntil: account?.healthBackoffUntil || 0, connectionEpoch: account?.connectionEpoch || 0,
+    };
+}
+
+const workerBindings = new WeakMap();
+let workerSocketSerial = 0;
+function registerWorkerSocket(sock) {
+    if (!workerBindings.has(sock)) workerBindings.set(sock, {
+        accountId: '', session: null, generation: null, socketSerial: ++workerSocketSerial,
+    });
+}
 async function handleWorkerFrame(sock, frame) {
-    if (!frame) return;
-    if (frame.t === 'ping') { sendFrame(sock, { t: 'pong' }); return; }
+    if (!frame || typeof frame !== 'object' || !['ping', 'status', 'connect', 'request', 'cancel', 'stop'].includes(frame.t)) return;
+    registerWorkerSocket(sock);
     const accountId = String(frame.accountId || '');
+    const binding = workerBindings.get(sock);
+    if (binding.accountId && accountId && binding.accountId !== accountId) {
+        sendFrame(sock, { t: 'error', accountId, message: '同一 IPC 连接不得混用账号' });
+        return;
+    }
+    if (frame.t === 'ping') { sendFrame(sock, { t: 'pong', ...(accountId ? { accountId } : {}) }); return; }
     if (!accountId) return;
+    if (!binding.accountId) {
+        binding.accountId = accountId;
+        binding.generation = frame.generation ?? null;
+    }
+    if (frame.generation != null && binding.generation != null && frame.generation !== binding.generation) {
+        sendFrame(sock, { t: 'error', accountId, message: 'IPC worker 世代不匹配' });
+        return;
+    }
+    if (frame.t === 'status') {
+        if (!gatewayOwnsAccount(accountId, false)) {
+            sendFrame(sock, { t: 'error', accountId, message: '此账号不由当前网关托管' });
+            return;
+        }
+        const current = getAccount(accountId);
+        sendFrame(sock, { t: 'status', accountId, state: {
+            connected: !!(current?.ws && current.ws.readyState === current.ws.OPEN && current.userState.gid),
+            ...gatewayHealthStatus(current),
+            credentialDirectory: ISOLATED_WX_GATEWAY ? 'wx-gateway' : 'wx-login',
+            temporaryFailures: current?.wxTempFailCount || 0,
+            retryAfter: current?.wxRetryAfter || 0,
+            errorStage: current?.wxLastCodeError?.stage || '',
+            errorReason: current?.wxLastCodeError ? classifyWxCodeError(current.wxLastCodeError).reason : '',
+            errorCode: current?.wxLastCodeError?.code ?? null,
+            networkStopped: !!current?.networkStopped,
+            lastGameResponseAt: current?.lastGameResponseAt || 0,
+            connecting: !!current?.wxConnectFlight || !!(current?.ws && current.ws.readyState === 0),
+            ...(getStoreAccount(accountId)?.platform === 'wx' ? { credential: wxCredentialStatus(accountId) } : {}),
+        } });
+        return; // 只读诊断不得创建账号或抢占正在工作的 workerSock。
+    }
+    if (!gatewayOwnsAccount(accountId)) {
+        sendFrame(sock, { t: 'error', accountId, message: '此账号不由当前网关托管或正在交接' });
+        return;
+    }
+    if (!['connect', 'request', 'cancel', 'stop'].includes(frame.t)) return;
     let account = getAccount(accountId);
+    if (!account && frame.t !== 'connect') {
+        sendFrame(sock, { t: 'error', accountId, message: 'worker 必须先发送 connect' });
+        return;
+    }
+    if (gatewayShuttingDown && frame.t === 'connect') {
+        sendFrame(sock, { t: 'error', accountId, message: '网关正在排空，拒绝新worker接管' });
+        return;
+    }
     if (!account) { account = createConn(accountId); accounts.set(accountId, account); }
-    account.workerSock = sock;
+    if (binding.session === null && frame.t === 'connect') {
+        if (binding.socketSerial < account.workerSocketSerial) {
+            sendFrame(sock, { t: 'error', accountId, message: '旧 IPC 连接不得接管新 worker' });
+            return;
+        }
+        account.workerSocketSerial = binding.socketSerial;
+        binding.session = ++account.workerSession;
+        binding.generation = frame.generation ?? binding.generation;
+        account.workerSock = sock;
+    }
+    if (account.workerSock !== sock || account.workerSession !== binding.session) {
+        sendFrame(sock, { t: 'error', accountId, message: '旧 worker 会话已被替换' });
+        return;
+    }
+    if ((frame.t === 'request' || frame.t === 'cancel') && frame.connectionEpoch != null
+        && frame.connectionEpoch !== account.connectionEpoch) {
+        sendFrame(sock, { t: 'response', accountId, seq: frame.seq,
+            error: '请求连接世代已过期，未发送', body: '', meta: {
+                errorCode: 'STALE_CONNECTION', stage: 'queue', sent: false,
+                resultState: 'not_sent', outcomeUnknown: false, retryable: false,
+            } }, frame.connectionEpoch);
+        return;
+    }
+    if (frame.t === 'cancel') {
+        cancelWorkerOperation(account, sock, frame);
+        return;
+    }
+    if (gatewayShuttingDown && frame.t !== 'request') {
+        sendFrame(sock, { t: 'error', accountId, message: '网关正在排空，拒绝重建或提前停止连接' });
+        return;
+    }
     // 从 store 读取账号真实 platform（微信账号为 wx，QQ 为 qq），用于建连 URL 参数
     try {
         const store = getStoreModule();
@@ -1316,64 +2115,73 @@ async function handleWorkerFrame(sock, frame) {
 
     switch (frame.t) {
         case 'connect': {
+            syncAccountPlatform(account);
+            if (account.platform === 'wx') {
+                if (!account.connectionDead && account.ws && account.ws.readyState === account.ws.OPEN && account.userState.gid) {
+                    sendFrame(sock, { t: 'login', accountId, userState: account.userState });
+                    return;
+                }
+                const generation = readWxCredentialGeneration(account);
+                const firstGeneration = !!generation && !account.wxCredentialGeneration;
+                const renewed = !!generation && !!account.wxCredentialGeneration && generation !== account.wxCredentialGeneration;
+                if (firstGeneration) account.wxCredentialGeneration = generation;
+                if (renewed) {
+                    account.connectionEpoch = (account.connectionEpoch || 0) + 1;
+                    cancelReconnectTimers(account);
+                    clearHealthTimers(account);
+                    closeCurrentWs(account, { terminate: true });
+                    stopSecurityRuntime(account, '已收到新扫码凭据');
+                    account.userState.gid = 0;
+                    account.businessNoResponseSince = 0;
+                    if (account.wxConnectController) account.wxConnectController.abort(new Error('已收到新扫码凭据'));
+                    account.wxCredentialGeneration = generation;
+                    clearWxTemporaryFailures(account);
+                    account.codeInvalidCount = 0;
+                    account.deadReconnectCount = 0;
+                    account.shortSessionCount = 0;
+                    account.wxNeedsRefresh = false;
+                    account.networkStopped = false;
+                    if (account.wxConnectFlight) await account.wxConnectFlight;
+                    if (account.workerSock !== sock || account.workerSession !== binding.session || account.networkStopped) return;
+                }
+                // 任意不同的旧磁盘 code 都不能代表新扫码或绕过冷却。
+                if (account.wxRetryAfter > Date.now()) {
+                    armWxReconnectAt(account, account.wxRetryAfter);
+                    return;
+                }
+                if (account.networkStopped) {
+                    if (account.wxConnectFlight) return; // stop前的操作必须先结算，不能被新帧复活。
+                    account.networkStopped = false; // 新的一次start；冷却与新扫码世代检查已在上方完成。
+                }
+                await connectWxSingleFlight(account);
+                return;
+            }
             // 活连接：网关已持有 gameserver WebSocket 且已登录
             const liveWs = !!(account.ws && account.ws.readyState === account.ws.OPEN && account.userState && account.userState.gid);
             const incomingCode = frame.code;
+            const codeChanged = !!(incomingCode && String(incomingCode) !== String(account.savedCode || ''));
+            if ((account.reconnectTimer || account.deadReconnectTimer || account.connectionDead) && !codeChanged) return; // watchdog不得吞掉合法退避。
             // 重抓/重启可能发生在上一次重连风暴期间：先清掉已排队的旧 timer，
             // 否则它稍后会用废 Code 冲服务器，把刚重抓好的新连接顶掉（"抓了好几次仍被顶"的根因）
             if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
             // 收到 connect 即视为一次新的登录尝试，清除"Code 已失效"告警标记与重连计数，允许重新判定
             account.codeInvalidAlerted = false;
             account.reconnectAttempts = 0;
-            account.requestTimeoutStreak = 0;
             // 注意：此处**不再**无条件清零 deadReconnectCount / shortSessionCount。
             // worker 每次重启都会发 connect 帧，无条件清零等于"重启即绕过风控熔断"
             // （2026-09-09 微信每 14 秒一次 1006 循环就是这么来的）。
             // 只有用户带来**全新 Code**（真人工重抓/扫码）才重置，见下方 codeChanged 分支。
             // 用户显式带了新 Code（重抓后 /start）：与已存 savedCode 不同即视为换号/换登录态
-            const codeChanged = !!(incomingCode && String(incomingCode) !== String(account.savedCode || ''));
             if (liveWs && !codeChanged) {
                 // worker 重启/重连场景：网关 WebSocket 仍存活，直接复用，不重新登录（不消耗新 Code）
                 log('gateway', `account ${accountId} 复用已有网关连接（worker 重启免 Code）`);
                 sendFrame(sock, { t: 'login', accountId, userState: account.userState });
             } else {
                 // 无活连接，或用户提供了新 Code：关旧建新，用新 Code（或已存 savedCode）重建
-                let code = codeChanged ? incomingCode : account.savedCode;
-                // 微信：code 必须以网关持有的 wx-login 文件为准，绝不能用主容器带来的过期 code 直接建连，
-                // 否则反复 1006 死循环且 refreshtoken 续期路径永远走不到（微信掉线无法自愈的根因）。
-                // 始终由网关从 loginBuffer 派生（过期则 refreshtoken 续期），与主容器带来的 code 无关。
-                if (account.platform === 'wx') {
-                    try {
-                        const fresh = await issueWxCodeFromBuffer(account);
-                        if (fresh) {
-                            code = fresh;
-                            account.savedCode = fresh;
-                            account.codeInvalidCount = 0;
-                            account.wxCodeFailCount = 0;
-                            account.wxBufferAlerted = false;
-                            account.wxNeedsRefresh = false;
-                            account.networkStopped = false; // 换新 Code 成功：恢复自动重连能力
-                        } else {
-                            // 换码失败（loginBuffer/refreshtoken 均失效）：绝不用旧 code 建连，
-                            // 否则必然 1006 死循环，且 connect 帧每次会重置 deadReconnectCount 绕过总闸 → 风暴。
-                            // 直接返回，累计失败计数达上限后彻底停止；用户重新扫码落盘新文件后下次 connect 帧即可自愈。
-                            logWarn('gateway', `account ${accountId} 微信换码/续期失败，仍需重新扫码`);
-                            account.wxCodeFailCount = (account.wxCodeFailCount || 0) + 1;
-                            if (account.wxCodeFailCount >= 3) {
-                                account.networkStopped = true;
-                                if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                                if (!account.wxBufferAlerted) {
-                                    account.wxBufferAlerted = true;
-                                    emitEvent(account, 'code_invalid', { reason: 'wx_buffer_expired', needRescan: true, attempts: account.wxCodeFailCount });
-                                }
-                            }
-                            return; // 不走到 connect(account, code)，避免 1006 风暴
-                        }
-                    } catch (e) {
-                        logWarn('gateway', `account ${accountId} 微信换码/续期异常: ${e.message}`);
-                        return;
-                    }
-                }
+                // gateway维护重启后内存savedCode为空；resume帧不带旧code，按本账号读取落盘code。
+                const code = codeChanged ? incomingCode : (account.savedCode || getStoreAccount(accountId)?.code);
+                if (!codeChanged && account.ws && (account.ws.readyState === 0 || account.ws.readyState === 1)) return;
+                account.networkStopped = false;
                 if (codeChanged) {
                     log('gateway', `account ${accountId} 收到新 Code，重建连接（启用新登录态）`);
                     // 用户重抓/扫码后下发新 Code：清空失效计数与告警，恢复自动重连
@@ -1384,100 +2192,31 @@ async function handleWorkerFrame(sock, frame) {
                     account.deadReconnectAlerted = false;
                     account.shortSessionCount = 0;
                     account.shortSessionAlerted = false;
+                    account.connectionEpoch = (account.connectionEpoch || 0) + 1;
+                    closeCurrentWs(account, { terminate: true });
+                    stopSecurityRuntime(account, '收到新Code');
+                    rejectAllPending(account, '已更换登录态');
+                    account.userState.gid = 0;
+                    account.clientSeq = 0;
+                    account.serverSeq = 0;
                 }
                 connect(account, code);
             }
             break;
         }
         case 'request': {
-            const body = Buffer.from(frame.body || '', 'base64');
-            const cb = {
-                workerSeq: frame.seq,
-                workerSock: sock,
-                timer: setTimeout(() => {
-                    // 假死兜底：请求发到死连接永不回包，超时快速失败，避免 worker 侧永久挂起
-                    account.pendingCallbacks.forEach((v, k) => { if (v === cb) account.pendingCallbacks.delete(k); });
-                    sendFrame(sock, { t: 'response', accountId, seq: frame.seq, error: '网关请求超时（连接可能假死）', body: '', meta: {} });
-
-                    // 业务级假死判死：连续 N 次业务请求全部超时 → 该连接已无法干活，主动断开重连。
-                    // 不会比现状更差（现状是永久假死、前端永远取不到数据）；微信自动换码自愈，
-                    // QQ 用保存的 savedCode 复用重连（已验证 code 可复用）；若 code 真过期，
-                    // 连续判死重连仍不通时由分平台上限（getDeadReconnectMax：微信3/QQ10）兜底停止并发告警，提醒用户重抓。
-                    account.requestTimeoutStreak = (account.requestTimeoutStreak || 0) + 1;
-
-                    // ===== 亚健康退避信号（防判死在源头） =====
-                    // 未到判死阈值(DEAD_REQUEST_TIMEOUT_STREAK=5)前，若已连续 HEALTH_DEGRADED_STREAK 次超时
-                    // （约 2×30s），说明服务端开始变慢/静默。立即通知 worker 暂停业务请求、给心跳让路自愈，
-                    // 避免 pending 队列被固定频率的农场/好友任务打满、连心跳都排不上而最终判死掉线。
-                    // 注意：这里不清零 requestTimeoutStreak——若连接真死，会继续累加走到下方判死重连；若只是
-                    // 短暂变慢，worker 退避后心跳/业务恢复，收到回包会清空 requestTimeoutStreak(见 handleMessage)。
-                    if (account.requestTimeoutStreak === HEALTH_DEGRADED_STREAK && !account.healthBackoffChanging) {
-                        account.healthBackoffChanging = true;
-                        const backoffMs = Math.min(
-                            HEALTH_BACKOFF_BASE_MS * Math.pow(2, account.degradedStreak),
-                            HEALTH_BACKOFF_MAX_MS
-                        );
-                        account.degradedStreak += 1;
-                        logWarn('gateway', `account ${account.accountId} 业务请求连续超时 ${HEALTH_DEGRADED_STREAK} 次，判定亚健康，通知 worker 退避 ${Math.round(backoffMs / 1000)}s 给心跳让路（第 ${account.degradedStreak} 次健康退避）`);
-                        emitEvent(account, 'connection_degraded', { backoffMs, degradedStreak: account.degradedStreak });
-                        // 退避窗口结束后解除节流，允许下次亚健康再次发出信号
-                        setTimeout(() => { try { account.healthBackoffChanging = false; } catch (_e) { } }, backoffMs);
-                    }
-
-                    if (account.requestTimeoutStreak >= DEAD_REQUEST_TIMEOUT_STREAK) {
-                        account.requestTimeoutStreak = 0; // 清零节流，避免每个超时请求都触发一次重连
-                        // 连续判死重连计数：重连成功且有业务回包时清零（见 handleMessage / onAccountLogin）；
-                        // 若重连后仍不通，计数持续累加，达上限即停止 —— 防止无限重连风暴拖垮网关。
-                        account.deadReconnectCount = (account.deadReconnectCount || 0) + 1;
-                        logWarn('gateway', `account ${account.accountId} 业务请求连续超时 ${DEAD_REQUEST_TIMEOUT_STREAK} 次（约 ${Math.round(DEAD_REQUEST_TIMEOUT_STREAK * WORKER_REQUEST_TIMEOUT_MS / 1000)}s），判定连接假死，主动断开重连（第 ${account.deadReconnectCount} 次）`);
-                        emitEvent(account, 'connection_dead', { timeoutStreak: DEAD_REQUEST_TIMEOUT_STREAK, deadReconnectCount: account.deadReconnectCount });
-
-                        // 分平台判死重连上限：微信 3（loginBuffer 自愈强），QQ 10（code 可复用，给足自动续命机会，
-                        // 仍由 QQ_CODE_INVALID_MAX=20 兜底防风暴）。连续多次判死重连后业务仍不通：
-                        // 凭证（Code/loginBuffer）多半已失效，再重试只会形成风暴并拖垮同一网关下的其它账号——
-                        // 停止并告警，等人工处理。
-                        const drMax = getDeadReconnectMax(account);
-                        if (account.deadReconnectCount > drMax) {
-                            // 连续多次判死重连后业务仍不通：凭证（Code/loginBuffer）多半已失效，
-                            // 再重试只会形成风暴并拖垮同一网关下的其它账号 —— 停止并告警，等人工处理。
-                            if (!account.deadReconnectAlerted) {
-                                account.deadReconnectAlerted = true;
-                                logWarn('gateway', `account ${account.accountId}${account.platform === 'wx' ? '' : '(QQ)'} 连续 ${account.deadReconnectCount} 次假死重连后仍无法恢复（凭证可能已失效，上限 ${drMax}），停止自动重连，请重新抓包或扫码`);
-                                emitEvent(account, 'dead_reconnect_exhausted', { deadReconnectCount: account.deadReconnectCount, needed: drMax });
-                            }
-                            // 清掉已排队的重连 timer，否则它稍后还会再拉起一次重连
-                            if (account.reconnectTimer) { clearTimeout(account.reconnectTimer); account.reconnectTimer = null; }
-                            // 关掉死连接，避免面板显示"在线"却取不到数据（假在线）误导排查
-                            if (account.ws) { try { account.ws.close(); } catch (_e) { /* ignore */ } }
-                            return;
-                        }
-
-                        // 第 1 次立即重连（网络抖动场景快速自愈）；之后递增退避，避免密集冲击 gameserver
-                        // 【2026-09-05 QQ 降频】改用分平台退避：QQ 首次也避且节奏慢（见 getDeadReconnectBackoffMs），
-                        // 微信保持原"第 1 次立即 + 60s 递增"，避免 QQ 高频重建 WS 加速 code 失效。
-                        const backoffMs = getDeadReconnectBackoffMs(account, account.deadReconnectCount || 1);
-                        if (backoffMs > 0) {
-                            log('gateway', `account ${account.accountId} 假死重连退避 ${Math.round(backoffMs / 1000)}s 后重试`);
-                            setTimeout(() => {
-                                if (account.networkStopped) return;
-                                reconnect(account, null).catch(() => { });
-                            }, backoffMs);
-                        } else {
-                            reconnect(account, null).catch(() => { });
-                        }
-                    }
-                }, WORKER_REQUEST_TIMEOUT_MS),
-            };
-            try {
-                const seq = await sendMsg(account, frame.service, frame.method, body, cb);
-                if (seq < 0) {
-                    try { clearTimeout(cb.timer); } catch { }
-                    sendFrame(sock, { t: 'response', accountId, seq: frame.seq, error: 'WebSocket 未连接', body: '', meta: {} });
-                }
-            } catch (e) {
-                try { clearTimeout(cb.timer); } catch { }
-                sendFrame(sock, { t: 'response', accountId, seq: frame.seq, error: e.message, body: '', meta: {} });
+            if (typeof frame.service !== 'string' || typeof frame.method !== 'string' || typeof (frame.body || '') !== 'string'
+                || (frame.body || '').length > Math.ceil(MAX_REQUEST_BODY_BYTES / 3) * 4
+                || Buffer.byteLength(frame.body || '', 'base64') > MAX_REQUEST_BODY_BYTES) {
+                sendFrame(sock, { t: 'response', accountId, seq: frame.seq, error: '无效网关请求', body: '', meta: { errorCode: 'INVALID_REQUEST', stage: 'queue',
+                    sent: false, retryable: false, outcomeUnknown: false, resultState: 'not_sent' } });
+                return;
             }
+            const body = Buffer.from(frame.body || '', 'base64');
+            await sendMsg(account, frame.service, frame.method, body, {
+                workerSeq: frame.seq, workerSock: sock,
+                timeoutMs: frame.meta?.timeoutMs, deadline: frame.meta?.deadline,
+            });
             break;
         }
         case 'stop':
@@ -1491,8 +2230,12 @@ async function handleWorkerFrame(sock, frame) {
 if (require.main === module || process.env.FARM_GATEWAY_PROCESS === '1') {
     // 网关进程必须先加载 Proto 定义（types.LoginRequest 等）再启动 IPC 服务，否则建连/登录时 encode 会报 undefined
     loadProto().then(() => {
+        if (gatewayShuttingDown) return;
+        if (ISOLATED_WX_GATEWAY && (!gatewayOwnsAccount('2', false) || SOCK_PATH !== '/sock/qq-farm-wx.sock')) {
+            throw new Error('独立微信网关托管登记不存在或 Socket 配置错误');
+        }
         startIpcServer();
-        startWxKeepalive(); // 微信凭证低频（120min）兜底续期：仅在 refreshtoken 过期临界前刷新一次，避免高频调授权接口触发腾讯风控（回撤 30min 高频轮询）
+        startWxKeepalive(); // 每 10min 本地检查，90min 最小年龄控制实际主动授权频率
     }).catch((e) => {
         logWarn('gateway', `Protobuf 加载失败，网关无法建连: ${e.message}`);
         process.exit(1);
@@ -1504,8 +2247,8 @@ if (require.main === module || process.env.FARM_GATEWAY_PROCESS === '1') {
     process.on('unhandledRejection', (reason) => {
         logWarn('gateway', `未捕获的 Promise 拒绝(兜底不退出): ${reason && reason.message ? reason.message : reason}`);
     });
-    process.on('SIGTERM', () => { accounts.forEach((a) => stopNetwork(a)); process.exit(0); });
-    process.on('SIGINT', () => { accounts.forEach((a) => stopNetwork(a)); process.exit(0); });
+    process.on('SIGTERM', () => { void shutdownGateway(); });
+    process.on('SIGINT', () => { void shutdownGateway(); });
 }
 
-module.exports = { startIpcServer, connect };
+module.exports = { startIpcServer, connect, shutdownGateway };

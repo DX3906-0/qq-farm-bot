@@ -88,25 +88,29 @@ function createAdminRouteHelpers({ store, userStore, logger, getProvider }) {
     }
   }
 
-  function isExpectedProviderError(err) {
-    const message = String((err && err.message) || '');
-    return message === '账号未运行' || message === 'API Timeout';
-  }
-
   function sendProviderError(res, err) {
-    if (res.headersSent || res.writableEnded || res.destroyed || res.locals?.requestTimedOut)
+    if (res.headersSent || res.writableEnded || res.destroyed || res.locals?.requestTimedOut || res.locals?.requestClosed)
       return;
 
-    if (isExpectedProviderError(err)) {
-      return res.json({
-        ok: false,
-        error: err.message,
-      });
+    const errorCode = err?.errorCode || err?.code;
+    const unavailable = new Set(['HEALTH_BACKOFF', 'QUEUE_FULL', 'API_QUEUE_FULL', 'DEADLINE', 'TIMEOUT', 'REQUEST_TIMEOUT', 'REQUEST_DEADLINE', 'READ_FLIGHTS_FULL']);
+    const payload = { ok: false, error: String(err?.message || 'Provider Error') };
+    for (const key of ['errorCode', 'stage', 'retryAfterMs', 'sent', 'resultState', 'outcomeUnknown',
+      'holdUntilTransportEpochChanged', 'friendGid', 'processing']) {
+      if (err?.[key] !== undefined) payload[key] = err[key];
     }
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
+    if (errorCode) payload.errorCode = errorCode;
+    // 不确定的写结果不能提供重试提示；只有传输层给出的准确剩余时间才发 Retry-After。
+    if (unavailable.has(errorCode) && err?.outcomeUnknown !== true
+      && Number.isFinite(err?.retryAfterMs) && err.retryAfterMs > 0) {
+      res.setHeader('Retry-After', String(Math.ceil(err.retryAfterMs / 1000)));
+    }
+    if (unavailable.has(errorCode)) return res.status(503).json(payload);
+    if (['CANCELLED', 'CANCELED', 'ABORT_ERR', 'REQUEST_CANCELLED', 'QUEUE_CANCELLED'].includes(errorCode)) return res.status(499).json(payload);
+    if (errorCode === 'WORKER_NOT_RUNNING') return res.json(payload);
+    // 仅为旧 worker 保留历史文字响应；有结构化代码的异常不按 message 分类。
+    if (!errorCode && (payload.error === '账号未运行' || payload.error === 'API Timeout')) return res.json(payload);
+    return res.status(500).json(payload);
   }
 
   function requireAdminRole(req, res, next) {

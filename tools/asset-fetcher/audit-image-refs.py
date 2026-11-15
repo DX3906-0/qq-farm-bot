@@ -7,7 +7,7 @@
 import os
 import re
 
-ROOT = 'D:/小工具/qq-farm-bot-main'
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SRC_DIRS = [os.path.join(ROOT, 'web', 'src'), os.path.join(ROOT, 'core', 'src')]
 SKIP = ('node_modules',)
 

@@ -16,7 +16,11 @@ const { toLong, toNum, syncServerTime, log, logWarn } = require('./utils');
 const cryptoWasm = require('./crypto-wasm');
 const { createGatewayToken } = require('./gateway-token');
 const { TsdkRuntime } = require('./tsdk-runtime');
-const { createRequestGate, getRequestPriority, runWithRequestPriority } = require('./request-priority');
+const {
+    createRequestGate, runWithRequestPriority, runWithRequestContext, getRequestContext,
+    throwIfRequestCancelled, getRequestOptions, requestError, isCriticalRequest,
+    isSafeReadRequest, createSafeReadFlights, createWriteDrain,
+} = require('./request-priority');
 
 // 延迟加载 warehouse 模块避免循环依赖
 let warehouseModule = null;
@@ -49,7 +53,53 @@ const pendingStartedAt = new Map();
 let wsErrorState = { code: 0, at: 0, message: '' };
 const networkScheduler = createScheduler('network');
 // 请求优先级闸门（移植自上游）：按优先级排序、限制并发，避免业务请求洪峰挤占关键请求
-const requestGate = createRequestGate({ maxActive: 8, maxQueued: 100 });
+const requestGate = createRequestGate({ maxActive: 8, maxCritical: 1, maxQueued: 100 });
+const safeFlights = createSafeReadFlights();
+const directRequests = new Map();
+let quiescing = false;
+const writeDrain = createWriteDrain(getPendingWriteCount);
+function getPendingWriteCount() {
+    let count = 0;
+    for (const callback of pendingCallbacks.values()) if (callback.read !== true && callback.critical !== true) count++;
+    return count;
+}
+function quiescingError() { return requestError('业务传输正在静默排空', { errorCode: 'TRANSPORT_QUIESCING', stage: 'queue' }); }
+function quiesceAndDrain({ timeoutMs = 155000 } = {}) {
+    quiescing = true;
+    cancelQueued(quiescingError());
+    safeFlights.cancelUnsent();
+    return writeDrain.wait(timeoutMs);
+}
+let connectionEpoch = 0;
+let healthBackoffUntil = 0;
+let healthBackoffReason = '';
+function getHealthBackoffState() {
+    if (healthBackoffUntil && Date.now() >= healthBackoffUntil) clearHealthBackoff();
+    return { active: healthBackoffUntil > 0, remainingMs: Math.max(0, healthBackoffUntil - Date.now()), reason: healthBackoffReason };
+}
+function isHealthBackoffActive() { return getHealthBackoffState().active; }
+function clearHealthBackoff() { healthBackoffUntil = 0; healthBackoffReason = ''; }
+function healthBackoffError() {
+    return requestError(`连接亚健康退避中(${healthBackoffReason})`, { errorCode: 'HEALTH_BACKOFF', stage: 'queue', retryAfterMs: Math.max(0, healthBackoffUntil - Date.now()) });
+}
+function cancelQueued(reason = '业务请求已取消') { return requestGate.cancelQueued(reason); }
+function setHealthBackoff(ms, reason) {
+    if (!Number.isFinite(Number(ms)) || Number(ms) <= 0) return;
+    healthBackoffUntil = Math.max(healthBackoffUntil, Date.now() + Number(ms));
+    healthBackoffReason = String(reason || '业务请求连续超时');
+    cancelQueued(healthBackoffError());
+}
+function getDiagnosticSnapshot() {
+    return { accountId: String(process.env.FARM_ACCOUNT_ID || ''), connectionEpoch, remoteGeneration: connectionEpoch,
+        connected: isConnected(), loggedIn: !!(isConnected() && Number(userState.gid) > 0), detached: false,
+        pending: pendingCallbacks.size, quiescing, pendingWrites: getPendingWriteCount(),
+        actualSent: [...directRequests.values()].filter(item => item.actualSent).length,
+        pendingActualWrites: [...directRequests.values()].filter(item => !item.read && !item.critical && item.actualSent).length,
+        deadlines: [...directRequests.entries()].map(([seq, item]) => ({ seq, readOnly: item.read, critical: item.critical,
+            actualSent: item.actualSent, sentAt: item.sentAt, settlementDeadline: item.settlementDeadline, timeoutDeadline: item.timeoutDeadline })),
+        oldestPendingStartedAt: pendingStartedAt.size ? Math.min(...pendingStartedAt.values()) : 0,
+        queue: requestGate.snapshot(), reads: safeFlights.snapshot(), healthBackoff: getHealthBackoffState() };
+}
 let tsdkRuntime = null;
 let aceService = null;
 let initialGamePackInfo = '';
@@ -155,6 +205,10 @@ function stopSecurityRuntime(reason = '停止') {
 }
 
 function rejectAllPendingRequests(reason = '请求被中断') {
+    connectionEpoch++;
+    userState.gid = 0;
+    safeFlights.invalidate();
+    requestGate.cancelQueued(reason, () => true);
     const entries = Array.from(pendingCallbacks.entries());
     pendingCallbacks.clear();
     pendingStartedAt.clear();
@@ -165,6 +219,7 @@ function rejectAllPendingRequests(reason = '请求被中断') {
             // ignore callback failure
         }
     }
+    writeDrain.notify();
     return entries.length;
 }
 
@@ -196,7 +251,8 @@ function applyUserExpPatch(patch) {
     const nextExp = Number(p.exp);
     const nextLevel = Number(p.level);
     let changed = false;
-    if (Number.isFinite(nextExp) && nextExp > 0 && nextExp !== Number(userState.exp)) {
+    if (p.exp !== null && p.exp !== undefined && Number.isSafeInteger(nextExp) && nextExp >= 0
+        && nextExp !== Number(userState.exp)) {
         userState.exp = nextExp;
         changed = true;
     }
@@ -281,17 +337,26 @@ async function encodeMsg(serviceName, methodName, bodyBytes, clientSeqValue) {
 }
 
 async function sendMsg(serviceName, methodName, bodyBytes, callback) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (quiescing && !(isCriticalRequest(serviceName, methodName) && methodName === 'Heartbeat')) throw quiescingError();
+    const socket = ws;
+    const epoch = connectionEpoch;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
         log('系统', '[WS] 连接未打开');
         return false;
     }
     const seq = clientSeq;
     clientSeq += 1;
     const encoded = await encodeMsg(serviceName, methodName, bodyBytes, seq);
+    if (socket !== ws || epoch !== connectionEpoch || socket.readyState !== WebSocket.OPEN) return false;
+    if (quiescing && !(isCriticalRequest(serviceName, methodName) && methodName === 'Heartbeat')) throw quiescingError();
+    if (callback?.validate) callback.validate();
+    if (callback?.isSettled?.()) return false;
     if (callback) pendingCallbacks.set(seq, callback);
-    // ws.send(encoded);
     try {
-        ws.send(encoded);
+        if (!isSafeReadRequest(serviceName, methodName)) safeFlights.invalidate();
+        if (callback?.markSent) callback.markSent();
+        socket.send(encoded);
+        if (callback?.markActualSent) callback.markActualSent();
     } catch (err) {
         if (callback) {
             pendingCallbacks.delete(seq);
@@ -303,63 +368,92 @@ async function sendMsg(serviceName, methodName, bodyBytes, callback) {
     return true;
 }
 
-/** Promise 版发送 */
-async function sendMsgAsync(serviceName, methodName, bodyBytes, timeout = 20000) {
-    // 优先级闸门：按优先级排队、限制并发（替换原先"队列满即拒绝"的粗暴策略）。
-    // 优先级经 runWithRequestPriority() 在异步上下文中传递，故本函数签名保持不变。
-    const release = await requestGate.acquire(getRequestPriority());
+/** Promise 版发送；加密、序号分配和 sendMsg 协议路径保持原有实现。 */
+async function sendDirectRequest(serviceName, methodName, bodyBytes, options, read, markSent = () => {}, session = {}) {
+    const socket = session.socket ?? ws;
+    const epoch = session.epoch ?? connectionEpoch;
+    const accountId = session.accountId ?? String(process.env.FARM_ACCOUNT_ID || '');
+    const critical = isCriticalRequest(serviceName, methodName);
+    function validate() {
+        throwIfRequestCancelled(options);
+        if (quiescing && (!critical || methodName !== 'Heartbeat')) throw quiescingError();
+        if (options.validateWaiters) options.validateWaiters();
+        if (!critical && isHealthBackoffActive()) throw healthBackoffError();
+        if (!socket || socket !== ws || epoch !== connectionEpoch || socket.readyState !== WebSocket.OPEN
+            || accountId !== String(process.env.FARM_ACCOUNT_ID || '') || (!critical && !userState.gid)) {
+            throw requestError(`连接或登录代际不可用: ${methodName}`, { errorCode: 'CONNECTION_UNAVAILABLE', stage: 'queue' });
+        }
+    }
+    validate();
+    const release = await requestGate.acquire(critical ? 'critical' : options.priority === 'critical' ? 'foreground' : options.priority, { ...options, validate });
     try {
+        validate();
         return await new Promise((resolve, reject) => {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                reject(new Error(`连接未打开: ${methodName}`));
-                return;
-            }
-
-            if (pendingCallbacks.size >= 100) {
-                reject(new Error(`请求队列已满: ${methodName} (pending=${pendingCallbacks.size})`));
-                return;
-            }
-
             const seq = clientSeq;
-            const timeoutKey = `request_timeout_${seq}`;
+            const item = { read, critical, actualSent: false, sentAt: 0, settlementDeadline: 0, timeoutDeadline: 0 };
+            directRequests.set(seq, item);
             let settled = false;
-
-            networkScheduler.setTimeoutTask(timeoutKey, timeout, () => {
+            let sent = false;
+            let timer;
+            function finish(error, body, meta) {
                 if (settled) return;
                 settled = true;
+                if (timer) clearTimeout(timer);
                 pendingCallbacks.delete(seq);
                 pendingStartedAt.delete(seq);
-                const pending = pendingCallbacks.size;
-                reject(new Error(`请求超时: ${methodName} (seq=${seq}, pending=${pending})`));
-            });
-
+                directRequests.delete(seq);
+                if (error) {
+                    reject(requestError(error.message, { sent,
+                        resultState: sent && !read ? 'unknown' : sent ? 'failed' : 'not_sent', ...error }));
+                } else resolve({ body, meta, resultState: 'completed' });
+                writeDrain.notify();
+            }
+            finish.read = read;
+            finish.critical = critical;
+            finish.validate = validate;
+            finish.isSettled = () => settled;
+            function armTimeout(budgetMs) {
+                if (timer) clearTimeout(timer);
+                item.timeoutDeadline = Date.now() + Math.max(0, budgetMs);
+                timer = setTimeout(() => finish(requestError(`请求超时: ${methodName}`, {
+                    errorCode: 'REQUEST_TIMEOUT', stage: 'transport', sent, resultState: sent && !read ? 'unknown' : sent ? 'failed' : 'not_sent',
+                })), Math.max(0, budgetMs));
+            }
+            finish.markSent = () => { sent = true; markSent(); };
+            finish.markActualSent = () => {
+                if (settled) return;
+                item.actualSent = true;
+                item.sentAt = Date.now();
+                item.settlementDeadline = item.sentAt + (critical ? Math.min(60000, options.wireTimeoutMs) : options.settlementTimeoutMs);
+                if (!read) armTimeout(Math.min(125000, item.settlementDeadline - Date.now() + 5000));
+            };
+            armTimeout(options.deadline - Date.now());
+            // 加密期间也登记回调，断连能及时清理；sendMsg 仍持有原序号。
+            pendingCallbacks.set(seq, finish);
             pendingStartedAt.set(seq, Date.now());
-
-            sendMsg(serviceName, methodName, bodyBytes, (err, body, meta) => {
-                networkScheduler.clear(timeoutKey);
-                pendingStartedAt.delete(seq);
-                if (settled) return;
-                settled = true;
-                if (err) reject(err);
-                else resolve({ body, meta });
-            }).then((sent) => {
-                if (sent || settled) return;
-                networkScheduler.clear(timeoutKey);
-                pendingStartedAt.delete(seq);
-                settled = true;
-                reject(new Error(`发送失败: ${methodName}`));
-            }).catch((error) => {
-                if (settled) return;
-                networkScheduler.clear(timeoutKey);
-                pendingCallbacks.delete(seq);
-                pendingStartedAt.delete(seq);
-                settled = true;
-                reject(error);
-            });
+            sendMsg(serviceName, methodName, bodyBytes, finish).then(ok => {
+                if (!ok && !settled) finish(requestError(`发送失败: ${methodName}`, {
+                    errorCode: 'SEND_FAILED', stage: 'send', sent, resultState: sent && !read ? 'unknown' : sent ? 'failed' : 'not_sent',
+                }));
+            }).catch(finish);
         });
     } finally {
+        if (!read) safeFlights.invalidate();
         release();
     }
+}
+async function sendMsgAsync(serviceName, methodName, bodyBytes, meta) {
+    const options = getRequestOptions(meta, 20000);
+    if (quiescing && !(isCriticalRequest(serviceName, methodName) && methodName === 'Heartbeat')) throw quiescingError();
+    const body = Buffer.from(bodyBytes || []);
+    if (!isCriticalRequest(serviceName, methodName) && isHealthBackoffActive()) throw healthBackoffError();
+    throwIfRequestCancelled(options);
+    if (!isSafeReadRequest(serviceName, methodName)) return sendDirectRequest(serviceName, methodName, body, options, false);
+    const session = { socket: ws, epoch: connectionEpoch, accountId: String(process.env.FARM_ACCOUNT_ID || '') };
+    return safeFlights.run({ accountId: session.accountId, epoch: connectionEpoch,
+        service: serviceName, method: methodName, body, context: options,
+        execute: ({ signal, markSent, validateWaiters, deadline }) => sendDirectRequest(serviceName, methodName, body,
+            { ...options, signal, validateWaiters, deadline }, true, markSent, session) });
 }
 
 // ============ 消息处理 ============
@@ -379,6 +473,7 @@ function handleMessage(data) {
 
         // Notify
         if (msgType === 3) {
+            safeFlights.invalidate();
             handleNotify(msg);
             return;
         }
@@ -393,10 +488,13 @@ function handleMessage(data) {
                 pendingCallbacks.delete(clientSeqVal);
                 pendingStartedAt.delete(clientSeqVal);
                 if (errorCode !== 0) {
-                    cb(new Error(`${meta.service_name}.${meta.method_name} 错误: code=${errorCode} ${meta.error_message || ''}`));
+                    cb(requestError(`${meta.service_name}.${meta.method_name} 错误: code=${errorCode} ${meta.error_message || ''}`, {
+                        errorCode, stage: 'remote', sent: true, resultState: 'failed',
+                    }));
                 } else {
                     cb(null, msg.body, meta);
                 }
+                writeDrain.notify();
                 return;
             }
 
@@ -461,10 +559,15 @@ function handleNotify(msg) {
                     // 仅使用 ID=1101 作为经验值标准
                     if (id === 1101) {
                         // 优先使用总量；若仅有 delta 也可累加
-                        if (count > 0) userState.exp = count;
-                        else if (delta !== 0) userState.exp = Math.max(0, Number(userState.exp || 0) + delta);
+                        if (hasOwn(item, 'count') && Number.isSafeInteger(count) && count >= 0) userState.exp = count;
+                        else if (Number.isSafeInteger(delta) && delta !== 0) userState.exp = Math.max(0, Number(userState.exp || 0) + delta);
+                        else continue; // 未提供经验总量或增量，不能把缓存当真实 idle。
                         // 这里调用 updateStatusLevel 会触发 status.js -> worker.js -> stats.js 的更新流程
                         updateStatusLevel(userState.level, userState.exp);
+                        networkEvents.emit('experienceObserved', {
+                            exp: userState.exp, level: userState.level, gid: userState.gid,
+                            at: Date.now(), source: 'item-notify'
+                        });
                     } else if (id === 1 || id === 1001) {
                         // 金币通知有时只有 delta 没有总量，避免把未提供总量误当 0 覆盖
                         if (count > 0) {
@@ -516,6 +619,10 @@ function handleNotify(msg) {
                         if (Number.isFinite(exp) && exp >= 0) {
                             userState.exp = exp;
                             updateStatusLevel(userState.level, exp);
+                            networkEvents.emit('experienceObserved', {
+                                exp, level: userState.level, gid: userState.gid,
+                                at: Date.now(), source: 'basic-notify'
+                            });
                         }
                     }
                     if (shouldUpdateGoldView) {
@@ -801,6 +908,7 @@ function closeCurrentWs({ terminate = false } = {}) {
     const current = ws;
     if (!current) return;
     ws = null;
+    rejectAllPendingRequests('连接代际已关闭');
     current.removeAllListeners();
     try {
         if (terminate && typeof current.terminate === 'function') current.terminate();
@@ -835,6 +943,7 @@ function scheduleReconnect(reason) {
 }
 
 function connect(code, onLoginSuccess) {
+    quiescing = false;
     networkStopped = false;
     savedLoginCallback = onLoginSuccess;
     if (code) savedCode = code;
@@ -875,6 +984,11 @@ function connect(code, onLoginSuccess) {
         headers: buildWebSocketHeaders(deviceProtocol),
     });
     ws = socket;
+    connectionEpoch++;
+    userState.gid = 0;
+    safeFlights.invalidate();
+    clearHealthBackoff();
+    const socketEpoch = connectionEpoch;
 
     socket.binaryType = 'arraybuffer';
 
@@ -892,11 +1006,13 @@ function connect(code, onLoginSuccess) {
     });
 
     socket.on('message', (data) => {
+        if (ws !== socket || socketEpoch !== connectionEpoch) return;
         handleMessage(Buffer.isBuffer(data) ? data : Buffer.from(data));
     });
 
     socket.on('close', (code, _reason) => {
-        if (ws === socket) ws = null;
+        if (ws !== socket) return;
+        ws = null;
         logWarn('系统', `[WS] 连接关闭 (code=${code})`);
         networkEvents.emit('disconnect', { code });
         cleanup();
@@ -904,6 +1020,7 @@ function connect(code, onLoginSuccess) {
     });
 
     socket.on('error', (err) => {
+        if (ws !== socket) return;
         const message = err && err.message ? String(err.message) : '';
         logWarn('系统', `[WS] 错误: ${message}`);
         const match = message.match(/Unexpected server response:\s*(\d+)/i);
@@ -977,10 +1094,12 @@ if (accountUsesGateway()) {
         onLogin: (us) => { if (us) Object.assign(userState, us); },
     });
     networkApi = {
-        connect: (code, onReady) => gatewayClient.connect(gwAccountId, code, onReady),
+        connect: (code, onReady, options) => gatewayClient.connect(gwAccountId, code, onReady, options),
         reconnect: () => false,
         cleanup: () => {},
-        stopNetwork: () => gatewayClient.stop(gwAccountId),
+        stopNetwork: (_reason, options = {}) => options.preserveSession === true
+            ? gatewayClient.detach()
+            : gatewayClient.stop(gwAccountId),
         getWs: () => gatewayClient.getWs(),
         isConnected: () => gatewayClient.isConnected(),
         sendMsg: (service, method, bodyBytes, meta, serviceObj) =>
@@ -995,6 +1114,13 @@ if (accountUsesGateway()) {
         clearHealthBackoff: () => gatewayClient.clearHealthBackoff(),
         isHealthBackoffActive: () => gatewayClient.isHealthBackoffActive(),
         getHealthBackoffState: () => gatewayClient.getHealthBackoffState(),
+        cancelQueued: reason => gatewayClient.cancelQueued(reason),
+        getRequestQueueSnapshot: () => gatewayClient.getRequestQueueSnapshot(),
+        getOldestPendingStartedAt: () => gatewayClient.getOldestPendingStartedAt(),
+        getDiagnosticSnapshot: () => gatewayClient.getDiagnosticSnapshot(),
+        getPendingWriteCount: () => gatewayClient.getPendingWriteCount(),
+        quiesceAndDrain: options => gatewayClient.quiesceAndDrain(options),
+        runWithRequestContext, getRequestContext, throwIfRequestCancelled,
         getWsErrorState: () => ({ code: 0, message: '', time: 0 }),
         getAceStatus: () => gatewayClient.getAceStatus(),
         buildLoginDeviceInfo,
@@ -1008,6 +1134,11 @@ if (accountUsesGateway()) {
     networkApi = {
         connect, reconnect, cleanup, stopNetwork, getWs, isConnected,
         sendMsg, sendMsgAsync,
+        setHealthBackoff, clearHealthBackoff, isHealthBackoffActive, getHealthBackoffState,
+        cancelQueued, getDiagnosticSnapshot, getPendingWriteCount, quiesceAndDrain,
+        getRequestQueueSnapshot: () => requestGate.snapshot(),
+        getOldestPendingStartedAt: () => pendingStartedAt.size ? Math.min(...pendingStartedAt.values()) : 0,
+        runWithRequestContext, getRequestContext, throwIfRequestCancelled,
         getUserState,
         getWsErrorState,
         getAceStatus,

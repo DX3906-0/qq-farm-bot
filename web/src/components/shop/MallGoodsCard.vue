@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
+import { getMallLimitText, isMallSoldOut } from '@/utils/mall-purchase'
 import { formatCouponAmount } from '@/utils/number-format'
 
-defineProps<{
+const props = defineProps<{
   item: any
   canAfford: boolean
   statusLabel: string
@@ -20,7 +22,12 @@ const L = {
   claim: '\u7ACB\u5373\u9886\u53D6',
   canBuy: '\u53EF\u8D2D\u4E70',
   canClaimFree: '\u53EF\u514D\u8D39\u9886',
+  soldOut: '\u5DF2\u4E70\u6EE1',
 }
+
+// 2026-11-02：展示限购周期（每日/每周/每月/永久）与已购进度
+const limitText = computed(() => getMallLimitText(props.item || {}))
+const soldOut = computed(() => isMallSoldOut(props.item || {}))
 
 function itemImage(item: any) {
   return Array.isArray(item.images) ? item.images[0] : ''
@@ -49,6 +56,13 @@ function itemImage(item: any) {
       <div class="mt-1 text-center text-xs text-amber-600 font-semibold dark:text-amber-400">
         {{ item.isFree ? L.free : `${formatCouponAmount(item.price)} ${L.coupon}` }}
       </div>
+      <div
+        v-if="limitText"
+        class="mt-1 text-center text-[11px] font-medium"
+        :class="soldOut ? 'text-red-500 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'"
+      >
+        {{ limitText }}
+      </div>
       <p v-if="item.discount" class="line-clamp-2 mt-2 text-[11px] text-blue-500 leading-5 dark:text-blue-400">
         {{ item.discount }}
       </p>
@@ -58,10 +72,10 @@ function itemImage(item: any) {
       <BaseButton
         class="mt-auto w-full"
         variant="primary"
-        :disabled="!item.canBuy || item.isSoldOut || !canAfford"
+        :disabled="!item.canBuy || item.isSoldOut || soldOut || !canAfford"
         @click="emit('buy', item)"
       >
-        {{ statusLabel === L.canBuy || statusLabel === L.canClaimFree ? (item.isFree ? L.claim : L.buy) : statusLabel }}
+        {{ soldOut ? L.soldOut : (statusLabel === L.canBuy || statusLabel === L.canClaimFree ? (item.isFree ? L.claim : L.buy) : statusLabel) }}
       </BaseButton>
     </div>
   </article>

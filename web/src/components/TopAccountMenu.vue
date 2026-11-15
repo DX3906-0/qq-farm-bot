@@ -1,18 +1,36 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 import api from '@/api'
 import AccountModal from '@/components/AccountModal.vue'
 import AccountCareerModal from '@/components/AccountCareerModal.vue'
 import RemarkModal from '@/components/RemarkModal.vue'
+import { cancelContentMotion } from '@/composables/useContentMotion'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import type { Account } from '@/stores/account'
 import { getPlatformClass, getPlatformLabel, useAccountStore } from '@/stores/account'
 import { useStatusStore } from '@/stores/status'
 
 const accountStore = useAccountStore()
 const statusStore = useStatusStore()
-const { accounts, currentAccount } = storeToRefs(accountStore)
+const { accounts, currentAccount, currentAccountId, equippedAvatarFrame, avatarFrameAccountId } = storeToRefs(accountStore)
 const { currentStatusReady, status } = storeToRefs(statusStore)
+const avatarFrameFailed = ref('')
+const avatarFrameLoadMessage = ref('')
+const currentFrame = computed(() => avatarFrameAccountId.value === String(currentAccountId.value)
+  && equippedAvatarFrame.value?.image !== avatarFrameFailed.value ? equippedAvatarFrame.value : null)
+const frameConnected = computed(() => currentStatusReady.value && status.value?.connection?.connected === true)
+watch([currentAccountId, frameConnected], () => {
+  avatarFrameFailed.value = ''
+  avatarFrameLoadMessage.value = ''
+  if (!frameConnected.value) { accountStore.clearAvatarFrame(); return }
+  // One account-scoped read when selecting a connected account. No interval,
+  // no write and no new query on dropdown hover/expand.
+  const requestedId = String(currentAccountId.value)
+  void accountStore.fetchAvatarFrames().catch(() => {
+    if (requestedId === String(currentAccountId.value)) avatarFrameLoadMessage.value = '头像框状态未确认，可在个人页刷新核对'
+  })
+}, { immediate: true, flush: 'sync' })
 
 const showAccountDropdown = ref(false)
 const showAccountModal = ref(false)
@@ -158,6 +176,7 @@ function openCareer(event: MouseEvent) {
   event.stopPropagation()
   if (!currentAccount.value)
     return
+  cancelContentMotion('overlay')
   closeDropdown()
   showCareerModal.value = true
   loadCareer()
@@ -168,6 +187,7 @@ const currentAvatarSrc = computed(() => avatarSource(currentAccount.value))
 const currentSubtitle = computed(() => accountSubtitle(currentAccount.value))
 
 async function openDropdown() {
+  cancelContentMotion('overlay')
   updateDropdownPos()
   showAccountDropdown.value = true
   await nextTick()
@@ -206,12 +226,16 @@ function updateDropdownPos() {
   }
 }
 
-function selectAccount(acc: any) {
-  accountStore.setCurrentAccount(acc)
+async function selectAccount(acc: any) {
+  const allowed = await accountStore.setCurrentAccount(acc)
+  if (allowed === false) return
+  cancelContentMotion('context')
   closeDropdown()
 }
 
 function openAddAccount() {
+  if (LOCAL_UI_READONLY)
+    return
   accountToEdit.value = null
   showAccountModal.value = true
   closeDropdown()
@@ -238,17 +262,20 @@ async function handleAccountSaved() {
       class="max-w-[min(76vw,280px)] flex items-center gap-3 rounded-xl px-3 py-2 text-left transition hover:bg-gray-100/70 dark:hover:bg-gray-700/50"
       @click="toggleDropdown"
     >
-      <div class="h-9 w-9 flex shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded-full bg-gray-100 ring-1 ring-gray-200 transition hover:ring-2 hover:ring-[var(--theme-primary)] dark:bg-gray-700 dark:ring-gray-600" title="查看角色生涯" @click="openCareer">
-        <img
-          v-if="shouldShowAvatar(currentAccount)"
-          :src="currentAvatarSrc"
-          :alt="displayName"
-          class="h-full w-full object-cover"
-          @error="markAvatarFailed(currentAccount)"
-        >
-        <span v-else class="text-sm text-gray-500 font-semibold dark:text-gray-300">
-          {{ avatarInitial(currentAccount) }}
-        </span>
+      <div class="account-avatar relative h-9 w-9 shrink-0 cursor-pointer" :class="{ 'has-frame': !!currentFrame }" :title="currentFrame ? `查看角色生涯 · ${currentFrame.name}` : avatarFrameLoadMessage || '查看角色生涯'" @click="openCareer">
+        <div class="account-avatar-core flex h-full w-full items-center justify-center overflow-hidden rounded-full bg-gray-100 ring-1 ring-gray-200 transition hover:ring-2 hover:ring-[var(--theme-primary)] dark:bg-gray-700 dark:ring-gray-600">
+          <img
+            v-if="shouldShowAvatar(currentAccount)"
+            :src="currentAvatarSrc"
+            :alt="displayName"
+            class="h-full w-full object-cover"
+            @error="markAvatarFailed(currentAccount)"
+          >
+          <span v-else class="text-sm text-gray-500 font-semibold dark:text-gray-300">
+            {{ avatarInitial(currentAccount) }}
+          </span>
+        </div>
+        <img v-if="currentFrame" :key="`${currentAccountId}:${currentFrame.frameId}`" class="account-avatar-frame pointer-events-none absolute" :src="currentFrame.image" :alt="`当前佩戴：${currentFrame.name}`" :data-frame-id="currentFrame.frameId" @error="avatarFrameFailed = currentFrame?.image || ''">
       </div>
       <div class="min-w-0 flex flex-col">
         <span class="truncate text-sm text-gray-900 font-semibold dark:text-gray-100">
@@ -285,12 +312,16 @@ async function handleAccountSaved() {
       >
         <div class="custom-scrollbar max-h-72 overflow-y-auto">
           <template v-if="accounts.length > 0">
-            <button
+            <div
               v-for="acc in accounts"
               :key="acc.id || acc.uin"
-              class="w-full flex items-center gap-3 px-4 py-2 transition-colors hover:bg-gray-100/60 dark:hover:bg-gray-700/50"
+              role="button"
+              tabindex="0"
+              class="w-full flex cursor-pointer items-center gap-3 px-4 py-2 transition-colors hover:bg-gray-100/60 dark:hover:bg-gray-700/50"
               :style="{ backgroundColor: currentAccount?.id === acc.id ? 'color-mix(in srgb, var(--theme-primary) 10%, transparent)' : undefined }"
               @click="selectAccount(acc)"
+              @keydown.enter.self="selectAccount(acc)"
+              @keydown.space.prevent.self="selectAccount(acc)"
             >
               <div class="h-7 w-7 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 dark:bg-gray-600">
                 <img
@@ -327,7 +358,7 @@ async function handleAccountSaved() {
                 <div class="i-carbon-edit" />
               </button>
               <div v-if="currentAccount?.id === acc.id" class="i-carbon-checkmark shrink-0" :style="{ color: 'var(--theme-primary)' }" />
-            </button>
+            </div>
           </template>
           <div v-else class="px-4 py-3 text-center text-sm text-gray-400">
             暂无账号
@@ -337,6 +368,8 @@ async function handleAccountSaved() {
           <button
             class="w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors hover:bg-gray-100/50 dark:hover:bg-gray-700/50"
             :style="{ color: 'var(--theme-primary)' }"
+            :disabled="LOCAL_UI_READONLY"
+            :title="LOCAL_UI_READONLY ? '本地只读浏览不允许添加或登录账号' : undefined"
             @click="openAddAccount"
           >
             <div class="i-carbon-add" />
@@ -385,6 +418,11 @@ async function handleAccountSaved() {
 </template>
 
 <style scoped>
+/* Clip only the portrait, never the frame's ornamental outer edge. Keep the
+   original 36px layout footprint so the right-hand account control stays put. */
+.account-avatar.has-frame .account-avatar-core { padding: 3px; background-clip: content-box; box-shadow: none; }
+.account-avatar.has-frame .account-avatar-core > img { border-radius: 50%; }
+.account-avatar-frame { width: 46px; height: 46px; max-width: none; left: -5px; top: -5px; object-fit: contain; z-index: 1; }
 .custom-scrollbar::-webkit-scrollbar {
   width: 4px;
 }

@@ -49,3 +49,9 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+.workbuddy/
+cloudbase/.ref/
+web/stats.html
+*.tsbuildinfo
+*.lnk
+core/src/__bolt_manifest.json

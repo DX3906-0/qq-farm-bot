@@ -10,7 +10,9 @@
 const protobuf = require('protobufjs/minimal');
 const fs = require('node:fs');
 const path = require('node:path');
-const { sendMsgAsync, getUserState, isConnected } = require('../utils/network');
+const { sendMsgAsync, getUserState, isConnected, getDiagnosticSnapshot } = require('../utils/network');
+const { getRequestContext, runWithRequestContext } = require('../utils/request-priority');
+const { CONFIG } = require('../config/config');
 const { types } = require('../utils/proto');
 const { toNum, toLong } = require('../utils/utils');
 const { getItemImageById, getItemById } = require('../config/gameConfig');
@@ -161,6 +163,10 @@ const HELU_DRAW_CMD = 9;
 
 // ---- RPC 调用 ----
 
+function decodeActivityReply(type, body) {
+  return (Buffer.isBuffer(body) || body instanceof Uint8Array) ? type.decode(body) : body;
+}
+
 /**
  * 获取活动分组信息
  */
@@ -173,11 +179,10 @@ async function getActivityGroup(activityId = NANGUA_SHOP_ACTIVITY_ID, uid = NANG
   ).finish();
 
   const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'GetGroup', request);
-  const decoded = types.ActivityGetGroupReply.decode(body);
+  const decoded = decodeActivityReply(types.ActivityGetGroupReply, body);
 
-  // 附加原始字节供回退解析
-  Object.defineProperty(decoded, '__rawBody', {
-    value: Buffer.from(body || []),
+  if ((Buffer.isBuffer(body) || body instanceof Uint8Array)) Object.defineProperty(decoded, '__rawBody', {
+    value: Buffer.from(body),
     enumerable: false,
   });
 
@@ -189,7 +194,7 @@ async function listActivityGroups() {
     types.ActivityListRequest.create({})
   ).finish();
   const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'List', request);
-  return types.ActivityListReply.decode(body);
+  return decodeActivityReply(types.ActivityListReply, body);
 }
 
 function normalizeDiscoveryActivity(node) {
@@ -343,13 +348,19 @@ async function operateActivity(activityId, cmd, options = {}) {
     types.ActivityOperateRequest.create(payload)
   ).finish();
 
-  const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'Operate', request);
-  return body;
+  const account = milkTeaAccountKey();
+  milkTeaInvalidate(account);
+  try {
+    const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'Operate', request);
+    return body;
+  } finally {
+    milkTeaInvalidate(account);
+  }
 }
 
 async function operateActivityReply(activityId, cmd, options = {}) {
   const body = await operateActivity(activityId, cmd, options);
-  return types.ActivityOperateReply.decode(body);
+  return decodeActivityReply(types.ActivityOperateReply, body);
 }
 
 function normalizeCoreItem(item) {
@@ -417,12 +428,9 @@ function createQingmeiWineError(stage, message, cause) {
   err.stage = stage;
   err.cause = cause;
   err.qingmeiWine = true;
+  if (cause?.code !== undefined || activityErrorCode(cause)) err.code = cause?.code ?? activityErrorCode(cause);
+  if (cause?.meta !== undefined) err.meta = cause.meta;
   return err;
-}
-
-function isNoOngoingQingmeiBrewError(err) {
-  const message = String(err?.message || err || '');
-  return message.includes('1034027') || message.includes('无进行中的酿造记录');
 }
 
 async function reportQingmeiShareForDouble() {
@@ -1153,6 +1161,10 @@ function getHeluActivityUidCandidates() {
   return [HELU_ACTIVITY_UID, 'SAIJI_DRAW', 'SaiJi', 'HeLu', 'Helu', ''];
 }
 
+function activityErrorCode(err) {
+  return Number(err?.meta?.code ?? err?.code) || 0;
+}
+
 async function getActivityGroupWithUidFallback(activityId, uidCandidates) {
   let lastErr = null;
   for (const uid of uidCandidates) {
@@ -1225,18 +1237,19 @@ async function getQingmeiWineMaterialItems() {
     }));
 }
 
-/** 活动节点是否仍在有效期（end_time 缺失视为有效；兼容秒/毫秒时间戳） */
+/** 青梅写前必须有服务端有效期证据，兼容秒/毫秒时间戳。 */
 function isQingmeiNodeActive(item, nowSec) {
   const endTime = toNum(item?.end_time ?? item?.endTime);
-  if (endTime <= 0) return true;
+  const startTime = toNum(item?.start_time ?? item?.startTime);
   const endSec = endTime > 1e12 ? Math.floor(endTime / 1000) : endTime;
-  return endSec >= nowSec;
+  const startSec = startTime > 1e12 ? Math.floor(startTime / 1000) : startTime;
+  return endSec > 0 && endSec >= nowSec && startSec <= nowSec && item?.enabled !== false;
 }
 
 /**
  * 从活动组子节点中解析青梅活动的 root/领取/酿酒节点。
  * 节点编号规则：主活动 YYYYMMDD00、领取 +1、酿酒 +2；节点 ID 在活动期内稳定，
- * 每日轮换的是领取参数 type（见 getDateBasedQingmeiClaimType）。
+ * 领取参数只接受官方节点中的确证值。
  * 服务端可能同时下发已过期的旧期节点，必须按 end_time 过滤。
  */
 function resolveQingmeiNodesFromChildren(activities) {
@@ -1269,37 +1282,9 @@ function resolveQingmeiNodesFromChildren(activities) {
   };
 }
 
-/** 按近期日期推导“YYYYMMDD00”主活动 ID 候选（仅作为探测，服务端未开始时返回 1034001） */
-function getDateDerivedQingmeiRootIds() {
-  const ids = [];
-  for (const offset of [0, 1, 2]) {
-    const day = new Date(Date.now() - offset * 24 * 60 * 60 * 1000);
-    const ymd = day.getFullYear() * 10000 + (day.getMonth() + 1) * 100 + day.getDate();
-    ids.push(ymd * 100);
-  }
-  return ids;
-}
+let qingmeiResolveFlight = null;
 
-const qingmeiResolvedIdsCache = { dateKey: '', expiresAt: 0, ids: null };
-// 被 Operate 以 1034005 拒绝过的节点 ID，下次解析时跳过
-const rejectedQingmeiNodeIds = new Set();
-
-function summarizeQingmeiNodes(activities) {
-  return (Array.isArray(activities) ? activities : [])
-    .map(item => ({
-      id: toNum(item?.id),
-      status: item?.status ?? null,
-      startTime: toNum(item?.start_time ?? item?.startTime),
-      endTime: toNum(item?.end_time ?? item?.endTime),
-      enabled: item?.enabled ?? null,
-      title: item?.title || '',
-      payload: String(item?.payload || '').slice(0, 300),
-    }))
-    .filter(node => node.id > 0)
-    .slice(0, 30);
-}
-
-/** 在候选活动列表中按编号族+有效期解析青梅节点，跳过被拒绝过的 ID */
+/** 只在青梅主契约返回的节点中解析有效编号族。 */
 function pickActiveQingmeiNodes(activities) {
   const list = Array.isArray(activities) ? activities : [];
   const byId = new Map();
@@ -1308,9 +1293,7 @@ function pickActiveQingmeiNodes(activities) {
     if (id > 0 && !byId.has(id)) byId.set(id, item);
   }
   const nowSec = Math.floor(Date.now() / 1000);
-  const usable = item => item
-    && !rejectedQingmeiNodeIds.has(toNum(item?.id))
-    && isQingmeiNodeActive(item, nowSec);
+  const usable = item => item && isQingmeiNodeActive(item, nowSec);
 
   const rootCandidates = [...byId.keys()]
     .filter(id => id % 100 === 0)
@@ -1325,87 +1308,26 @@ function pickActiveQingmeiNodes(activities) {
   return null;
 }
 
-/**
- * 查询活动组并返回当前有效的青梅活动 ID。
- * 汇总日期推导 ID、写死基线和 List 全量枚举三个来源的节点后统一解析，
- * 避免旧期节点短路导致永远查不到新期；成功结果缓存 30 分钟；
- * 解析不到领取节点时必须记录服务端节点详情便于排查。
- */
+/** 青梅主契约查询只合并进行中请求，不猜日期 ID、不探测 UID、不重试。 */
 async function resolveQingmeiActivityIds() {
-  const fallback = {
-    rootId: QINGMEI_ACTIVITY_ID,
-    claimId: QINGMEI_SEED_CLAIM_ACTIVITY_ID,
-    wineId: QINGMEI_WINE_ACTIVITY_ID,
-  };
-  const dateKey = getLocalDateKey();
-  const cached = qingmeiResolvedIdsCache;
-  if (cached.ids && cached.dateKey === dateKey && cached.expiresAt > Date.now()) {
-    return { ...cached.ids };
+  const account = getQingmeiClaimStateKey();
+  if (!qingmeiResolveFlight || qingmeiResolveFlight.account !== account) {
+    const flight = { account };
+    flight.promise = getActivityGroup(QINGMEI_ACTIVITY_ID, QINGMEI_ACTIVITY_UID).then(reply => {
+      const resolved = pickActiveQingmeiNodes(flattenActivityChildren(reply));
+      return {
+        rootId: toNum(resolved?.root?.id),
+        claimId: toNum(resolved?.claim?.id),
+        wineId: toNum(resolved?.wine?.id),
+        claimNode: resolved?.claim || null,
+        reply,
+      };
+    }).finally(() => {
+      if (qingmeiResolveFlight === flight) qingmeiResolveFlight = null;
+    });
+    qingmeiResolveFlight = flight;
   }
-
-  const result = { ...fallback };
-  const rootIds = [...new Set([...getDateDerivedQingmeiRootIds(), QINGMEI_ACTIVITY_ID])];
-  let lastErr = null;
-  const collected = [];
-
-  for (const rootId of rootIds) {
-    try {
-      const reply = await getActivityGroupWithUidFallback(rootId, [QINGMEI_ACTIVITY_UID, '']);
-      collected.push(...flattenActivityChildren(reply));
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-
-  // List 枚举全部活动组，避免遗漏服务端当期节点
-  try {
-    collected.push(...flattenActivityChildren(await listActivityGroups()));
-  } catch (err) {
-    lastErr = lastErr || err;
-  }
-
-  const nodes = summarizeQingmeiNodes(collected);
-  const resolved = pickActiveQingmeiNodes(collected);
-  const resolvedRootId = toNum(resolved?.root?.id);
-  const claimId = toNum(resolved?.claim?.id);
-  const wineId = toNum(resolved?.wine?.id);
-  if (resolvedRootId > 0) result.rootId = resolvedRootId;
-  if (claimId > 0) result.claimId = claimId;
-  if (wineId > 0) result.wineId = wineId;
-
-  if (claimId > 0 || wineId > 0) {
-    if (claimId > 0 && claimId !== QINGMEI_SEED_CLAIM_ACTIVITY_ID) {
-      activityLogger.info('青梅活动 ID 已轮换，使用服务端最新领取/酿酒节点', {
-        event: 'qingmei_id_rotation',
-        rootId: result.rootId,
-        claimId: result.claimId,
-        wineId: result.wineId,
-      });
-    }
-    if (!claimId) {
-      // 只命中酿酒节点：领取节点缺失，输出全部节点详情供排查
-      activityLogger.warn('青梅活动仅解析到酿酒节点，缺少有效领取节点', {
-        event: 'qingmei_claim_missing',
-        wineId: result.wineId,
-        rejectedIds: [...rejectedQingmeiNodeIds],
-        nodes,
-        lastError: lastErr?.message || '',
-      });
-    }
-    cached.dateKey = dateKey;
-    cached.expiresAt = Date.now() + 30 * 60 * 1000;
-    cached.ids = { ...result };
-    return { ...result };
-  }
-
-  activityLogger.warn('青梅活动组未解析到有效领取/酿酒节点，回退写死常量', {
-    event: 'qingmei_resolve_miss',
-    rootIds,
-    rejectedIds: [...rejectedQingmeiNodeIds],
-    nodes,
-    lastError: lastErr?.message || '',
-  });
-  return result;
+  return qingmeiResolveFlight.promise;
 }
 
 function normalizeQingmeiActivity(reply) {
@@ -1434,9 +1356,8 @@ function normalizeQingmeiActivity(reply) {
     endTime: toNum(root?.end_time ?? root?.endTime ?? claim?.end_time ?? claim?.endTime),
     status,
     claimed: claimedToday || (hasServerClaimStatus && status === 3),
-    // 领取节点通常不下发每日领取状态；未知时允许用户点击，由 Operate
-    // 的“已领取”响应校准本进程当天状态。
-    claimable: !claimedToday && (!hasServerClaimStatus || status !== 3) && claim?.enabled !== false,
+    claimable: confirmedQingmeiClaimType(claim) !== null && !claimedToday
+      && (!hasServerClaimStatus || status !== 3) && claim?.enabled !== false,
     claimStatusKnown: claimedToday || hasServerClaimStatus,
     reward: {
       itemId: QINGMEI_SEED_ITEM_ID,
@@ -1456,8 +1377,7 @@ function normalizeQingmeiActivity(reply) {
 
 async function getQingmeiActivity() {
   try {
-    const { rootId } = await resolveQingmeiActivityIds();
-    const reply = await getActivityGroupWithUidFallback(rootId, [QINGMEI_ACTIVITY_UID, '']);
+    const { reply } = await resolveQingmeiActivityIds();
     const activity = normalizeQingmeiActivity(reply);
     activity.material.itemCount = await getBagItemCount(QINGMEI_FRUIT_ITEM_ID);
     return activity;
@@ -1496,118 +1416,37 @@ async function getQingmeiActivity() {
   }
 }
 
-function isActivityParamError(err) {
-  return String(err?.message || err || '').includes('1034005');
-}
-
-function invalidateQingmeiResolvedCache() {
-  qingmeiResolvedIdsCache.ids = null;
-  qingmeiResolvedIdsCache.expiresAt = 0;
-}
-
-/**
- * 青梅领取参数 type 按天轮换：主活动 ID 内嵌起始日期（2026081200 → 2026-08-12），
- * 自起始日第 N 天的有效 type = N（8-12→1、8-13→2、8-14→3……）。
- * 写死固定 type 会在跨天后被服务端以 1034005「活动参数错误」拒绝。
- */
-function getDateBasedQingmeiClaimType(rootId) {
-  const ymd = Math.floor((toNum(rootId) || QINGMEI_ACTIVITY_ID) / 100);
-  const year = Math.floor(ymd / 10000);
-  const month = Math.floor((ymd % 10000) / 100);
-  const day = ymd % 100;
-  if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 1;
-  const base = new Date(year, month - 1, day).getTime();
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const elapsedDays = Math.round((today - base) / (24 * 60 * 60 * 1000));
-  return Math.max(1, elapsedDays + 1);
-}
-
-// 记录当天服务端实际接受的领取 type（日期推导值不匹配时探测到的值）
-const qingmeiClaimTypeByDate = new Map();
-
-function getQingmeiClaimTypeCandidates(rootId) {
-  const candidates = [];
-  const confirmed = qingmeiClaimTypeByDate.get(getLocalDateKey());
-  if (confirmed > 0) candidates.push(confirmed);
-  candidates.push(getDateBasedQingmeiClaimType(rootId));
-  for (let type = 1; type <= 6; type += 1) candidates.push(type);
-  return [...new Set(candidates)];
+function confirmedQingmeiClaimType(node) {
+  // 必须是已加载官方节点消息中的请求参数；任意 JSON payload 不构成协议确证。
+  const nodeType = types.ActivityGetGroupReply?.fields?.group?.resolvedType;
+  const activityType = nodeType?.fields?.activity?.resolvedType;
+  const field = activityType?.fields?.qingmei_claim_params;
+  if (!field?.resolvedType?.fields?.type) return null;
+  const value = node?.qingmei_claim_params?.type;
+  return Number.isInteger(value) && value > 0 ? value : null;
 }
 
 async function claimQingmeiSeeds() {
-  const beforeCount = await getBagItemCount(QINGMEI_SEED_ITEM_ID);
   const resolved = await resolveQingmeiActivityIds();
   const claimId = resolved.claimId;
-  const typeCandidates = getQingmeiClaimTypeCandidates(resolved.rootId);
-  let reply = null;
-  let lastErr = null;
-
-  for (const [index, claimType] of typeCandidates.entries()) {
-    try {
-      reply = await operateActivityReply(claimId, QINGMEI_SEED_CLAIM_CMD, {
-        qingmeiClaim: { type: claimType },
-      });
-      if (index > 0) {
-        activityLogger.warn('青梅领取参数 type 已轮换，探测到服务端接受的 type', {
-          event: 'qingmei_claim_type_resolved',
-          claimId,
-          claimType,
-          rejectedTypes: typeCandidates.slice(0, index),
-        });
-      }
-      qingmeiClaimTypeByDate.set(getLocalDateKey(), claimType);
-      break;
-    } catch (err) {
-      if (isAlreadyClaimedError(err)) {
-        markQingmeiClaimedToday();
-        return {
-          ok: true,
-          alreadyClaimed: true,
-          claimedCount: 0,
-          beforeCount,
-          afterCount: beforeCount,
-          qingmei: await getQingmeiActivity(),
-        };
-      }
-      // 参数错误说明该 type 不是当天有效值，继续尝试下一个候选
-      if (isActivityParamError(err)) {
-        lastErr = err;
-        activityLogger.info('青梅领取参数 type 被服务端拒绝，尝试下一个候选', {
-          event: 'qingmei_claim_type_rejected',
-          claimId,
-          claimType,
-        });
-        continue;
-      }
-      throw err;
-    }
+  const claimType = confirmedQingmeiClaimType(resolved.claimNode);
+  const requestField = types.ActivityOperateRequest?.fields?.qingmei_claim_params;
+  if (!claimId || !claimType || !requestField?.resolvedType?.fields?.type) {
+    return { skipped: true, reason: 'qingmei_claim_contract_unconfirmed', claimedCount: 0 };
   }
-
-  // 全部 type 被拒才认定节点失效：拉黑后重新解析并换节点重试一次
-  if (!reply) {
-    rejectedQingmeiNodeIds.add(claimId);
-    invalidateQingmeiResolvedCache();
-    const retry = await resolveQingmeiActivityIds();
-    if (retry.claimId > 0 && retry.claimId !== claimId) {
-      activityLogger.warn('青梅领取节点已失效，使用新节点重试', {
-        event: 'qingmei_claim_retry',
-        rejectedClaimId: claimId,
-        claimId: retry.claimId,
-      });
-      try {
-        reply = await operateActivityReply(retry.claimId, QINGMEI_SEED_CLAIM_CMD, {
-          qingmeiClaim: { type: getQingmeiClaimTypeCandidates(retry.rootId)[0] },
-        });
-      } catch (retryErr) {
-        if (isActivityParamError(retryErr)) markQingmeiClaimedToday();
-        throw retryErr;
-      }
-    } else {
-      // 无可用新节点：标记今日已领取，避免自动任务当天反复探测无效 type
-      markQingmeiClaimedToday();
-      throw lastErr || new Error('领取青梅种子失败: 服务端拒绝全部领取参数 type');
-    }
+  if (isQingmeiClaimedToday() || toNum(resolved.claimNode?.status) === 3 || resolved.claimNode?.enabled === false) {
+    return { skipped: true, reason: 'qingmei_claim_unavailable', claimedCount: 0 };
+  }
+  const beforeCount = await getBagItemCount(QINGMEI_SEED_ITEM_ID);
+  let reply;
+  try {
+    reply = await operateActivityReply(claimId, QINGMEI_SEED_CLAIM_CMD, {
+      qingmeiClaim: { type: claimType },
+    });
+  } catch (err) {
+    if (!isAlreadyClaimedError(err)) throw err;
+    markQingmeiClaimedToday();
+    return { skipped: true, reason: 'already_claimed', alreadyClaimed: true, claimedCount: 0 };
   }
 
   const claimResult = normalizeQingmeiClaimResult(reply?.qingmei_claim);
@@ -1642,6 +1481,7 @@ async function brewAndSellQingmeiWine(options = {}) {
   const share = options?.share !== false;
   const brewSteps = Math.max(1, Number(options?.brewSteps) || QINGMEI_FINE_BREW_STEPS);
   const { wineId: wineActivityId } = await resolveQingmeiActivityIds();
+  if (!wineActivityId) return { skipped: true, reason: 'qingmei_wine_node_missing' };
   const materialItems = await getQingmeiWineMaterialItems();
   const beforeMaterialCount = materialItems.reduce((sum, item) => sum + Math.max(0, toNum(item?.count)), 0);
   if (beforeMaterialCount <= 0) {
@@ -1655,9 +1495,10 @@ async function brewAndSellQingmeiWine(options = {}) {
       qingmeiWineStart: { items: materialItems },
     });
   } catch (err) {
-    previewWarning = `打开青梅酿售卖失败，已尝试直接精酿: ${err.message}`;
+    throw createQingmeiWineError('preview', `打开青梅酿售卖失败: ${err.message}`, err);
   }
   const preview = normalizeQingmeiPreviewResult(previewReply?.qingmei_preview);
+  if (!preview || preview.price <= 0) throw createQingmeiWineError('preview', '青梅酿预览未返回有效报价');
   await delay(QINGMEI_WINE_STEP_DELAY_MS);
 
   const brews = [];
@@ -1668,25 +1509,11 @@ async function brewAndSellQingmeiWine(options = {}) {
         qingmeiWineBrew: true,
       });
     } catch (err) {
-      if (index === 0 && isNoOngoingQingmeiBrewError(err)) {
-        try {
-          const retryMaterialItems = await getQingmeiWineMaterialItems();
-          previewReply = await operateActivityReply(wineActivityId, QINGMEI_WINE_PREVIEW_CMD, {
-            qingmeiWineStart: { items: retryMaterialItems },
-          });
-          await delay(QINGMEI_WINE_STEP_DELAY_MS);
-          brewReply = await operateActivityReply(wineActivityId, QINGMEI_WINE_BREW_CMD, {
-            qingmeiWineBrew: true,
-          });
-        } catch (retryErr) {
-          throw createQingmeiWineError('brew', `青梅酿精酿失败: ${retryErr.message}`, retryErr);
-        }
-      } else {
-        throw createQingmeiWineError('brew', `青梅酿精酿失败: ${err.message}`, err);
-      }
+      throw createQingmeiWineError('brew', `青梅酿精酿失败: ${err.message}`, err);
     }
     const brew = normalizeQingmeiBrewResult(brewReply?.qingmei_brew);
-    if (brew) brews.push(brew);
+    if (!brew) throw createQingmeiWineError('brew', '精酿未返回有效结果');
+    brews.push(brew);
     await delay(QINGMEI_WINE_STEP_DELAY_MS);
   }
 
@@ -1877,12 +1704,15 @@ function normalizeSeasonClaimResult(rawBody) {
   };
 }
 
+// 官方 SolarTermsInfoModel.ts 的V1枚举：4=EXPIRED_UNCLAIMED，5=EXPIRED_CLAIMED。
+// 不能把所有过期条目视为漏领；V2 window_status为独立枚举，不套这里。
+const SOLAR_TERM_NAMES = {
+  101: '端午', 102: '夏至', 103: '小暑', 201: '大暑', 202: '立秋', 203: '七夕', 204: '处暑',
+  301: '白露', 302: '秋分', 303: '中秋', 304: '寒露', 401: '重阳', 402: '霜降', 403: '立冬',
+};
 function solarStatusLabel(status) {
-  if (status === 2) return '可领取';
-  if (status === 3) return '已领取';
-  if (status === 1) return '未开启';
-  if (status === 5) return '已结束';
-  return `状态${status}`;
+  return ({ 0: '状态未知', 1: '尚未开放', 2: '可领取', 3: '已领取',
+    4: '已过期未领取', 5: '已过期已领取' })[status] || `状态${status}`;
 }
 
 function normalizeSolarTerm(rawBytes) {
@@ -1896,7 +1726,7 @@ function normalizeSolarTerm(rawBytes) {
     startTime: getProtoNumber(entries, 3),
     endTime: getProtoNumber(entries, 4),
     rewards: getProtoBytesAll(entries, 5).map(parseActivityItemMessage).filter(Boolean),
-    title: getProtoString(entries, 6, ''),
+    title: getProtoString(entries, 6, '') || SOLAR_TERM_NAMES[getProtoNumber(entries, 1)] || '',
   };
 }
 
@@ -1955,33 +1785,36 @@ async function getSolarTermsInfo() {
   return normalizeSolarTermsInfo(await getSolarTermsRaw());
 }
 
+let solarV1Scope;
 async function claimSolarTermsReward(termId = 0) {
-  const before = await getSolarTermsInfo();
-  const resolvedTermId = Number(termId) || toNum(before?.currentTerm?.id);
-  if (resolvedTermId <= 0) throw new Error('未找到可领取的节令奖励');
-
-  const target = (before.terms || []).find((term) => term.id === resolvedTermId) || null;
-  if (target && !target.claimable) {
-    throw new Error(`${target.title || '该节令'}当前不可领取`);
-  }
-
-  const result = normalizeSolarTermsClaimResult(await claimSolarTermsRaw(resolvedTermId));
-  const after = await getSolarTermsInfo();
-
-  activityLogger.info('节令小札领取成功', {
-    event: 'solar_terms_claim',
-    termId: resolvedTermId,
-    termTitle: target?.title || result.term?.title || '',
-    rewardCount: result.rewards.length,
+  const { createGameCommandScope, positiveId, unknown, validation, validateSession } = require('./game-command');
+  solarV1Scope ||= createGameCommandScope('solar-v1');
+  return solarV1Scope.execute(async session => {
+    const before = await getSolarTermsInfo();
+    const resolvedTermId = positiveId(Number(termId) || toNum(before?.currentTerm?.id), '节令编号');
+    const target = (before.terms || []).find(term => term.id === resolvedTermId);
+    if (!target?.claimable) throw validation('该节令不在服务端当前可领取列表中');
+    const key = `claim:${resolvedTermId}`;
+    const reply = await solarV1Scope.rpc(session, 'gamepb.solartermspb.SolarTermsService', 'ClaimSolarTerms',
+      'ClaimSolarTermsRequest', 'ClaimSolarTermsReply', { id: resolvedTermId }, { write: true, key });
+    const event = reply.updated_event;
+    const rewards = (reply.rewards || []).map(normalizeCoreItem).filter(item => item.itemId > 0 && item.itemCount > 0);
+    if (toNum(event?.id) !== resolvedTermId || ![3, 5].includes(toNum(event?.status)) || !rewards.length) {
+      throw unknown('旧版节令奖励及领取进度未确认，只刷新核对，不重复提交');
+    }
+    solarV1Scope.confirm(session, key);
+    const term = { id: resolvedTermId, title: event.name || target.title || '', status: toNum(event.status), claimable: false };
+    // A proved write does not become a second write when its refresh fails.
+    const result = { ok: true, resultState: 'completed', termId: resolvedTermId, rewards, term };
+    activityLogger.info('节令小札领取成功', { event: 'solar_terms_claim', termId: resolvedTermId,
+      termTitle: term.title, rewardCount: rewards.length });
+    try {
+      const solarTerms = await getSolarTermsInfo();
+      validateSession(session);
+      return { ...result, solarTerms };
+    }
+    catch (cause) { validateSession(session); return { ...result, refreshRequired: true, solarTerms: null }; }
   });
-
-  return {
-    ok: true,
-    termId: resolvedTermId,
-    rewards: result.rewards,
-    term: result.term,
-    solarTerms: after,
-  };
 }
 
 function parseStarRecordExtra(value) {
@@ -2888,13 +2721,15 @@ function normalizeQixiActivity(reply) {
 
 async function getQixiActivity() {
   try {
+    const account = getQixiDewLimitStateKey();
     const reply = await getActivityGroup(QIXI_ACTIVITY_ID, QIXI_ACTIVITY_UID);
+    if (!reply?.group) throw new Error('七夕活动快照未下发');
     const activity = normalizeQixiActivity(reply);
-    const counts = await Promise.all([
-      getBagItemCount(QIXI_FEATHER_ITEM_ID),
-      getBagItemCount(QIXI_SACHET_ITEM_ID),
-      getBagItemCount(QIXI_DEW_ITEM_ID),
-    ]);
+    const bag = await getBag();
+    const items = getBagItems(bag);
+    if (!Array.isArray(items)) throw new Error('七夕背包快照未下发');
+    const counts = [QIXI_FEATHER_ITEM_ID, QIXI_SACHET_ITEM_ID, QIXI_DEW_ITEM_ID].map(id =>
+      items.filter(item => toNum(item?.id) === id).reduce((sum, item) => sum + toNum(item?.count), 0));
     // 活动节点中的 balances 会保留阶段奖励/配置值，真实可用库存以背包为准。
     activity.items.feather.itemCount = counts[0];
     activity.items.sachet.itemCount = counts[1];
@@ -2907,13 +2742,11 @@ async function getQixiActivity() {
       activity.bridge.canBuild = activity.bridge.nextStage.cost.itemCount > 0
         && activity.items.feather.itemCount >= activity.bridge.nextStage.cost.itemCount;
     }
+    if (account === getQixiDewLimitStateKey()) updateQixiEndedSnapshot(activity);
     return activity;
   } catch (error) {
-    // 鹊桥活动已于 2026-08-22 结束，服务端不再下发活动节点 → 此分支属「预期内」的常态路径，
-    // 不应按 error 级别刷屏。降级为 debug，并保留原始信息便于排查真实异常。
-    activityLogger.debug('鹊桥寄情活动节点未下发（活动已结束，属预期）:', error?.message || error);
-    // 活动节点已下架/接口异常：返回带 active:false 的缺省对象，
-    // 让前端识别「活动已结束」隐藏操作入口，worker 也据此拦截灵露/驻桥/香囊自动化。
+    // 失败不构成已结束证据；禁用本次操作并保留 warning，不覆盖已确证快照。
+    activityLogger.debug('鹊桥寄情活动快照不可用:', error?.message || error);
     return {
       uid: QIXI_ACTIVITY_UID,
       title: '鹊桥寄情',
@@ -2929,7 +2762,9 @@ async function getQixiActivity() {
       dewUsage: { dailyLimit: QIXI_DEW_DAILY_LIMIT, limitReached: true },
       bridge: { stages: [], completedCount: 0, canBuild: false, nextStage: null },
       gift: { remainingCount: 0, sentCount: 0, maxCount: 0 },
-      ended: true,
+      ended: null,
+      warning: error?.message || String(error),
+      meta: error?.meta,
     };
   }
 }
@@ -3057,8 +2892,9 @@ async function useQixiDewOnFriend(friendGid, landIds = []) {
 
 async function buildQixiBridge(options = {}) {
   const before = await getQixiActivity();
+  if (before.warning || !before.active) return { skipped: true, reason: 'qixi_snapshot_unavailable', activity: before };
   if (!before.bridge.nextStage) return { ok: true, completed: true, built: false, activity: before };
-  if (!before.bridge.canBuild && !options.force) throw new Error('鹊羽不足，暂时无法驻建鹊桥');
+  if (!before.bridge.canBuild) throw new Error('鹊羽不足，暂时无法驻建鹊桥');
   await operateActivityReply(QIXI_BRIDGE_ACTIVITY_ID, QIXI_BRIDGE_CMD);
   return { ok: true, built: true, stageId: before.bridge.nextStage.id, activity: await getQixiActivity() };
 }
@@ -3068,8 +2904,9 @@ async function sendQixiSachet(friendGid, count = 1) {
   const sendCount = Math.max(1, Math.floor(toNum(count) || 1));
   if (!gid) throw new Error('请选择有效好友');
   const before = await getQixiActivity();
+  if (before.warning || !before.active) return { skipped: true, reason: 'qixi_snapshot_unavailable', activity: before };
   if (!before.gift.enabled || before.gift.remainingCount <= 0) throw new Error('今日香囊赠送次数已用完');
-  const actual = Math.min(sendCount, before.gift.remainingCount, before.items.sachet.itemCount || sendCount);
+  const actual = Math.min(sendCount, before.gift.remainingCount, before.items.sachet.itemCount);
   if (actual <= 0) throw new Error('鹊羽香囊不足');
   for (let i = 0; i < actual; i++) {
     // 官方界面没有款式选项，抓包中该内部编号由客户端在 1-13 间自动选择。
@@ -3087,68 +2924,39 @@ async function sendQixiSachet(friendGid, count = 1) {
 // 活动一旦结束（endTime 已过或 active === false），无需每轮巡查重复请求/打日志。
 // 已结束判定缓存较长时间（6h，仍保留返厂探活）；未结束判定缓存较短（15min，确保中途下架/结束能被及时感知）。
 // ============================================================
-let qixiEndedCache = null; // { date: 'YYYY-MM-DD', ended: boolean, activity: object|null }
-let qixiEndedCacheAt = 0;
+const qixiEndedSnapshots = new Map();
+const qixiEndedFlights = new Map();
 
-async function getQixiEndedState() {
-    const now = Date.now();
-    const ttl = qixiEndedCache && qixiEndedCache.ended ? 6 * 60 * 60 * 1000 : 15 * 60 * 1000;
-    if (qixiEndedCache && (now - qixiEndedCacheAt) < ttl) {
-        return qixiEndedCache;
-    }
-    let activity = null;
-    let ended = false;
-    try {
-        activity = await getQixiActivity();
-        const nowSec = Math.floor(now / 1000);
-        ended = !!activity && ((activity.endTime > 0 && activity.endTime < nowSec) || activity.active === false);
-    } catch {
-        // 探活异常（网络抖动）保守视为「未结束」，交由调用方原有逻辑处理
-        ended = false;
-    }
-    // 兜底：getActivityGroup 抛错/返回空（活动节点已下架）时，用活动发现列表判断鹊桥活动是否还在列表中且仍有效。
-    // 列表里找不到鹊桥节点 = 活动已下架；节点仍在但 endTime 已过 / enabled=false / visible=false = 活动已结束。
-    // 两种情况都视为已结束（worker 停止灵露自动化、今日统计隐藏友灵露等）。
-    if (!activity && !ended) {
-        try {
-            const list = await getActivityDiscoveryList();
-            const nodes = (list || []).filter(a =>
-                toNum(a.id) === QIXI_BRIDGE_ACTIVITY_ID
-                || toNum(a.id) === QIXI_ACTIVITY_ID
-                || toNum(a.parentId) === QIXI_ACTIVITY_ID
-            );
-            if (nodes.length === 0) {
-                ended = true;
-            } else {
-                // 任一鹊桥相关节点仍有效（endTime 未过 且 enabled 且 visible）则视为未结束；
-                // 全部无效则视为已结束。
-                const nowSec = Math.floor(now / 1000);
-                const anyActive = nodes.some(a => {
-                    const end = toNum(a.endTime);
-                    const endSec = end > 1e12 ? Math.floor(end / 1000) : end;
-                    const timeOk = end <= 0 || endSec > nowSec;
-                    return timeOk && a.enabled !== false && a.visible !== false;
-                });
-                if (!anyActive) ended = true;
-            }
-        } catch { /* 列表也失败则保持原判定 */ }
-    }
-    qixiEndedCache = { date: getLocalDateKey(), ended, activity };
-    qixiEndedCacheAt = now;
-    return qixiEndedCache;
+function updateQixiEndedSnapshot(activity) {
+    const end = toNum(activity?.endTime);
+    const endSec = end > 1e12 ? Math.floor(end / 1000) : end;
+    const ended = activity?.active === false || (endSec > 0 && endSec < Math.floor(Date.now() / 1000));
+    qixiEndedSnapshots.set(getQixiDewLimitStateKey(), {
+        at: Date.now(), value: structuredClone({ date: getLocalDateKey(), ended, activity }),
+    });
 }
 
-// 同步取缓存（不阻塞）：返回当前缓存值（可能为 null），并后台异步刷新（TTL 过期时）。
+async function getQixiEndedState() {
+    const key = getQixiDewLimitStateKey();
+    const snapshot = qixiEndedSnapshots.get(key);
+    const ttl = snapshot?.value.ended ? 6 * 60 * 60 * 1000 : 15 * 60 * 1000;
+    if (snapshot && Date.now() - snapshot.at < ttl) return structuredClone(snapshot.value);
+    if (!qixiEndedFlights.has(key)) {
+        const flight = getQixiActivity().then(activity => {
+            if (getQixiDewLimitStateKey() !== key) return null;
+            if (activity?.warning) return snapshot ? structuredClone(snapshot.value) : null;
+            return getQixiEndedStateCached();
+        }).finally(() => {
+            if (qixiEndedFlights.get(key) === flight) qixiEndedFlights.delete(key);
+        });
+        qixiEndedFlights.set(key, flight);
+    }
+    return structuredClone(await qixiEndedFlights.get(key));
+}
+
+// 纯快照 getter：不发请求、不排后台任务，未知时返回 null。
 function getQixiEndedStateCached() {
-    if (!qixiEndedCache) {
-        getQixiEndedState().catch(() => {});
-        return null;
-    }
-    const ttl = qixiEndedCache.ended ? 6 * 60 * 60 * 1000 : 15 * 60 * 1000;
-    if (Date.now() - qixiEndedCacheAt >= ttl) {
-        getQixiEndedState().catch(() => {});
-    }
-    return qixiEndedCache;
+    return structuredClone(qixiEndedSnapshots.get(getQixiDewLimitStateKey())?.value || null);
 }
 
 // ============================================================
@@ -3300,7 +3108,7 @@ function isLightningMutantPlant(plant) {
 async function getOwnWeatherStatus() {
     const request = types.GetWeatherStatusRequest.encode(types.GetWeatherStatusRequest.create({})).finish();
     const { body } = await sendMsgAsync('gamepb.weatherpb.WeatherService', 'GetWeatherStatus', request);
-    return normalizeWeatherStatus(types.GetWeatherStatusReply.decode(body)?.weather);
+    return normalizeWeatherStatus(decodeActivityReply(types.GetWeatherStatusReply, body)?.weather);
 }
 
 async function getRainPoemActivity() {
@@ -3365,7 +3173,8 @@ async function collectRainPoemWeather() {
     if (before.items.collectionBottles < 1) throw new Error('天气采集瓶不足');
     if (before.collection.remainingUseCount <= 0) throw new Error('天气采集瓶今日使用次数已达上限');
 
-    const { enterFriendFarm, leaveFriendFarm } = require('./friend-api');
+    const { withFriendVisitSession } = require('./friend-api');
+    if (typeof withFriendVisitSession !== 'function') return { skipped: true, reason: 'friend_visit_session_unavailable' };
     const { getFriendsList } = require('./friend-land-analyzer');
     const friends = await getFriendsList();
     let checkedCount = 0;
@@ -3376,25 +3185,40 @@ async function collectRainPoemWeather() {
         if (!gid) continue;
         let entered = false;
         try {
-            const visit = await enterFriendFarm(gid);
-            entered = true;
-            checkedCount++;
-            const weather = normalizeWeatherStatus(visit?.weather);
-            if (!weather.rainstorm) continue;
-            await operateActivityReply(RAIN_POEM_COLLECTION_ACTIVITY_ID, RAIN_POEM_COLLECTION_CMD, {
-                // 抓包确认 field 107.3 承载目标好友 GID；沿用现有消息字段名 item_uid。
-                helu_paid_draw: { item_uid: gid },
+            const weather = await withFriendVisitSession(gid, async visit => {
+                entered = true;
+                checkedCount++;
+                const currentWeather = normalizeWeatherStatus(visit?.weather);
+                if (!currentWeather.rainstorm) return null;
+                const root = types.ActivityOperateRequest.root;
+                const requestType = root?.lookup('gamepb.activitypb.CollectWeatherRequest');
+                if (!requestType?.fields?.weather_collect_operate?.resolvedType?.fields?.host_gid) {
+                    const err = new Error('天气采集缺少已确证的 host_gid 请求契约');
+                    err.code = 'ACTIVITY_CONTRACT_MISSING';
+                    throw err;
+                }
+                const request = requestType.encode(requestType.create({
+                    activity_id: RAIN_POEM_COLLECTION_ACTIVITY_ID, operate_type: RAIN_POEM_COLLECTION_CMD,
+                    weather_collect_operate: { host_gid: gid },
+                })).finish();
+                // 已确证的 field 107.3，不能借用会丢失 GID 的荷露字段；只发一次。
+                const account = milkTeaAccountKey();
+                milkTeaInvalidate(account);
+                try {
+                    await sendMsgAsync('gamepb.activitypb.ActivityService', 'Operate', request);
+                } finally {
+                    milkTeaInvalidate(account);
+                }
+                return currentWeather;
             });
-            return {
+            if (weather) return {
                 ok: true, friendGid: gid, friendName: String(friend?.name || ''), weather,
                 checkedCount, visitFailureCount, activity: await getRainPoemActivity(),
             };
         } catch (err) {
-            if (entered) throw err;
+            if (entered || err?.resultState === 'unknown' || err?.outcomeUnknown === true || err?.visitStage === 'leave') throw err;
             visitFailureCount++;
             activityLogger.warn('检查好友雷雨天气失败，继续下一位', { friendGid: gid, error: err.message });
-        } finally {
-            if (entered) await leaveFriendFarm(gid);
         }
     }
     return { ok: true, collected: false, reason: 'no_rainstorm_friend', checkedCount, visitFailureCount, activity: await getRainPoemActivity() };
@@ -3636,7 +3460,59 @@ const MILK_TEA_OPERATIONS = {
 };
 const MILK_TEA_READ_ACTIONS = new Set(['shop', 'hireList', 'workshop', 'work', 'rank', 'logs']);
 
-let milkTeaTail = Promise.resolve();
+const milkTeaQueues = new Map();
+const milkTeaPageFlights = new Map();
+const milkTeaMutationGenerations = new Map();
+const milkTeaInventories = new WeakMap();
+const MILK_TEA_QUEUE_LIMIT = 32;
+const MILK_TEA_QUEUE_DEADLINE_MS = 30000;
+const milkTeaSchemaVersions = new WeakMap();
+let milkTeaSchemaVersion = 0;
+function milkTeaProtocolVersion() {
+  const schema = types.MilkTeaGetGroupReply;
+  if (!milkTeaSchemaVersions.has(schema)) milkTeaSchemaVersions.set(schema, ++milkTeaSchemaVersion);
+  return [CONFIG.clientVersion, milkTeaSchemaVersions.get(schema)];
+}
+
+function milkTeaEpoch() {
+  return getDiagnosticSnapshot?.()?.connectionEpoch ?? null;
+}
+
+function milkTeaAccountKey() {
+  const state = getUserState();
+  return JSON.stringify([require('node:process').env.FARM_ACCOUNT_ID || state?.accountId || '',
+    String(state?.gid || state?.openid || 'current')]);
+}
+
+function milkTeaInvalidate(account = milkTeaAccountKey()) {
+  milkTeaMutationGenerations.set(account, (milkTeaMutationGenerations.get(account) || 0) + 1);
+}
+
+function milkTeaContext(options = {}) {
+  const inherited = getRequestContext();
+  return { account: milkTeaAccountKey(), epoch: milkTeaEpoch(), signal: options.signal ?? inherited.signal,
+    deadlineAt: options.deadlineAt ?? options.deadline ?? inherited.deadline };
+}
+
+function milkTeaCheckContext(ctx) {
+  if (ctx?.check) return ctx.check();
+  if (ctx && (ctx.signal?.aborted || (ctx.deadlineAt != null && Date.now() >= ctx.deadlineAt)
+      || ctx.account !== milkTeaAccountKey() || ctx.epoch !== milkTeaEpoch())) {
+    const err = new Error('奶茶请求已取消、超时或账号已切换');
+    err.code = 'ACTIVITY_CONTEXT_EXPIRED';
+    throw err;
+  }
+}
+
+function milkTeaPageInput(page, input) {
+  if (page === 'hireList') return { durationId: Math.max(1, Math.min(3, toNum(input.durationId) || 1)) };
+  if (page === 'rank') return { pageNumber: Math.max(1, toNum(input.pageNumber) || 1) };
+  if (page === 'logs') {
+    const now = Math.floor(Date.now() / 1000);
+    return { day: toNum(input.day) || Math.floor((now + 8 * 3600) / 86400) * 86400 - 8 * 3600 };
+  }
+  return {};
+}
 
 function milkTeaPlain(type, value) {
   return type.toObject(type.create(value), { longs: String, bytes: String, defaults: false });
@@ -3679,24 +3555,41 @@ function milkTeaRecipeName(recipeId) {
 }
 
 // 走 Operate 的奶茶子操作，返回解码后的对应字段
-async function milkTeaRpc(action, params = {}) {
+async function milkTeaRpc(action, params = {}, ctx) {
   const op = MILK_TEA_OPERATIONS[action];
   if (!op) throw new Error(`不支持的奶茶操作: ${action}`);
   const [cmd, field, activityId] = op;
+  milkTeaCheckContext(ctx);
   assertActivityConnection('奶茶活动');
-  const request = types.MilkTeaOperateRequest.encode(
-    types.MilkTeaOperateRequest.create({
+  const root = types.MilkTeaOperateRequest.root;
+  const requestType = action === 'shareDaily' || action === 'shareRewards'
+    ? root?.lookup('gamepb.activitypb.AutumnOperateRequest') || types.MilkTeaOperateRequest : types.MilkTeaOperateRequest;
+  const replyType = action === 'shareDaily' || action === 'shareRewards'
+    ? root?.lookup('gamepb.activitypb.ActivityOperateReply') || types.MilkTeaOperateReply : types.MilkTeaOperateReply;
+  const request = requestType.encode(
+    requestType.create({
       activity_id: Number(activityId),
       operate_type: cmd,
       [field]: params,
     })
   ).finish();
-  const { body } = await sendMsgAsync(MILK_TEA_SERVICE, 'Operate', request);
-  const decoded = types.MilkTeaOperateReply.decode(body);
-  if (toNum(decoded.activity_id) !== Number(activityId) || toNum(decoded.operate_type) !== cmd) {
-    throw new Error('奶茶操作回包不匹配，请刷新后重试');
+  // Operate 不能按方法名判成只读；原始调用不合并，写开始/结束均推进失效代数。
+  const mutation = !MILK_TEA_READ_ACTIONS.has(action);
+  const account = milkTeaAccountKey();
+  if (mutation) milkTeaInvalidate(account);
+  try {
+    const { body } = await sendMsgAsync(MILK_TEA_SERVICE, 'Operate', request, {
+      signal: ctx?.signal, deadline: ctx?.deadlineAt,
+    });
+    if (!mutation) milkTeaCheckContext(ctx);
+    const decoded = decodeActivityReply(replyType, body);
+    if (toNum(decoded?.activity_id) !== Number(activityId) || toNum(decoded?.operate_type) !== cmd || !decoded?.[field]) {
+      throw new Error('奶茶操作回包不匹配，请刷新后重试');
+    }
+    return decoded[field];
+  } finally {
+    if (mutation) milkTeaInvalidate(account);
   }
-  return decoded[field] || null;
 }
 
 // 读取奶茶活动组。
@@ -3709,15 +3602,44 @@ async function milkTeaRpc(action, params = {}) {
 //      形状不同 → purchase_limit / category_tag / cond_hints 全部解不出，种子筛选与限购失效。
 //   3) share_reward 挂在子活动 2026110104 上，需按 head.id 定位后单独取 summary。
 // 故照上游做法用 MilkTeaGetGroupReply 独立解码。
-async function getMilkTeaGroup() {
+let milkTeaGroupSchemaSource;
+let milkTeaGroupSchema;
+function milkTeaGroupReplyType() {
+  const base = types.MilkTeaGetGroupReply;
+  if (milkTeaGroupSchemaSource === base) return milkTeaGroupSchema;
+  milkTeaGroupSchemaSource = base;
+  milkTeaGroupSchema = base;
+  const data = base.root?.lookup('gamepb.activitypb.ActivityData');
+  const group = base.fields?.group?.resolvedType;
+  const child = group?.fields?.children?.resolvedType;
+  const share = data?.fields?.share_reward;
+  if (!share || !child || child.fields.share_reward) return base;
+  const reflection = require('protobufjs');
+  const node = new reflection.Type('MilkTeaSnapshotNode');
+  for (const field of child.fieldsArray) node.add(new reflection.Field(field.name, field.id,
+    field.resolvedType?.fullName || field.type, field.rule));
+  node.add(new reflection.Field(share.name, share.id, share.resolvedType.fullName));
+  const groupType = new reflection.Type('MilkTeaSnapshotGroup')
+    .add(new reflection.Field('head', group.fields.head.id, group.fields.head.resolvedType.fullName))
+    .add(new reflection.Field('children', group.fields.children.id, 'MilkTeaSnapshotNode', 'repeated'));
+  const reply = new reflection.Type('MilkTeaSnapshotReply').add(new reflection.Field('group', base.fields.group.id, 'MilkTeaSnapshotGroup'));
+  const namespace = new reflection.Namespace('milkTeaSnapshot');
+  namespace.add(node).add(groupType).add(reply);
+  reflection.Root.fromJSON(base.root.toJSON()).add(namespace);
+  milkTeaGroupSchema = reply.resolveAll();
+  return milkTeaGroupSchema;
+}
+
+async function getMilkTeaGroup(ctx) {
   const request = types.ActivityGetGroupRequest.encode(
     types.ActivityGetGroupRequest.create({
       id: Number(MILK_TEA_GROUP_ID),
       uid: String(MILK_TEA_ACTIVITY_UID || ''),
     })
   ).finish();
-  const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'GetGroup', request);
-  return types.MilkTeaGetGroupReply.decode(body);
+  const { body } = await sendMsgAsync('gamepb.activitypb.ActivityService', 'GetGroup', request, { deadline: ctx?.deadlineAt });
+  if ((Buffer.isBuffer(body) || body instanceof Uint8Array)) return milkTeaGroupReplyType().decode(body);
+  return body;
 }
 
 // 在 MilkTeaGroup 树中按 head 的活动 ID 查找子节点。
@@ -3905,14 +3827,21 @@ function normalizeMilkTeaShare(body) {
   };
 }
 
-/** 读取背包（含金币兜底，与 404 的 bag() 同口径）。 */
+/** 只使用本次背包快照，不用用户状态中的旧金币补足写前库存。 */
 async function getMilkTeaInventory() {
-  const inventory = [...(getBagItems(await getBag()) || [])];
-  const account = getUserState() || {};
-  if (!inventory.some(item => toNum(item?.id) === 1001) && account.gold != null) {
-    inventory.push({ id: 1001, count: String(account.gold) });
+  const bag = await getBag();
+  if (!bag || (!Array.isArray(bag.item_bag?.items) && !Array.isArray(bag.items))) {
+    const err = new Error('奶茶背包快照未下发');
+    err.code = 'ACTIVITY_SNAPSHOT_MISSING';
+    throw err;
   }
-  return inventory;
+  const items = getBagItems(bag);
+  if (!Array.isArray(items)) {
+    const err = new Error('奶茶背包快照未下发');
+    err.code = 'ACTIVITY_SNAPSHOT_MISSING';
+    throw err;
+  }
+  return [...items];
 }
 
 /**
@@ -3924,6 +3853,14 @@ async function getMilkTeaInventory() {
  */
 function milkTeaCostItemId(cost) {
   return toNum(cost?.itemId ?? cost?.id);
+}
+
+/** 自动购种只认服务端明确下发的纯金币成本，不能按作物名称或1000系前缀推断。 */
+function isMilkTeaGoldSeed(good) {
+  return good?.categoryTag === 'seed' && Array.isArray(good.costs) && good.costs.length > 0
+    && good.costs.every(cost => milkTeaCostItemId(cost) === 1001
+      && cost?.count !== true && cost?.count !== false
+      && Number.isSafeInteger(toNum(cost?.count)) && toNum(cost?.count) > 0);
 }
 
 /** 库存是否够付（count 份）；钻石(1004)购买一律视为不可用。 */
@@ -3971,7 +3908,9 @@ function milkTeaInventoryCount(inventory, itemId) {
 function normalizeMilkTeaGood(good, inventory, phase = 'business') {
   const costs = (good.cost || []).map(c => normalizeCoreItem({ id: c.id, count: c.count, uid: c.uid }));
   const remaining = Math.max(0, toNum(good.purchase_limit) - toNum(good.purchased_count));
-  const unlocked = (good.cond_hints || []).every(hint => !!hint.satisfied);
+  // 官方 repeated 条件省略即空列表，不代表锁定；成本和限购仍由本次快照核验。
+  const unlocked = (good.cond_hints == null || Array.isArray(good.cond_hints))
+    && (good.cond_hints || []).every(hint => hint.satisfied === true);
   const paid = toNum(good.diamond_cost_count) > 0 || (good.cost || []).some(c => toNum(c.id) === 1004);
   const categoryTag = String(good.category_tag || '');
   const normalized = {
@@ -4037,22 +3976,72 @@ function normalizeMilkTeaFund(node) {
  * @param {string} page 页面：shop/settings/upgrade/workshop/hireList/exchange/fund/work/rank/logs
  * @param {object} input 附加参数（durationId/pageNumber/day/name 等）
  */
-async function getMilkTeaActivity(page = 'shop', input = {}) {
+async function getMilkTeaActivity(page = 'shop', input = {}, options = {}) {
+  const ctx = milkTeaContext(options);
+  milkTeaCheckContext(ctx);
+  const canonical = milkTeaPageInput(page, input);
+  const generation = milkTeaMutationGenerations.get(ctx.account) || 0;
+  const version = milkTeaProtocolVersion();
+  const key = JSON.stringify([ctx.account, MILK_TEA_ACTIVITY_UID, page, canonical, ctx.epoch, version, generation]);
+  let flight = milkTeaPageFlights.get(key);
+  if (!flight) {
+    if (milkTeaPageFlights.size >= MILK_TEA_QUEUE_LIMIT) {
+      const err = new Error('奶茶页面并发请求已达上限');
+      err.code = 'QUEUE_FULL';
+      throw err;
+    }
+    flight = { consumers: new Set() };
+    milkTeaPageFlights.set(key, flight);
+    const sharedContext = { check: () => {
+      for (const consumer of flight.consumers) {
+        try { milkTeaCheckContext(consumer); return; } catch { /* 检查其余消费者 */ }
+      }
+      const err = new Error('奶茶页面已无有效消费者');
+      err.code = 'ACTIVITY_CONTEXT_EXPIRED';
+      throw err;
+    } };
+    // 单个 HTTP 消费者的 ALS 不能控制共享底层请求；各消费者的取消/期限由阶段检查处理。
+    flight.promise = Promise.resolve().then(() => runWithRequestContext({ signal: undefined, deadline: undefined },
+      () => loadMilkTeaActivity(page, canonical, sharedContext)))
+      .finally(() => { if (milkTeaPageFlights.get(key) === flight) milkTeaPageFlights.delete(key); });
+  }
+  flight.consumers.add(ctx);
+  try {
+    const state = await flight.promise;
+    milkTeaCheckContext(ctx);
+    if (generation !== (milkTeaMutationGenerations.get(ctx.account) || 0)
+        || JSON.stringify(version) !== JSON.stringify(milkTeaProtocolVersion())) {
+      const err = new Error('奶茶页面结果已过期，请重新读取');
+      err.code = 'ACTIVITY_STALE_RESULT';
+      throw err;
+    }
+    const copy = structuredClone(state);
+    if (milkTeaInventories.has(state)) milkTeaInventories.set(copy, structuredClone(milkTeaInventories.get(state)));
+    return copy;
+  } finally {
+    flight.consumers.delete(ctx);
+  }
+}
+
+async function loadMilkTeaActivity(page, input, ctx) {
   const validPages = ['shop', 'settings', 'upgrade', 'workshop', 'hireList', 'exchange', 'fund', 'work', 'rank', 'logs'];
   if (!validPages.includes(page)) throw new Error('未知的奶茶活动页面');
-  const group = await getMilkTeaGroup();
+  milkTeaCheckContext(ctx);
+  const group = await getMilkTeaGroup(ctx);
+  milkTeaCheckContext(ctx);
   const root = group?.group;
   const node = findMilkTeaNodeById([root], MILK_TEA_ACTIVITY_ID);
-  // 活动未上线/已下线：返回 inactive 空结构，避免自动化每轮抛错刷屏
+  // 空回包不构成下线证据，也不能作为写前默认有效快照。
   if (!node?.milk_tea?.summary) {
-    return { activityId: MILK_TEA_ACTIVITY_ID, title: '奶茶热销中', active: false, settling: false, phase: 'ended', page };
+    return { activityId: MILK_TEA_ACTIVITY_ID, title: '奶茶热销中', active: null,
+      phase: 'unknown', page, skipped: true, reason: 'milk_tea_snapshot_missing' };
   }
   const head = node.head || {};
   const now = Math.floor(Date.now() / 1000);
   const beginTime = toNum(head.begin_time || head.start_time);
   const endTime = toNum(head.end_time);
   const settleStartTime = toNum(head.settle_start_time);
-  const active = now >= beginTime && now < endTime;
+  const active = beginTime > 0 && endTime > beginTime && now >= beginTime && now < endTime;
   const settling = settleStartTime > 0 && now >= settleStartTime;
   const phase = now < beginTime ? 'upcoming' : now >= endTime ? 'ended' : settling ? 'settling' : 'business';
   const summary = normalizeMilkTeaSummary(node);
@@ -4092,13 +4081,32 @@ async function getMilkTeaActivity(page = 'shop', input = {}) {
   // 兑换商店（子活动 2026110102，独立 schema 下为 ActivityBodyShop.goods）
   const shopNode = findMilkTeaNodeById([root], MILK_TEA_SHOP_ACTIVITY_ID);
   const rawGoods = shopNode?.shop?.goods || [];
-  const inventory = await getMilkTeaInventory();
+  const pageReads = {};
+  const readPage = (action, params = {}) => {
+    milkTeaCheckContext(ctx);
+    pageReads[action] = milkTeaRpc(action, params, ctx);
+  };
+  if (active && summary.shopOpenAt > 0) {
+    if (['shop', 'upgrade', 'workshop', 'hireList'].includes(page)) readPage('shop');
+    if (page === 'shop' || page === 'workshop') readPage('workshop');
+    if (page === 'hireList') readPage('hireList', { duration_id: input.durationId });
+    if (page === 'work') readPage('work');
+    if (page === 'rank') readPage('rank', { page: input.pageNumber });
+    if (page === 'logs') readPage('logs', { day: input.day });
+  }
+  milkTeaCheckContext(ctx);
+  const settled = await Promise.allSettled([getMilkTeaInventory(), ...Object.values(pageReads)]);
+  const failed = settled.find(result => result.status === 'rejected');
+  if (failed) throw failed.reason;
+  const inventory = settled[0].value;
+  milkTeaCheckContext(ctx);
+  milkTeaInventories.set(result, inventory);
   result.goods = rawGoods
     .map(good => normalizeMilkTeaGood(good, inventory, phase))
     .sort(compareMilkTeaGoods);
 
   // 兑换货币余额（供面板显示「我有多少奶茶券/金币」）：
-  // 1041=奶茶券（活动专属兑换货币）、1001=金币。取自背包（金币兜底 state.gold）。
+  // 1041=奶茶券（活动专属兑换货币）、1001=金币，均只取本次背包快照。
   result.balances = {
     milkTeaToken: milkTeaInventoryCount(inventory, 1041),
     goldCoin: milkTeaInventoryCount(inventory, 1001),
@@ -4107,25 +4115,29 @@ async function getMilkTeaActivity(page = 'shop', input = {}) {
   // 店铺相关（需已开业且活动在期）
   if (active && summary.shopOpenAt > 0) {
     if (['shop', 'upgrade', 'workshop', 'hireList'].includes(page)) {
-      const shopReply = await milkTeaRpc('shop');
-      result.shop = normalizeMilkTeaShop(shopReply?.shop);
+      const shopReply = await pageReads.shop;
+      if (!shopReply?.shop) {
+        const err = new Error('奶茶店铺快照未下发');
+        err.code = 'ACTIVITY_SNAPSHOT_MISSING';
+        throw err;
+      }
+      result.shop = normalizeMilkTeaShop(shopReply.shop);
     }
     if (page === 'shop' || page === 'workshop') {
-      const wsReply = await milkTeaRpc('workshop');
+      const wsReply = await pageReads.workshop;
       result.recipes = normalizeMilkTeaRecipes(wsReply?.recipes);
     }
     if (page === 'hireList') {
-      const durationId = Math.max(1, Math.min(3, toNum(input.durationId) || 1));
-      const hireReply = await milkTeaRpc('hireList', { duration_id: durationId });
+      const hireReply = await pageReads.hireList;
       result.hire = normalizeMilkTeaHire(hireReply);
       result.durations = milkTeaConfig.MilkTeaHireDurationConfig || [];
     }
     if (page === 'work') {
-      const workReply = await milkTeaRpc('work');
+      const workReply = await pageReads.work;
       result.work = normalizeMilkTeaWork(workReply);
     }
     if (page === 'rank') {
-      const rankReply = await milkTeaRpc('rank', { page: Math.max(1, toNum(input.pageNumber) || 1) });
+      const rankReply = await pageReads.rank;
       result.rank = {
         myRank: toNum(rankReply?.my_rank),
         page: toNum(rankReply?.page),
@@ -4138,9 +4150,7 @@ async function getMilkTeaActivity(page = 'shop', input = {}) {
       };
     }
     if (page === 'logs') {
-      const today = Math.floor((now + 8 * 3600) / 86400) * 86400 - 8 * 3600;
-      const day = toNum(input.day) || today;
-      const logReply = await milkTeaRpc('logs', { day });
+      const logReply = await pageReads.logs;
       result.logs = {
         day: toNum(logReply?.day),
         token: toNum(logReply?.token),
@@ -4161,9 +4171,36 @@ async function getMilkTeaActivity(page = 'shop', input = {}) {
  * @param {string} action 见 MILK_TEA_OPERATIONS
  * @param {object} input 参数
  */
-function operateMilkTeaActivity(action, input = {}) {
-  const task = milkTeaTail.then(() => performMilkTeaOperation(action, input));
-  milkTeaTail = task.catch(() => {});
+function operateMilkTeaActivity(action, input = {}, options = {}) {
+  const ctx = milkTeaContext(options);
+  const entryDeadlineAt = Date.now() + MILK_TEA_QUEUE_DEADLINE_MS;
+  let queue = milkTeaQueues.get(ctx.account);
+  if (!queue) {
+    queue = { tail: Promise.resolve(), size: 0 };
+    milkTeaQueues.set(ctx.account, queue);
+  }
+  if (queue.size >= MILK_TEA_QUEUE_LIMIT) return Promise.resolve({ skipped: true, reason: 'milk_tea_queue_full' });
+  const params = structuredClone(input);
+  queue.size++;
+  const task = queue.tail.then(async () => {
+    try {
+      // 30 秒只限制未入队执行的命令；入锁后沿用调用方的业务 deadline。
+      if (Date.now() >= entryDeadlineAt) return { skipped: true, reason: 'milk_tea_queue_deadline' };
+      milkTeaCheckContext(ctx);
+      // 入锁时切断旧页面 flight，写前判断只能使用本命令的一次新快照。
+      milkTeaInvalidate(ctx.account);
+      return await runWithRequestContext({ signal: ctx.signal, deadline: ctx.deadlineAt },
+        () => performMilkTeaOperation(action, params, ctx));
+    } catch (err) {
+      if (err?.code === 'ACTIVITY_CONTEXT_EXPIRED') return { skipped: true, reason: 'milk_tea_context_expired' };
+      if (err?.code === 'ACTIVITY_SNAPSHOT_MISSING') return { skipped: true, reason: 'milk_tea_snapshot_missing' };
+      throw err;
+    }
+  }).finally(() => {
+    queue.size--;
+    if (!queue.size && milkTeaQueues.get(ctx.account) === queue) milkTeaQueues.delete(ctx.account);
+  });
+  queue.tail = task.catch(() => {});
   return task;
 }
 
@@ -4177,10 +4214,16 @@ const MILK_TEA_SETTLING_ALLOWED = new Set([
 // 无需店铺已开业的操作
 const MILK_TEA_NO_SHOP_REQUIRED = new Set(['create', 'shareDaily', 'shareRewards', 'fundClaim']);
 
-async function performMilkTeaOperation(action, input = {}) {
+async function performMilkTeaOperation(action, input = {}, ctx) {
   const op = MILK_TEA_OPERATIONS[action];
   if (!op || MILK_TEA_READ_ACTIONS.has(action)) throw new Error('未知的奶茶活动操作');
-  const state = await getMilkTeaActivity(milkTeaPageForAction(action), input);
+  const state = await loadMilkTeaActivity(milkTeaPageForAction(action), milkTeaPageInput(milkTeaPageForAction(action), input), ctx);
+  milkTeaCheckContext(ctx);
+  const inventory = milkTeaInventories.get(state);
+  if (!inventory) return { skipped: true, reason: 'milk_tea_snapshot_missing' };
+  if (['wages', 'interact'].includes(action) && !state.work) return { skipped: true, reason: 'milk_tea_work_snapshot_missing' };
+  if (['unlock', 'fundClaim'].includes(action) && !state.fund) return { skipped: true, reason: 'milk_tea_fund_snapshot_missing' };
+  if (['shareDaily', 'shareRewards'].includes(action) && !state.share) return { skipped: true, reason: 'milk_tea_share_snapshot_missing' };
   if (!state.active) throw new Error('奶茶活动尚未开放或已结束');
   if (!MILK_TEA_NO_SHOP_REQUIRED.has(action) && !state.summary.shopOpenAt) throw new Error('请先开业');
   // 结算期不允许购买活动种子（与官方 S4ShopUI 同规则）——先于通用白名单检查，
@@ -4209,9 +4252,9 @@ async function performMilkTeaOperation(action, input = {}) {
     //    404 参考实现有这一步（available([{ id: state.shop.sales_item_id, count: 1 }], inventory)）。
     //    线上实测：salesItemId=1042，账号 1 持有 0 个 → 本应静默跳过。
     const salesItemId = toNum(state.shop?.salesItemId);
+    if (salesItemId <= 0) return { skipped: true, reason: 'milk_tea_boost_contract_missing' };
     if (salesItemId > 0) {
-      const inventory = await getMilkTeaInventory();
-      if (!milkTeaCanAfford([{ itemId: salesItemId, count: 1 }], inventory, 1)) {
+      if (!milkTeaCanAfford([{ itemId: salesItemId, count: 1 }], inventory, Math.max(1, Math.min(9999, toNum(input.count) || 1)))) {
         return { ok: true, action, skipped: true, reason: '宣传喇叭不足', rewards: [] };
       }
     }
@@ -4226,7 +4269,6 @@ async function performMilkTeaOperation(action, input = {}) {
       const eligible = new Set(
         (state.recipes || []).filter(r => r.unlocked && r.isAdvanced).map(r => r.fruitItemId).filter(Boolean)
       );
-      const inventory = await getMilkTeaInventory();
       uids = inventory
         .filter(x => eligible.has(toNum(x.id)) && toNum(x.uid) > 0 && toNum(x.count) > 0)
         .map(x => String(x.uid));
@@ -4236,6 +4278,10 @@ async function performMilkTeaOperation(action, input = {}) {
     // 线上实测：账号 1 已解锁配方 2/9，但对应果实 40525/49005 背包均为 0。
     if (!uids.length) return { ok: true, action, skipped: true, reason: '没有可加工的已解锁活动果实', rewards: [] };
     if (uids.length > 200) throw new Error('一次最多加工 200 个果实');
+    const eligible = new Set((state.recipes || []).filter(r => r.unlocked && r.isAdvanced).map(r => r.fruitItemId));
+    if (uids.some(uid => !inventory.some(item => String(item.uid) === uid && toNum(item.count) > 0 && eligible.has(toNum(item.id))))) {
+      return { skipped: true, reason: 'milk_tea_fruit_not_owned_or_unlocked' };
+    }
     params = { fruit_uids: uids.map(Number).filter(Number.isFinite) };
   } else if (action === 'hire') {
     const levelCfg = (milkTeaConfig.MilkTeaStoreLevelConfig || [])
@@ -4249,6 +4295,7 @@ async function performMilkTeaOperation(action, input = {}) {
       for (let i = 0; i < slotCount; i++) if (!usedSlots.has(i)) { slotIndex = i; break; }
     }
     if (slotIndex < 0) throw new Error('员工位置已满');
+    if (slotIndex >= slotCount || !state.hire) return { skipped: true, reason: 'milk_tea_hire_slot_unconfirmed' };
 
     const durationId = [1, 2, 3].includes(toNum(input.durationId)) ? toNum(input.durationId) : 1;
     const talentId = [0, 9001, 9002, 9003, 9004].includes(toNum(input.talentId)) ? toNum(input.talentId) : 0;
@@ -4268,40 +4315,50 @@ async function performMilkTeaOperation(action, input = {}) {
       const targetGid = toNum(input.targetGid);
       candidate = [...(state.hire?.friends || []), ...(state.hire?.robots || [])]
         .find(v => toNum(v.friend?.gid) === targetGid);
-      if (!candidate || candidate.state !== 0 || candidate.rehireAvailableAt > now) throw new Error('该员工当前不可雇佣');
+      if (!candidate || candidate.state !== 0 || candidate.stateUntilAt > now || candidate.rehireAvailableAt > now) throw new Error('该员工当前不可雇佣');
     }
     params = {
       hires: [{ slot_index: slotIndex, duration_id: durationId, target_gid: toNum(candidate.friend?.gid) }],
     };
   } else if (action === 'exchange' || action === 'seedBuy') {
     const wantSeed = action === 'seedBuy';
+    const autoGoldOnly = wantSeed && input.auto === true;
     const count = Math.max(1, toNum(input.count) || 1);
     const goodsList = state.goods || [];
     let good = input.goodsId != null
       ? goodsList.find(g => g.id === String(toNum(input.goodsId)))
       : null;
     if (wantSeed) {
-      // 自动挑选：未售罄、已解锁、非钻石购买、资源足够，优先 order 小的
+      // 自动调用即使指定goodsId也必须检查本次fresh成本；人工兑换不受金币策略限制。
+      if (autoGoldOnly && input.goodsId != null && !isMilkTeaGoldSeed(good)) {
+        return { skipped: true, reason: 'milk_tea_seed_gold_only' };
+      }
       if (!good || good.categoryTag !== 'seed') {
         good = goodsList
-          .filter(g => g.categoryTag === 'seed' && g.unlocked && !g.paid && g.remaining > 0 && g.affordable)
+          .filter(g => g.categoryTag === 'seed' && g.unlocked && !g.paid && g.remaining > 0 && g.affordable
+            && (!autoGoldOnly || isMilkTeaGoldSeed(g)))
           .sort(compareMilkTeaGoods)[0] || null;
       }
-      if (!good) throw new Error('暂无可购买的活动种子（未解锁/售罄/资源不足）');
+      if (!good) {
+        if (autoGoldOnly) return { skipped: true, reason: 'milk_tea_no_gold_seed' };
+        throw new Error('暂无可购买的活动种子（未解锁/售罄/资源不足）');
+      }
+      if (autoGoldOnly && !isMilkTeaGoldSeed(good)) return { skipped: true, reason: 'milk_tea_seed_gold_only' };
       if (!good.unlocked) throw new Error('该商品尚未解锁');
       if (good.remaining <= 0) throw new Error('该商品已售罄');
     }
     if (!good) throw new Error('商品不存在或已下架');
     if (good.paid) throw new Error('不支持钻石购买');
     if (good.remaining < count) throw new Error('超出限购数量');
-    if (!milkTeaCanAfford(good.costs, await getMilkTeaInventory(), count)) throw new Error('资源不足');
+    if (!good.unlocked) return { skipped: true, reason: 'milk_tea_good_locked' };
+    if (!milkTeaCanAfford(good.costs, inventory, count)) throw new Error('资源不足');
     params = { goods_id: toNum(good.id), count };
   } else if (action === 'wages') {
     if (!(state.work?.slips || []).some(s => s.wageStatus === 1)) throw new Error('暂无可领取工资');
   } else if (action === 'interact') {
     const shift = state.work?.myShift;
     const now = Math.floor(Date.now() / 1000);
-    if (!shift || state.work?.interactDone || shift.endAt <= now || shift.interactCount >= shift.interactLimit) {
+    if (!shift || !toNum(shift.employer?.gid) || state.work?.interactDone || shift.beginAt > now || shift.endAt <= now || shift.interactCount >= shift.interactLimit) {
       throw new Error('当前班次不可互动');
     }
     params = {
@@ -4311,7 +4368,9 @@ async function performMilkTeaOperation(action, input = {}) {
   } else if (action === 'hireSetting') {
     params = { hire_disabled: !!input.disabled };
   } else if (action === 'unlock') {
+    if (!state.fund) return { skipped: true, reason: 'milk_tea_fund_missing' };
     if (state.fund?.unlocked) throw new Error('成长基金已解锁');
+    if (!milkTeaCanAfford(state.fund.costs, inventory)) return { skipped: true, reason: 'milk_tea_fund_cost_unconfirmed_or_insufficient' };
   } else if (action === 'fundClaim') {
     if (!state.fund?.unlocked || !(state.fund?.tiers || []).some(t => t.state === 2)) {
       throw new Error('暂无可领取的成长基金奖励');
@@ -4324,7 +4383,20 @@ async function performMilkTeaOperation(action, input = {}) {
     if (!(state.shop?.pendingRewards || []).some(r => toNum(r.count) > 0)) throw new Error('暂无可领取收益');
   }
 
-  const reply = await milkTeaRpc(action, params);
+  milkTeaCheckContext(ctx);
+  const reply = await milkTeaRpc(action, params, ctx);
+  const resultFields = {
+    create: ['opening_gift'], exchange: ['awards'], seedBuy: ['awards'], claim: ['items'],
+    wages: ['items', 'claimed_count'], boost: ['cups', 'token_gain', 'coin_gain'],
+    upgrade: ['level', 'rewards'], craft: ['crafted_cups', 'used_fruits'],
+    fundClaim: ['claimed_tier_ids', 'awards'], shareDaily: ['granted_score', 'rewards'], shareRewards: ['claimed_tier_ids', 'rewards'],
+  };
+  if (resultFields[action] && !resultFields[action].some(field => {
+    const value = reply?.[field];
+    return Array.isArray(value) ? value.some(item => typeof item === 'object' ? toNum(item?.count) > 0 : toNum(item) > 0)
+      : value && typeof value === 'object' ? Object.values(value).some(count => toNum(count) > 0) : toNum(value) > 0;
+  })) throw new Error('奶茶操作未返回有效结果，请刷新确认');
+  if (action === 'interact' && reply?.success !== true) throw new Error('奶茶互动未成功，请刷新确认');
   if (action === 'hire' && !(reply?.results || []).some(r => r.success)) {
     throw new Error(reply?.results?.[0]?.error_msg || '雇佣未成功，请刷新确认');
   }
@@ -4340,7 +4412,7 @@ async function performMilkTeaOperation(action, input = {}) {
   if (action === 'shareDaily' && toNum(reply?.granted_score) > 0) {
     rewards.push(normalizeCoreItem({ id: toNum(state.share?.scoreItemId) || 1042, count: toNum(reply.granted_score) }));
   }
-  return { ok: true, action, rewards };
+  return { ok: true, action, rewards, result: reply };
 }
 
 function milkTeaPageForAction(action) {
@@ -4453,4 +4525,6 @@ module.exports = {
   MILK_TEA_OPERATIONS,
   getMilkTeaActivity,
   operateMilkTeaActivity,
+  isMilkTeaGoldSeed,
+  invalidateMilkTeaSnapshot: milkTeaInvalidate,
 };

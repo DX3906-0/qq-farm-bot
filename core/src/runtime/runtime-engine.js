@@ -1,5 +1,7 @@
 const { fork } = require('node:child_process');
 const path = require('node:path');
+const fs = require('node:fs');
+const { getDataFile } = require('../config/runtime-paths');
 const process = require('node:process');
 const { Worker } = require('node:worker_threads');
 const store = require('../models/store');
@@ -92,7 +94,8 @@ function createRuntimeEngine(options = {}) {
         startWorker,
         stopWorker,
         restartWorker,
-        callWorkerApi
+        callWorkerApi,
+        shutdown: shutdownWorkerManager
     } = createWorkerManager({
         fork,
         WorkerThread: Worker,
@@ -194,7 +197,23 @@ function createRuntimeEngine(options = {}) {
      * FARM_AUTO_START_ACCOUNTS: 逗号分隔的账号 id（如 "1,2,10"），或 "all" 表示全部
      */
     function resumeConfiguredAccounts() {
-        const raw = (process.env.FARM_AUTO_START_ACCOUNTS || '').trim();
+        // 部署记录只含在线账号 ID，不含 Code/凭据。优先恢复原在线集合，
+        // 避免空 FARM_AUTO_START_ACCOUNTS 让存活网关会话失去业务执行器。
+        const externalGateway = processRef.env.FARM_NETWORK_MODE === 'gateway'
+            && processRef.env.FARM_GATEWAY_EXTERNAL === '1';
+        const resumeFile = getDataFile('deployment-resume.json');
+        let resumeRecord = null;
+        if (externalGateway && fs.existsSync(resumeFile)) {
+            try {
+                const record = JSON.parse(fs.readFileSync(resumeFile, 'utf8'));
+                if (Array.isArray(record.accountIds) && Number(record.expiresAt) > Date.now()) resumeRecord = record;
+            } catch (error) {
+                log('系统', `部署恢复记录读取失败: ${error.message}`);
+            }
+        }
+        const raw = resumeRecord
+            ? resumeRecord.accountIds.map(String).join(',')
+            : (processRef.env.FARM_AUTO_START_ACCOUNTS || '').trim();
         if (!raw) return;
         const accounts = store.getAccounts().accounts || [];
         if (!accounts.length) return;
@@ -211,13 +230,12 @@ function createRuntimeEngine(options = {}) {
             return;
         }
 
-        const externalGateway = process.env.FARM_GATEWAY_EXTERNAL === '1';
         log('系统', `将在 3 秒后自动恢复 ${targets.length} 个账号 (${targets.map(a => a.id).join(', ')})${externalGateway ? ' [外部网关模式：复用已有连接]' : ' [警告：非网关模式会消耗 Code]'}`);
         // 延迟启动，等待面板与网关就绪
         setTimeout(() => {
             for (const acc of targets) {
                 try {
-                    startWorker(acc);
+                    startWorker(acc, { resumeSession: externalGateway });
                 } catch (err) {
                     log('系统', `自动恢复账号 ${acc.id} 失败: ${err && err.message ? err.message : String(err)}`);
                 }
@@ -264,9 +282,33 @@ function createRuntimeEngine(options = {}) {
             setTimeout(() => resolve(), 3000); // 兜底：3s 后继续启动 worker
         });
     }
-    // 容器/引擎停止时标记，避免网关退出触发无限重启
-    process.on('SIGTERM', () => { gatewayShuttingDown = true; });
-    process.on('SIGINT', () => { gatewayShuttingDown = true; });
+    // 业务主进程退出只 detach 外部网关，绝不把 SIGTERM 当“退出所有游戏账号”。
+    let runtimeShuttingDown = false;
+    function shutdownRuntime() {
+        if (runtimeShuttingDown) return;
+        runtimeShuttingDown = true;
+        gatewayShuttingDown = true;
+        if (gatewayRestartTimer) clearTimeout(gatewayRestartTimer);
+        const preserveSession = processRef.env.FARM_NETWORK_MODE === 'gateway'
+            && processRef.env.FARM_GATEWAY_EXTERNAL === '1';
+        const drain = typeof shutdownWorkerManager === 'function'
+            ? shutdownWorkerManager({ drain: true, preserveSession }) : null;
+        stopAllAccounts({ preserveSession });
+        const finish = (drained, exitCode = 0) => {
+            processRef.removeListener('SIGTERM', shutdownRuntime);
+            processRef.removeListener('SIGINT', shutdownRuntime);
+            if (drained) { processRef.exit(exitCode); return; }
+            const timer = setTimeout(() => processRef.exit(0), 1200);
+            if (timer.unref) timer.unref();
+        };
+        if (drain && typeof drain.then === 'function') {
+            drain.then(outcomes => finish(true, Array.isArray(outcomes)
+                && outcomes.some(outcome => outcome?.graceful === false) ? 1 : 0));
+        }
+        else finish(false);
+    }
+    processRef.on('SIGTERM', shutdownRuntime);
+    processRef.on('SIGINT', shutdownRuntime);
 
     /** 引擎启动入口 */
     async function start(startOpts = {}) {
@@ -301,11 +343,9 @@ function createRuntimeEngine(options = {}) {
         autoCodeRefresh.rescheduleAll();
     }
 
-    /** 停止所有账号 */
-    function stopAllAccounts() {
-        for (const id of Object.keys(workers)) {
-            stopWorker(id);
-        }
+    /** 用户停止全部账号与业务退出分开；业务退出使用 preserveSession。 */
+    function stopAllAccounts(options = {}) {
+        return Promise.all(Object.keys(workers).map(id => stopWorker(id, options)));
     }
 
     return {

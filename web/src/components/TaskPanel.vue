@@ -2,6 +2,7 @@
 import { storeToRefs } from 'pinia'
 import { computed, watch } from 'vue'
 import DailyOverview from '@/components/DailyOverview.vue'
+import OpenServerGiftPanel from '@/components/OpenServerGiftPanel.vue'
 import { useAccountStore } from '@/stores/account'
 import { useStatusStore } from '@/stores/status'
 
@@ -65,6 +66,7 @@ function formatTaskProgress(task: any) {
   <div class="space-y-6">
     <!-- Daily Overview (Daily Gifts & Tasks) -->
     <DailyOverview :daily-gifts="dailyGifts" />
+    <OpenServerGiftPanel />
 
     <!-- Growth Task -->
     <div class="flex flex-col rounded-lg bg-white p-4 shadow dark:bg-gray-800">

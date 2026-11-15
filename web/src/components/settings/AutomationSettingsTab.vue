@@ -8,7 +8,10 @@ import SettingToggle from '@/components/settings/SettingToggle.vue'
 import { isActivityHidden } from '@/config/activityVisibility'
 import { isWithinActivityWindowMs, MILK_TEA_BUSINESS_WINDOW } from '@/constants/activity-windows'
 import { useFriendStore } from '@/stores/friend'
+import { createOverlayTransition } from '@/composables/useContentMotion'
 import friendIcon from '@/assets/qqfarm/default_head.png'
+
+const overlayMotion = createOverlayTransition()
 
 interface AutomationSettings {
   automation: {
@@ -27,6 +30,8 @@ interface AutomationSettings {
     star_passport_claim: boolean
     star_record_claim: boolean
     solar_terms_claim: boolean
+    solar_terms_quiz_notify: boolean
+    solar_terms_auto_answer: boolean
     qingmei_seed_claim: boolean
     qingmei_wine_brew: boolean
     qixi_dew_use: boolean
@@ -123,10 +128,12 @@ const props = withDefaults(defineProps<{
   title?: string
   saveLabel?: string
   showRunAutoCodeRefresh?: boolean
+  showSave?: boolean
 }>(), {
   title: '自动控制',
   saveLabel: '保存自动控制',
   showRunAutoCodeRefresh: true,
+  showSave: true,
 })
 
 const emit = defineEmits<{
@@ -228,15 +235,24 @@ onMounted(() => {
 onUnmounted(() => {
   if (nowTimer) window.clearInterval(nowTimer)
   nowTimer = null
+  overlayMotion.dispose()
 })
 watch(() => props.currentAccountId, ensureFriends)
 
 const activeCategory = ref<string | null>(null)
+const displayedCategory = ref<string | null>(null)
 function openCategory(key: string) {
+  if (props.saving) return
+  displayedCategory.value = key
   activeCategory.value = key
 }
 function closeCategory() {
   activeCategory.value = null
+}
+function finishCategoryExit() {
+  // Keep the current heading/controls painted during the short exit. A stale
+  // leave callback must not blank a newer opening or trigger any game action.
+  if (!activeCategory.value) displayedCategory.value = null
 }
 
 // 活动控制分类的介绍文案动态反映当前「活动控制」弹窗里实际可见的开关，
@@ -259,7 +275,7 @@ const categories = computed(() => [
   { key: 'monitor', label: '监控与推送', icon: 'i-carbon-notification', iconBg: 'bg-teal-50 dark:bg-teal-900/30', iconText: 'text-teal-600 dark:text-teal-300', desc: '每日日报·自动刷新 Code' },
 ])
 
-const activeCat = computed(() => categories.value.find(c => c.key === activeCategory.value) || null)
+const activeCat = computed(() => categories.value.find(c => c.key === displayedCategory.value) || null)
 
 const coreToggles = [
   { key: 'farm', label: '自动种植收获', icon: 'i-carbon-sprout', color: 'green' },
@@ -297,7 +313,7 @@ const milkTeaBusinessToggles = [
   { key: 'milk_tea_craft', label: '奶茶·自动制作补货', icon: 'i-carbon-cafe', color: 'teal' },
   { key: 'milk_tea_boost', label: '奶茶·自动使用加速', icon: 'i-carbon-lightning', color: 'teal' },
   { key: 'milk_tea_hire', label: '奶茶·自动雇佣店员', icon: 'i-carbon-user-multiple', color: 'teal' },
-  { key: 'milk_tea_seed_buy', label: '奶茶·自动购买种子', icon: 'i-carbon-seedling', color: 'teal' },
+  { key: 'milk_tea_seed_buy', label: '奶茶·自动购买种子', icon: 'i-carbon-sprout', color: 'teal' },
 ]
 const milkTeaClaimToggles = [
   { key: 'milk_tea_cashier', label: '奶茶·自动领收银台收益', icon: 'i-carbon-currency', color: 'amber' },
@@ -309,7 +325,9 @@ const milkTeaClaimToggles = [
 ]
 
 const activityToggles = [
-  { key: 'solar_terms_claim', label: '自动领取节令小札', icon: 'i-carbon-calendar', color: 'rose' },
+  { key: 'solar_terms_claim', label: '自动领取节令小礼（基础奖励）', icon: 'i-carbon-calendar', color: 'rose' },
+  { key: 'solar_terms_quiz_notify', label: '节令答题微信订阅提醒（同农场日报）', icon: 'i-carbon-notification', color: 'rose' },
+  { key: 'solar_terms_auto_answer', label: '自动答题（仅已核验题库，无可靠答案则跳过）', icon: 'i-carbon-help', color: 'rose' },
   { key: 'star_passport_claim', label: '自动领取千星游记', icon: 'i-carbon-star', color: 'violet' },
   { key: 'star_record_claim', label: '自动领取观星礼录', icon: 'i-carbon-trophy', color: 'amber' },
   { key: 'qixi_bridge_build', label: '七夕自动建鹊桥', icon: 'i-carbon-link', color: 'pink' },
@@ -320,9 +338,9 @@ const activityToggles = [
   { key: 'honghua_love_donate', label: '公益小红花·送爱心值', icon: 'i-carbon-favorite', color: 'rose' },
   // 萌宠成长日记（萌宠日记活动）自动化开关
   { key: 'pet_diary_adopt', label: '萌宠日记·自动领养', icon: 'i-carbon-dog-walker', color: 'emerald' },
-  { key: 'pet_diary_feed', label: '萌宠日记·自动喂养', icon: 'i-carbon-paw-heart', color: 'emerald' },
+  { key: 'pet_diary_feed', label: '萌宠日记·自动喂养', icon: 'i-carbon-dog-walker', color: 'emerald' },
   { key: 'pet_diary_draw', label: '萌宠日记·自动召唤', icon: 'i-carbon-pedestrian', color: 'emerald' },
-  { key: 'pet_diary_seed_claim', label: '萌宠日记·领种子', icon: 'i-carbon-seedling', color: 'emerald' },
+  { key: 'pet_diary_seed_claim', label: '萌宠日记·领种子', icon: 'i-carbon-sprout', color: 'emerald' },
   { key: 'pet_diary_solar_claim', label: '萌宠日记·领节令小礼', icon: 'i-carbon-calendar', color: 'emerald' },
   { key: 'pet_diary_story_claim', label: '萌宠日记·领爪印手记', icon: 'i-carbon-bookmark', color: 'emerald' },
   { key: 'pet_diary_treasure_open', label: '萌宠日记·开启拾物箱', icon: 'i-carbon-box', color: 'emerald' },
@@ -342,6 +360,8 @@ const toggleHiddenBy: Record<string, string> = {
   star_passport_claim: 'journey',
   star_record_claim: 'records',
   solar_terms_claim: 'notes',
+  solar_terms_quiz_notify: 'notes',
+  solar_terms_auto_answer: 'notes',
   honghua_share_claim: 'honghua',
   honghua_tiers_claim: 'honghua',
   honghua_love_donate: 'honghua',
@@ -422,18 +442,17 @@ function categoryEnabledCount(key: string) {
       <p>加载中...</p>
     </div>
 
-    <div v-else-if="!currentAccountId" class="py-8 text-center text-gray-500">
+    <div v-else-if="!currentAccountId" class="ui-empty-state">
       <div class="i-carbon-settings-adjust mx-auto mb-2 text-3xl text-gray-400" />
       <p>请先选择账号</p>
     </div>
 
     <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
       <button
-        v-for="(cat, idx) in categories"
+        v-for="cat in categories"
         :key="cat.key"
         type="button"
-        class="auto-card farm-card group relative flex flex-col gap-5 overflow-hidden rounded-[1.75rem] border border-[#ECE5D6] bg-[#FCFBF6] p-6 text-left shadow-[0_1px_2px_rgba(60,50,30,0.04),0_10px_28px_-14px_rgba(60,50,30,0.18)] transition-[transform,box-shadow] duration-300 hover:-translate-y-1.5 hover:shadow-[0_20px_44px_-16px_rgba(60,50,30,0.30)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#5E8C5A] focus-visible:ring-offset-2 focus-visible:ring-offset-[#FBF7EE] active:scale-[0.975] dark:border-[#32362B] dark:bg-[#1E211A] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35),0_10px_28px_-14px_rgba(0,0,0,0.55)] dark:hover:shadow-[0_20px_44px_-16px_rgba(0,0,0,0.6)] dark:focus-visible:ring-[#84B572] dark:focus-visible:ring-offset-[#14160F]"
-        :style="{ '--delay': (idx * 70) + 'ms' }"
+        class="auto-card farm-card group relative flex flex-col gap-4 overflow-hidden p-5 text-left"
         @click="openCategory(cat.key)"
       >
         <div class="relative flex items-start justify-between gap-3">
@@ -442,7 +461,7 @@ function categoryEnabledCount(key: string) {
           </span>
           <span
             v-if="categoryEnabledCount(cat.key) > 0"
-            class="inline-flex items-center gap-1 rounded-full bg-[#E7F0DF] px-2.5 py-1 text-xs font-semibold text-[#3F6B3C] dark:bg-[#243022] dark:text-[#A7C957]"
+            class="automation-count inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold"
           >
             <span class="i-carbon-checkmark-outline text-sm" />
             {{ categoryEnabledCount(cat.key) }} 项开启
@@ -450,8 +469,8 @@ function categoryEnabledCount(key: string) {
         </div>
 
         <div class="relative">
-          <span class="block text-xl font-bold tracking-tight text-[#2C2A22] dark:text-[#ECE9DE]">{{ cat.label }}</span>
-          <span class="mt-1.5 block text-sm leading-relaxed text-[#8C8472] dark:text-[#9C9A88]">{{ cat.desc }}</span>
+          <span class="block text-xl font-bold tracking-tight text-[var(--theme-text)]">{{ cat.label }}</span>
+          <span class="mt-1.5 block text-sm leading-relaxed text-[var(--muted-text)]">{{ cat.desc }}</span>
         </div>
 
         <!-- 签名元素：种子行（每个开关一颗，开启=发芽变绿） -->
@@ -463,26 +482,26 @@ function categoryEnabledCount(key: string) {
             v-for="tk in categoryToggleList(cat.key)"
             :key="tk"
             class="seed h-2.5 w-2.5 rounded-full transition-all duration-300"
-            :class="isToggleOn(tk)
-              ? 'bg-[#7FB069] shadow-[0_0_0_3px_rgba(127,176,105,0.18)] dark:bg-[#8FBF6B] dark:shadow-[0_0_0_3px_rgba(143,191,107,0.22)]'
-              : 'bg-transparent shadow-[inset_0_0_0_1.5px_#D8D0BF] dark:shadow-[inset_0_0_0_1.5px_#4A4E3E]'"
+            :data-enabled="isToggleOn(tk)"
           />
-          <span class="ml-1 text-xs tabular-nums text-[#8C8472] dark:text-[#9C9A88]">{{ categoryEnabledCount(cat.key) }}/{{ categoryToggleList(cat.key).length }}</span>
+          <span class="ml-1 text-xs tabular-nums text-[var(--muted-text)]">{{ categoryEnabledCount(cat.key) }}/{{ categoryToggleList(cat.key).length }}</span>
         </div>
       </button>
     </div>
 
-    <div class="mt-4 px-1">
+    <div v-if="showSave && currentAccountId" class="mt-4 px-1">
       <BaseButton variant="primary" class="w-full rounded-2xl py-3 text-sm font-semibold shadow-md" :loading="saving" @click="emit('save')">
         {{ saveLabel }}
       </BaseButton>
     </div>
 
+    <!-- Escape the page's motion/card clipping without keeping hidden pages. -->
+    <Teleport to="body">
     <!-- 分类设置弹窗 -->
-    <Transition name="harmony">
-      <div v-if="activeCategory" class="fixed inset-0 z-50 flex items-end justify-center sm:items-center">
+    <Transition :css="false" @enter="overlayMotion.enter" @leave="overlayMotion.leave" @after-leave="finishCategoryExit" @enter-cancelled="overlayMotion.cancelled" @leave-cancelled="overlayMotion.cancelled">
+      <div v-if="activeCategory" class="fixed inset-0 z-50 flex items-end justify-center sm:items-center" :data-leaving="!activeCategory">
         <div class="absolute inset-0 bg-gray-950/45 backdrop-blur-[2px]" @click="closeCategory" />
-        <div class="modal-card relative flex max-h-[88vh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800 sm:rounded-3xl">
+        <div data-overlay-panel class="modal-card relative flex max-h-[88vh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800 sm:rounded-3xl">
           <div class="flex items-center justify-between border-b border-gray-100 px-6 py-5 dark:border-gray-700">
             <div class="flex items-center gap-3">
               <span class="h-10 w-10 inline-grid place-items-center rounded-full" :class="[activeCat?.iconBg || '', activeCat?.iconText || '']">
@@ -493,15 +512,15 @@ function categoryEnabledCount(key: string) {
             <button class="h-8 w-8 inline-grid shrink-0 place-items-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200" type="button" aria-label="关闭" @click="closeCategory"><span class="i-carbon-close text-xl" /></button>
           </div>
 
-          <div class="flex-1 space-y-3 overflow-auto px-6 py-5">
-            <template v-if="activeCategory === 'core'">
+          <fieldset class="flex-1 space-y-3 overflow-auto px-6 py-5 border-0 m-0" :disabled="saving || !activeCategory">
+            <template v-if="displayedCategory === 'core'">
               <SettingToggle v-for="t in coreToggles" :key="t.key" :model-value="(settings.automation as any)[t.key]" :label="t.label" :icon="t.icon" :color="t.color" @update:model-value="(v: boolean) => (settings.automation as any)[t.key] = v" />
               <SettingToggle :model-value="settings.automation.friend" label="自动好友互动" :img="friendIcon" color="indigo" @update:model-value="settings.automation.friend = $event" />
             </template>
 
-            <template v-else-if="activeCategory === 'activity'">
+            <template v-else-if="displayedCategory === 'activity'">
               <div v-if="!visibleActivityToggles.length && isActivityHidden('qingmei')" class="rounded-2xl border border-dashed border-gray-300 px-4 py-8 text-center dark:border-gray-600">
-                <i class="i-carbon-calendar-heat mb-2 inline-block text-2xl text-gray-400" />
+                <i class="i-carbon-calendar mb-2 inline-block text-2xl text-gray-400" />
                 <p class="text-sm font-medium text-gray-600 dark:text-gray-300">
                   当前无在期活动的自动化开关
                 </p>
@@ -548,7 +567,7 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
 
-            <template v-else-if="activeCategory === 'friend'">
+            <template v-else-if="displayedCategory === 'friend'">
               <SettingToggle v-for="t in friendToggles" :key="t.key" :model-value="(settings.automation as any)[t.key]" :label="t.label" :img="friendIcon" color="indigo" @update:model-value="(v: boolean) => (settings.automation as any)[t.key] = v" />
               <div v-if="settings.automation.friend_steal" class="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-3 dark:border-emerald-900 dark:bg-emerald-900/20">
                 <div class="mb-2 flex items-center justify-between gap-2">
@@ -588,7 +607,7 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
 
-            <template v-else-if="activeCategory === 'fertilizer'">
+            <template v-else-if="displayedCategory === 'fertilizer'">
               <SettingToggle v-model="settings.automation.fertilizer_buy_organic" label="自动购买有机化肥" icon="i-carbon-leaf" color="green" />
               <SettingToggle v-model="settings.automation.fertilizer_buy_normal" label="自动购买无机化肥" icon="i-carbon-chemistry" color="cyan" />
               <div v-if="settings.automation.fertilizer_buy_organic || settings.automation.fertilizer_buy_normal" class="space-y-3 rounded-2xl border border-green-200 bg-green-50/60 p-3 dark:border-green-900 dark:bg-green-900/20">
@@ -642,7 +661,7 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
 
-            <template v-else-if="activeCategory === 'mystery'">
+            <template v-else-if="displayedCategory === 'mystery'">
               <SettingToggle v-model="settings.automation.mystery_shop_auto_buy" label="自动购买商品" icon="i-carbon-store" color="amber" />
               <SettingToggle v-model="settings.automation.mystery_shop_push" label="上新推送" icon="i-carbon-notification" color="rose" />
               <div class="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50/60 p-3 dark:border-amber-900 dark:bg-amber-900/20">
@@ -652,7 +671,7 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
 
-            <template v-else-if="activeCategory === 'pet'">
+            <template v-else-if="displayedCategory === 'pet'">
               <SettingToggle v-model="settings.automation.pet_food_auto_feed" label="自动购买并喂食狗粮" icon="i-carbon-dog-walker" color="orange" />
               <div v-if="settings.automation.pet_food_auto_feed" class="space-y-3 rounded-2xl border border-orange-200 bg-orange-50/60 p-3 dark:border-orange-900 dark:bg-orange-900/20">
                 <div class="text-sm font-medium text-orange-700 dark:text-orange-400">补粮策略</div>
@@ -666,7 +685,7 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
 
-            <template v-else-if="activeCategory === 'monitor'">
+            <template v-else-if="displayedCategory === 'monitor'">
               <SettingToggle v-model="settings.automation.daily_report_push" label="每日收益日报" icon="i-carbon-notification" color="teal" />
               <div v-if="settings.automation.daily_report_push" class="flex items-center gap-2 rounded-2xl border border-gray-100 bg-white px-4 py-3 dark:border-gray-700 dark:bg-gray-800">
                 <label class="text-sm text-gray-600 dark:text-gray-300">推送时间</label>
@@ -698,7 +717,7 @@ function categoryEnabledCount(key: string) {
                 </div>
               </div>
             </template>
-          </div>
+          </fieldset>
 
           <div class="flex justify-end border-t border-gray-100 bg-gray-50/70 px-6 py-4 dark:border-gray-700 dark:bg-gray-900/20">
             <BaseButton class="min-w-24" size="sm" @click="closeCategory">完成</BaseButton>
@@ -708,9 +727,9 @@ function categoryEnabledCount(key: string) {
     </Transition>
 
     <!-- 香囊优先赠送好友选择弹窗 -->
-    <Transition name="fade">
+    <Transition :css="false" @enter="overlayMotion.enter" @leave="overlayMotion.leave" @enter-cancelled="overlayMotion.cancelled" @leave-cancelled="overlayMotion.cancelled">
       <div v-if="qixiPickerVisible" class="fixed inset-0 z-[60] grid place-items-center bg-gray-950/45 p-4 backdrop-blur-[2px]" @click.self="qixiPickerVisible = false">
-        <div class="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
+        <div data-overlay-panel class="modal-card flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
           <div class="flex items-center justify-between border-b border-gray-100 px-6 py-5 dark:border-gray-700">
             <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">选择香囊优先赠送好友</h3>
             <button class="h-8 w-8 inline-grid shrink-0 place-items-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200" type="button" aria-label="关闭" @click="qixiPickerVisible = false"><span class="i-carbon-close text-xl" /></button>
@@ -736,9 +755,9 @@ function categoryEnabledCount(key: string) {
     </Transition>
 
     <!-- 仅捣乱指定好友选择弹窗 -->
-    <Transition name="fade">
+    <Transition :css="false" @enter="overlayMotion.enter" @leave="overlayMotion.leave" @enter-cancelled="overlayMotion.cancelled" @leave-cancelled="overlayMotion.cancelled">
       <div v-if="badPickerVisible" class="fixed inset-0 z-[60] grid place-items-center bg-gray-950/45 p-4 backdrop-blur-[2px]" @click.self="badPickerVisible = false">
-        <div class="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
+        <div data-overlay-panel class="modal-card flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
           <div class="flex items-center justify-between border-b border-gray-100 px-6 py-5 dark:border-gray-700">
             <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">选择仅捣乱好友</h3>
             <button class="h-8 w-8 inline-grid shrink-0 place-items-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200" type="button" aria-label="关闭" @click="badPickerVisible = false"><span class="i-carbon-close text-xl" /></button>
@@ -761,8 +780,10 @@ function categoryEnabledCount(key: string) {
           </div>
         </div>
       </div>
+    </Transition>
+    <Transition :css="false" @enter="overlayMotion.enter" @leave="overlayMotion.leave" @enter-cancelled="overlayMotion.cancelled" @leave-cancelled="overlayMotion.cancelled">
       <div v-if="stealPickerVisible" class="fixed inset-0 z-[60] grid place-items-center bg-gray-950/45 p-4 backdrop-blur-[2px]" @click.self="stealPickerVisible = false">
-        <div class="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
+        <div data-overlay-panel class="modal-card flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800">
           <div class="flex items-center justify-between border-b border-gray-100 px-6 py-5 dark:border-gray-700">
             <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">选择仅偷取好友</h3>
             <button class="h-8 w-8 inline-grid shrink-0 place-items-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200" type="button" aria-label="关闭" @click="stealPickerVisible = false"><span class="i-carbon-close text-xl" /></button>
@@ -786,27 +807,33 @@ function categoryEnabledCount(key: string) {
         </div>
       </div>
     </Transition>
+    </Teleport>
   </div>
 </template>
 
 <style scoped>
-.farm-card {
-  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-}
+.farm-card { border: 1px solid var(--surface-border); border-radius: var(--radius-card); background: var(--surface-1); color: var(--theme-text); box-shadow: var(--surface-shadow-soft); }
+.auto-card { transition: border-color 160ms ease; }
+.auto-card:hover { border-color: var(--surface-border-strong); }
+.auto-card:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 3px; }
+.automation-count { background: color-mix(in srgb, var(--theme-primary) 10%, var(--surface-1)); color: var(--theme-text); }
+
 /* 图标：泥块底色 + 鼠尾草绿，hover 时轻微放大旋转（发芽感） */
 .plot-icon {
-  color: #5E8C5A;
-  background: #F0ECDD;
+  color: var(--theme-primary);
+  background: color-mix(in srgb, var(--theme-primary) 10%, var(--surface-1));
   transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1), color 0.3s, background 0.3s;
 }
 :global(.dark) .plot-icon {
-  color: #84B572;
-  background: #2A2E22;
+  color: var(--theme-primary);
+  background: color-mix(in srgb, var(--theme-primary) 10%, var(--surface-1));
 }
 .farm-card:hover .plot-icon {
-  transform: scale(1.08) rotate(-4deg);
+  transform: scale(1.025);
 }
 /* 种子：开启点 hover 微微上浮放大 */
+.seed { background: transparent; box-shadow: inset 0 0 0 1.5px var(--surface-border-strong); }
+.seed[data-enabled='true'] { background: var(--theme-primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--theme-primary) 14%, transparent); }
 .seed {
   transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.3s, background 0.3s;
 }
@@ -816,9 +843,7 @@ function categoryEnabledCount(key: string) {
 
 /* 分类大卡片入场缩放动画：错峰淡入 + 由小放大 */
 .auto-card {
-  animation: cardIn 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
-  animation-delay: var(--delay, 0ms);
-  will-change: transform, opacity;
+  animation: none;
 }
 @keyframes cardIn {
   from {
@@ -831,41 +856,22 @@ function categoryEnabledCount(key: string) {
   }
 }
 
-.harmony-enter-active,
-.harmony-leave-active {
-  transition: opacity 0.25s ease;
-}
-.harmony-enter-active .modal-card,
-.harmony-leave-active .modal-card {
-  transition: transform 0.34s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.25s ease;
-}
-.harmony-enter-from,
-.harmony-leave-to {
-  opacity: 0;
-}
-.harmony-enter-from .modal-card,
-.harmony-leave-to .modal-card {
-  transform: scale(0.94);
-  opacity: 0;
-}
-.harmony-enter-to .modal-card,
-.harmony-leave-from .modal-card {
-  transform: scale(1);
-  opacity: 1;
-}
+/* Entry/exit uses the shared presentation-only overlay controller. */
 
 /* 弹窗顶部鼠尾草色条 */
 .modal-card::before {
   content: "";
   display: block;
   height: 4px;
-  background: linear-gradient(90deg, #5E8C5A, #7FB069);
+  background: var(--theme-gradient);
 }
 :global(.dark) .modal-card::before {
-  background: linear-gradient(90deg, #84B572, #A7C957);
+  background: var(--theme-gradient);
 }
 .modal-card {
-  border-radius: 1.25rem;
+  border-radius: var(--radius-panel);
+  background: var(--surface-1);
+  color: var(--theme-text);
   overflow: hidden;
 }
 

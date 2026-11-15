@@ -160,11 +160,21 @@ function decodeIllustratedReplyRaw(rawBody) {
  * @param {boolean} refresh - 是否强制刷新
  * @param {number} illustratedType - 图鉴类型，默认 1
  */
-async function getIllustratedListV2(refresh = false, illustratedType = 1) {
+/**
+ * 拉取图鉴列表（V2 协议）。
+ *
+ * ⚠️ 2026-11-02 修正：本地 proto 的请求字段是错的（`bool refresh=1` / `int32 illustrated_type=2`），
+ * 而官方定义是 `int32 rarity=1` / `int32 type=2`。字段号错位会让服务端收到非法
+ * rarity（true→1 侥幸不报错，但 illustrated_type 写到 rarity 上）→ 服务端不响应 → 前端超时。
+ *
+ * @param {number} rarity - 稀有度筛选，0 = 全部
+ * @param {number} illustratedType - 图鉴类型：1=作物 2=变异
+ */
+async function getIllustratedListV2(rarity = 0, illustratedType = 1) {
   const request = types.GetIllustratedListV2Request.encode(
     types.GetIllustratedListV2Request.create({
-      refresh: !!refresh,
-      illustrated_type: Number(illustratedType) || 1,
+      rarity: Number(rarity) || 0,
+      type: Number(illustratedType) || 1,
     })
   ).finish();
 
@@ -180,23 +190,25 @@ async function getIllustratedListV2(refresh = false, illustratedType = 1) {
       replyBodyType: typeof body,
     });
 
-    // 尝试用 proto 解码
+    // 用 proto 解码（官方字段：list / total_progress / current_level / ...）
     let decoded;
     try {
       decoded = types.GetIllustratedListV2Reply.decode(body);
-      logger.info('图鉴解码成功', { itemsCount: decoded.items ? decoded.items.length : 0 });
+      const list = decoded.list || [];
+      logger.info('图鉴解码成功', { itemsCount: list.length });
     } catch (err) {
       logger.error('图鉴解码失败', { error: err.message });
-      decoded = { items: [] };
+      decoded = { list: [] };
     }
 
     // 原始解析作为回退和辅助
     const raw = decodeIllustratedReplyRaw(body);
     logger.info('图鉴原始数据解析', { rawItemCount: raw.rawItemCount, normalizedCount: raw.normalizedItems.length });
 
-    // 优先使用 proto 解码的结果
-    if (decoded.items && decoded.items.length > 0) {
-      return { ...decoded, __raw: raw };
+    // 优先使用 proto 解码的结果（官方字段名是 list）
+    const list = decoded.list || decoded.items || [];
+    if (list.length > 0) {
+      return { ...decoded, items: list, __raw: raw };
     }
 
     // 回退：用原始解析构建 items

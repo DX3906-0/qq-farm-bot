@@ -1,0 +1,670 @@
+{
+  "kind": "official-cocos-avatar-assets",
+  "localOnly": true,
+  "importedAt": "2026-11-11T07:39:46.811305+00:00",
+  "manifest": {
+    "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/config.9fc68.json",
+    "sha256": "9e9acde94091ebf1c44421c90ff7b342da187120fd2026edb8244ccf42e5b8ef",
+    "bundle": "extraRes"
+  },
+  "unresolvedPrototypeItemIds": [
+    2101,
+    2102,
+    2103
+  ],
+  "items": {
+    "2130": {
+      "itemId": 2130,
+      "frameId": 301,
+      "frameType": 1,
+      "name": "萌宠柯基头像框",
+      "resource": "gui/texture/v2/img_keji_head_bg/spriteFrame",
+      "url": "/game-config/deco_icons/img_keji_head_bg.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "84d45dfc06873f22173dfb3d1a242a3ceab04006b8a4041f0fd00888309b9dec",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-atlas-extraction",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+        "guid": "1a9b74cbe",
+        "nativeHash": "00f19",
+        "sourceTexture": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
+        },
+        "sourcePack": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
+        },
+        "rect": {
+          "x": 704,
+          "y": 271,
+          "width": 108,
+          "height": 115
+        },
+        "rotated": true,
+        "originalSize": {
+          "width": 128,
+          "height": 128
+        },
+        "offset": {
+          "x": -2,
+          "y": 2.5
+        },
+        "resampling": "none",
+        "restoredTransparentMargins": true
+      }
+    },
+    "2131": {
+      "itemId": 2131,
+      "frameId": 203,
+      "frameType": 1,
+      "name": "春耕纪头像框",
+      "resource": "gui/texture/v2/img_qing_head_bg/spriteFrame",
+      "url": "/game-config/deco_icons/img_qing_head_bg.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "ba87709c4c72370a73a47cc9f5b54b180bcaa50093bb099b10ad5eaebe475132",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-atlas-extraction",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+        "guid": "1a9b74cbe",
+        "nativeHash": "00f19",
+        "sourceTexture": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
+        },
+        "sourcePack": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
+        },
+        "rect": {
+          "x": 106,
+          "y": 473,
+          "width": 102,
+          "height": 103
+        },
+        "rotated": true,
+        "originalSize": {
+          "width": 128,
+          "height": 128
+        },
+        "offset": {
+          "x": 0,
+          "y": 0.5
+        },
+        "resampling": "none",
+        "restoredTransparentMargins": true
+      }
+    },
+    "2140": {
+      "itemId": 2140,
+      "frameId": 311,
+      "frameType": 1,
+      "name": "同气连枝头像框",
+      "resource": "gui/texture/v2/img_roco_skill_head_bg/spriteFrame",
+      "url": "/game-config/deco_icons/img_roco_skill_head_bg.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "eb21cd088d008b0c18f4a1387282a2b93e41f3d87296dcdbe808a7e0d98d82da",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-atlas-extraction",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+        "guid": "1a9b74cbe",
+        "nativeHash": "00f19",
+        "sourceTexture": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
+        },
+        "sourcePack": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
+        },
+        "rect": {
+          "x": 268,
+          "y": 245,
+          "width": 112,
+          "height": 108
+        },
+        "rotated": false,
+        "originalSize": {
+          "width": 128,
+          "height": 128
+        },
+        "offset": {
+          "x": 1,
+          "y": -1
+        },
+        "resampling": "none",
+        "restoredTransparentMargins": true
+      }
+    },
+    "2141": {
+      "itemId": 2141,
+      "frameId": 312,
+      "frameType": 1,
+      "name": "护主犬头像框",
+      "resource": "gui/texture/v2/img_roco_head_bg/spriteFrame",
+      "url": "/game-config/deco_icons/img_roco_head_bg.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "769ef1984841b2f70d5bc278370a2169ab7d3224b67de388599d9f5ceec7c298",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-atlas-extraction",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+        "guid": "1a9b74cbe",
+        "nativeHash": "00f19",
+        "sourceTexture": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
+        },
+        "sourcePack": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
+        },
+        "rect": {
+          "x": 386,
+          "y": 229,
+          "width": 119,
+          "height": 120
+        },
+        "rotated": true,
+        "originalSize": {
+          "width": 128,
+          "height": 128
+        },
+        "offset": {
+          "x": 2.5,
+          "y": 2
+        },
+        "resampling": "none",
+        "restoredTransparentMargins": true
+      }
+    },
+    "2150": {
+      "itemId": 2150,
+      "frameId": 501,
+      "frameType": 1,
+      "name": "哈哈南瓜头像框",
+      "resource": "gui/texture/v2/img_nangua_head_bg/spriteFrame",
+      "url": "/game-config/deco_icons/img_nangua_head_bg.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "a3adb206187de68fbf68b2b1251ef453aae415b16002ae08869c244f7edde69a",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-atlas-extraction",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+        "guid": "1a9b74cbe",
+        "nativeHash": "00f19",
+        "sourceTexture": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
+        },
+        "sourcePack": {
+          "kind": "official-local-cache",
+          "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
+        },
+        "rect": {
+          "x": 253,
+          "y": 359,
+          "width": 109,
+          "height": 108
+        },
+        "rotated": false,
+        "originalSize": {
+          "width": 128,
+          "height": 128
+        },
+        "offset": {
+          "x": -4.5,
+          "y": -3
+        },
+        "resampling": "none",
+        "restoredTransparentMargins": true
+      }
+    },
+    "2151": {
+      "itemId": 2151,
+      "frameId": 2151,
+      "frameType": 1,
+      "name": "枕水听荷头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_saiji_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_saiji_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "3ffd4dbd82337d4a3da6592ae10ecd6dfb36d9343be650492c978e2225a808a8",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/b1/b18bd5f5-6e8f-4793-95e3-735b71ef43e2.fe646.png",
+        "sha256": "3ffd4dbd82337d4a3da6592ae10ecd6dfb36d9343be650492c978e2225a808a8",
+        "guid": "b18bd5f5-6e8f-4793-95e3-735b71ef43e2",
+        "nativeHash": "fe646",
+        "bytesUnchanged": true
+      }
+    },
+    "2152": {
+      "itemId": 2152,
+      "frameId": 2152,
+      "frameType": 1,
+      "name": "绿荫闲庭头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_saiji_2/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_saiji_2.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "72f9112890e2190dea8be9f3ff6ec05fe2ea3070a0515e08c52d0de9d42bb17e",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-cdn",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/4f/4f27b8e9-f294-4d0b-88f7-9b1d9a87657f.f0cb9.png",
+        "sha256": "72f9112890e2190dea8be9f3ff6ec05fe2ea3070a0515e08c52d0de9d42bb17e",
+        "guid": "4f27b8e9-f294-4d0b-88f7-9b1d9a87657f",
+        "nativeHash": "f0cb9",
+        "bytesUnchanged": true
+      }
+    },
+    "2153": {
+      "itemId": 2153,
+      "frameId": 2153,
+      "frameType": 1,
+      "name": "甜粽子头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_duanwu_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_duanwu_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "34b4b406100d0cc08195e01e29fe2a161206aed351f47764097e6c65cfbbf5e5",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/82/820e117c-6eda-42b6-a8a7-9b9da3bca020.538c4.png",
+        "sha256": "34b4b406100d0cc08195e01e29fe2a161206aed351f47764097e6c65cfbbf5e5",
+        "guid": "820e117c-6eda-42b6-a8a7-9b9da3bca020",
+        "nativeHash": "538c4",
+        "bytesUnchanged": true
+      }
+    },
+    "2154": {
+      "itemId": 2154,
+      "frameId": 2154,
+      "frameType": 1,
+      "name": "咸粽子头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_duanwu_2/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_duanwu_2.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "654ecbc2002e219bf5ce6e3b0adf99a9eee5d4345e6f92b2e038a4075c233cb3",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/84/8454f9ac-415f-442f-a022-9458e8efaae5.c7286.png",
+        "sha256": "654ecbc2002e219bf5ce6e3b0adf99a9eee5d4345e6f92b2e038a4075c233cb3",
+        "guid": "8454f9ac-415f-442f-a022-9458e8efaae5",
+        "nativeHash": "c7286",
+        "bytesUnchanged": true
+      }
+    },
+    "2155": {
+      "itemId": 2155,
+      "frameId": 2155,
+      "frameType": 1,
+      "name": "足球狂欢头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_worldCup_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_worldCup_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "9fadadcc066d9905a77ecf1fd522c801aa1518750231581287103ac3b8b1d51b",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/15/1506a19a-d4bd-4b7b-94c5-5ec63b2ce2f6.2feca.png",
+        "sha256": "9fadadcc066d9905a77ecf1fd522c801aa1518750231581287103ac3b8b1d51b",
+        "guid": "1506a19a-d4bd-4b7b-94c5-5ec63b2ce2f6",
+        "nativeHash": "2feca",
+        "bytesUnchanged": true
+      }
+    },
+    "2156": {
+      "itemId": 2156,
+      "frameId": 2156,
+      "frameType": 1,
+      "name": "萤火星房头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_S2_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_S2_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "a9efe5270c57a42c9ab1132a31c82c6d34eb9b20d0b134fb62f8ac103e6cd544",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/bf/bf170e2e-166b-4049-ab85-bea3f4ffc134.22847.png",
+        "sha256": "a9efe5270c57a42c9ab1132a31c82c6d34eb9b20d0b134fb62f8ac103e6cd544",
+        "guid": "bf170e2e-166b-4049-ab85-bea3f4ffc134",
+        "nativeHash": "22847",
+        "bytesUnchanged": true
+      }
+    },
+    "2157": {
+      "itemId": 2157,
+      "frameId": 2157,
+      "frameType": 1,
+      "name": "月光营地头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_S2_2/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_S2_2.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "d961a9a6d65337b696386e96093e9b95594d16ccd9f51200ee25b6c6683c888a",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/67/67c0168f-8dd8-4a25-9fc6-806494afaa67.2c432.png",
+        "sha256": "d961a9a6d65337b696386e96093e9b95594d16ccd9f51200ee25b6c6683c888a",
+        "guid": "67c0168f-8dd8-4a25-9fc6-806494afaa67",
+        "nativeHash": "2c432",
+        "bytesUnchanged": true
+      }
+    },
+    "2158": {
+      "itemId": 2158,
+      "frameId": 2158,
+      "frameType": 1,
+      "name": "小红花做好事头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_redFlower/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_redFlower.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "847f033c240602382f2e2c7cede602391fd8b129e8ba208a28b3f2190bbe792f",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/78/78cdf94b-caf2-4bb2-aca9-d7fa42446810.3d294.png",
+        "sha256": "847f033c240602382f2e2c7cede602391fd8b129e8ba208a28b3f2190bbe792f",
+        "guid": "78cdf94b-caf2-4bb2-aca9-d7fa42446810",
+        "nativeHash": "3d294",
+        "bytesUnchanged": true
+      }
+    },
+    "2159": {
+      "itemId": 2159,
+      "frameId": 2159,
+      "frameType": 1,
+      "name": "雨落成诗头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_weatherBottle/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_weatherBottle.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "2f2731ad3b41cccce7125cfae93d6b879f25a0ef9993a74290d17b4c0a24d661",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/08/081fc717-e366-4e6a-a219-46bf06631d18.38557.png",
+        "sha256": "2f2731ad3b41cccce7125cfae93d6b879f25a0ef9993a74290d17b4c0a24d661",
+        "guid": "081fc717-e366-4e6a-a219-46bf06631d18",
+        "nativeHash": "38557",
+        "bytesUnchanged": true
+      }
+    },
+    "2161": {
+      "itemId": 2161,
+      "frameId": 2161,
+      "frameType": 1,
+      "name": "比熊乐园头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_S3_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_S3_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "84f5cae33c4b2ebe203e467190064b723a19c8ec4b30c64cf3974529fb5e2eab",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/ad/ad69ed82-d42b-4ba7-83dc-5c33d0de66b0.5d302.png",
+        "sha256": "84f5cae33c4b2ebe203e467190064b723a19c8ec4b30c64cf3974529fb5e2eab",
+        "guid": "ad69ed82-d42b-4ba7-83dc-5c33d0de66b0",
+        "nativeHash": "5d302",
+        "bytesUnchanged": true
+      }
+    },
+    "2162": {
+      "itemId": 2162,
+      "frameId": 2162,
+      "frameType": 1,
+      "name": "恐龙宝宝头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_bichon/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_bichon.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "9de5a6b0d6837188de87fb2b2874f5bb9c59889c4e70a700e9c5f2141f15176a",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/84/84a57d35-3f05-45af-8e53-accf0ecbd97d.e15d9.png",
+        "sha256": "9de5a6b0d6837188de87fb2b2874f5bb9c59889c4e70a700e9c5f2141f15176a",
+        "guid": "84a57d35-3f05-45af-8e53-accf0ecbd97d",
+        "nativeHash": "e15d9",
+        "bytesUnchanged": true
+      }
+    },
+    "2163": {
+      "itemId": 2163,
+      "frameId": 2163,
+      "frameType": 1,
+      "name": "缤纷奶茶头像框",
+      "resource": "gui/texture/avatarDetail/img_avatar_S4_1/spriteFrame",
+      "url": "/game-config/deco_icons/img_avatar_S4_1.png",
+      "size": [
+        128,
+        128
+      ],
+      "sha256": "e6b800579a06e9ff1431afa7e2a6a8aa1ef0a9ecb747e4adfd9408dfb4db22b6",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/03/0396de0e-605d-42ee-9a97-fa1ae70fa1fb.dccef.png",
+        "sha256": "e6b800579a06e9ff1431afa7e2a6a8aa1ef0a9ecb747e4adfd9408dfb4db22b6",
+        "guid": "0396de0e-605d-42ee-9a97-fa1ae70fa1fb",
+        "nativeHash": "dccef",
+        "bytesUnchanged": true
+      }
+    },
+    "401001": {
+      "itemId": 401001,
+      "frameId": 401001,
+      "frameType": 2,
+      "name": "枕水听荷铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_saiji_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_saiji_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "7bf386263aa2f2435788bee48a5ebde932abdead11f74675a16e546ec3120ade",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/c4/c48738ce-559e-4a54-a599-5f363b822b6c.384f0.png",
+        "sha256": "7bf386263aa2f2435788bee48a5ebde932abdead11f74675a16e546ec3120ade",
+        "guid": "c48738ce-559e-4a54-a599-5f363b822b6c",
+        "nativeHash": "384f0",
+        "bytesUnchanged": true
+      }
+    },
+    "401002": {
+      "itemId": 401002,
+      "frameId": 401002,
+      "frameType": 2,
+      "name": "端午粽香铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_saiji_2/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_saiji_2.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "2652e1b826600d0bf22d09dc427231c98da991ff5ceeadcd513d43091218c66b",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/6e/6e224619-7ade-4ce8-ace3-3511af8f82f0.dcb54.png",
+        "sha256": "2652e1b826600d0bf22d09dc427231c98da991ff5ceeadcd513d43091218c66b",
+        "guid": "6e224619-7ade-4ce8-ace3-3511af8f82f0",
+        "nativeHash": "dcb54",
+        "bytesUnchanged": true
+      }
+    },
+    "401003": {
+      "itemId": 401003,
+      "frameId": 401003,
+      "frameType": 2,
+      "name": "星月铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_S2_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_S2_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "ac03749d7eee01949273e86a68d560da79dda5731c0b01ae40d3fe1a1bc70443",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/fc/fcb96ba1-1344-467c-ab8f-fb68e96418e1.c0685.png",
+        "sha256": "ac03749d7eee01949273e86a68d560da79dda5731c0b01ae40d3fe1a1bc70443",
+        "guid": "fcb96ba1-1344-467c-ab8f-fb68e96418e1",
+        "nativeHash": "c0685",
+        "bytesUnchanged": true
+      }
+    },
+    "401004": {
+      "itemId": 401004,
+      "frameId": 401004,
+      "frameType": 2,
+      "name": "鹊桥寄情铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_qixi_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_qixi_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "c309de3d96393e38added2210929b25c71e37846aab5eeb539dfc88fd90ae81a",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/bf/bf878342-abc3-4c78-868e-f2a2fabed6a9.1186c.png",
+        "sha256": "c309de3d96393e38added2210929b25c71e37846aab5eeb539dfc88fd90ae81a",
+        "guid": "bf878342-abc3-4c78-868e-f2a2fabed6a9",
+        "nativeHash": "1186c",
+        "bytesUnchanged": true
+      }
+    },
+    "401005": {
+      "itemId": 401005,
+      "frameId": 401005,
+      "frameType": 2,
+      "name": "比熊乐园铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_bichon_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_bichon_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "9e36a28a4f3d9589f0727f104f6394e201fbab6a502ebaf9185a5c0d69e754b1",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/3b/3b1d8ad5-d0b7-4f5e-9c9f-89e33c06d248.4124a.png",
+        "sha256": "9e36a28a4f3d9589f0727f104f6394e201fbab6a502ebaf9185a5c0d69e754b1",
+        "guid": "3b1d8ad5-d0b7-4f5e-9c9f-89e33c06d248",
+        "nativeHash": "4124a",
+        "bytesUnchanged": true
+      }
+    },
+    "401006": {
+      "itemId": 401006,
+      "frameId": 401006,
+      "frameType": 2,
+      "name": "幻彩流焰SVIP铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_svip_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_svip_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "abb383ffa0f09517e0d80a80a0f6d6690cf11636c364a0ca9184aff70cb14a1d",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/4a/4a551a86-9210-4a2c-8c60-b2f3f5a94d8c.017f8.png",
+        "sha256": "abb383ffa0f09517e0d80a80a0f6d6690cf11636c364a0ca9184aff70cb14a1d",
+        "guid": "4a551a86-9210-4a2c-8c60-b2f3f5a94d8c",
+        "nativeHash": "017f8",
+        "bytesUnchanged": true
+      }
+    },
+    "401007": {
+      "itemId": 401007,
+      "frameId": 401007,
+      "frameType": 2,
+      "name": "缤纷奶茶铭牌",
+      "resource": "gui/texture/nameplate/icon/icon_nameplate_S4_1/spriteFrame",
+      "url": "/game-config/deco_icons/icon_nameplate_S4_1.png",
+      "size": [
+        100,
+        100
+      ],
+      "sha256": "931dd30591f63fab703c5ade9e9ae33e61c3eef8d48c48ec5941a9bbc6874e2e",
+      "officialOriginVerified": true,
+      "source": {
+        "kind": "official-local-cache",
+        "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/08/0832f221-3604-4a70-bcf4-761ba83e0b6b.6a955.png",
+        "sha256": "931dd30591f63fab703c5ade9e9ae33e61c3eef8d48c48ec5941a9bbc6874e2e",
+        "guid": "0832f221-3604-4a70-bcf4-761ba83e0b6b",
+        "nativeHash": "6a955",
+        "bytesUnchanged": true
+      }
+    }
+  }
+}

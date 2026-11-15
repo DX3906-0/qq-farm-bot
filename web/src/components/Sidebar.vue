@@ -7,13 +7,16 @@ import { useRoute, useRouter } from 'vue-router'
 import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 
-import { menuRoutes } from '@/router/menu'
+import { createNavigationIndicatorMotion, createNavigationSelection } from '@/composables/useContentMotion'
+import { menuRoutes, warmMenuCode } from '@/router/menu'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { useShopStore } from '@/stores/shop'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
 import { formatTimeDuration, getCardQuotaValue, useUserStore } from '@/stores/user'
+import { deriveAccountPresentation } from '@/utils/operation-result'
 
 const accountStore = useAccountStore()
 const statusStore = useStatusStore()
@@ -34,7 +37,7 @@ const unadaptedActivityIds = ref<number[]>([])
 const notifiedActivitySignature = ref('')
 const brandLogoFailed = ref(false)
 
-const systemConnected = ref(true)
+const systemConnected = ref<boolean | null>(null)
 const serverUptimeBase = ref(0)
 const serverVersion = ref('')
 const lastPingTime = ref(Date.now())
@@ -42,9 +45,13 @@ const now = useNow()
 const formattedTime = useDateFormat(now, 'YYYY-MM-DD HH:mm:ss')
 
 async function checkConnection() {
+  if (LOCAL_UI_READONLY) {
+    systemConnected.value = false
+    return
+  }
   try {
     const res = await api.get('/api/ping')
-    systemConnected.value = true
+    systemConnected.value = res.data?.ok === true ? true : res.data?.ok === false ? false : null
     if (res.data.ok && res.data.data) {
       if (res.data.data.uptime) {
         serverUptimeBase.value = res.data.data.uptime
@@ -100,6 +107,8 @@ async function refreshActivityUpdateReminder() {
 }
 
 onMounted(() => {
+  if (LOCAL_UI_READONLY)
+    return
   appStore.fetchLoginPageConfig()
   accountStore.fetchAccounts()
   checkConnection()
@@ -154,36 +163,22 @@ const uptime = computed(() => {
 })
 
 const connectionStatus = computed(() => {
-  if (!systemConnected.value) {
-    return {
-      text: '系统离线',
-      color: 'bg-red-500',
-      pulse: false,
-    }
+  const presentation = deriveAccountPresentation({
+    accountId: currentAccountId.value,
+    account: currentAccount.value,
+    running: currentAccount.value?.running,
+    snapshot: status.value ? { ...status.value, accountId: statusStore.statusAccountId, metadata: statusStore.currentStatusMetadata } : null,
+    snapshotReady: statusStore.currentStatusReady,
+    loading: statusStore.loading,
+    error: statusStore.error,
+    readonly: LOCAL_UI_READONLY,
+    stale: statusStore.currentStatusStale,
+  })
+  if (presentation.kind !== 'readonly' && systemConnected.value === false) {
+    return { text: '系统离线', detail: '系统连接检查失败，不能确认当前账号实时状态。', color: 'bg-red-500', pulse: false }
   }
-
-  if (!currentAccount.value?.id) {
-    return {
-      text: '请添加账号',
-      color: 'bg-gray-400',
-      pulse: false,
-    }
-  }
-
-  const isConnected = status.value?.connection?.connected
-  if (isConnected) {
-    return {
-      text: '运行中',
-      color: 'bg-green-500',
-      pulse: true,
-    }
-  }
-
-  return {
-    text: '未连接',
-    color: 'bg-gray-400', // Or red? Old version uses gray/offline class which is gray usually
-    pulse: false,
-  }
+  const colors = { neutral: 'bg-gray-400', info: 'bg-blue-500', success: 'bg-green-500', warning: 'bg-amber-500', error: 'bg-red-500' }
+  return { ...presentation, text: presentation.label, color: colors[presentation.tone] }
 })
 
 // 根据用户角色过滤导航菜单
@@ -196,6 +191,58 @@ const navItems = computed(() => {
       label: item.label,
       icon: item.icon,
     }))
+})
+
+const navigationList = ref<HTMLElement | null>(null)
+const navigationIndicator = ref<HTMLElement | null>(null)
+const indicatorReady = ref(false)
+const indicatorMotion = createNavigationIndicatorMotion(() => navigationIndicator.value)
+const navigationSelection = createNavigationSelection(() => route.path, path => router.push(path), () => placeNavigationIndicator())
+const selectedNavPath = navigationSelection.selected
+let indicatorFrame = 0
+let navigationObserver: ResizeObserver | null = null
+
+function placeNavigationIndicator(immediate = false) {
+  const list = navigationList.value
+  const link = list && [...list.querySelectorAll<HTMLElement>('[data-nav-path]')]
+    .find(element => element.dataset.navPath === selectedNavPath.value)
+  if (!link || !link.offsetHeight) { indicatorReady.value = false; return }
+  indicatorReady.value = indicatorMotion.move(link.offsetTop, link.offsetHeight, immediate)
+}
+function queueNavigationIndicator() {
+  if (indicatorFrame) return
+  indicatorFrame = window.requestAnimationFrame(() => {
+    indicatorFrame = 0
+    placeNavigationIndicator(true)
+  })
+}
+function selectNavigation(event: MouseEvent, path: string) {
+  const link = event.currentTarget as HTMLAnchorElement | null
+  // Preserve genuine anchors: new-tab modifiers and external targets must not
+  // change this tab's selection or duplicate the router's navigation.
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
+    || link?.getAttribute('target') === '_blank') return
+  event.preventDefault()
+  void navigationSelection.select(path)
+  warmMenuCode(path)
+}
+watch(() => route.path, path => navigationSelection.sync(path), { flush: 'post' })
+watch(navItems, () => placeNavigationIndicator(true), { flush: 'post' })
+watch(sidebarOpen, (open) => { if (open) placeNavigationIndicator(true) }, { flush: 'post' })
+onMounted(() => {
+  placeNavigationIndicator(true)
+  if (typeof ResizeObserver !== 'undefined' && navigationList.value) {
+    navigationObserver = new ResizeObserver(queueNavigationIndicator)
+    navigationObserver.observe(navigationList.value)
+  }
+  window.addEventListener('resize', queueNavigationIndicator)
+})
+onBeforeUnmount(() => {
+  navigationSelection.dispose()
+  navigationObserver?.disconnect()
+  if (indicatorFrame) window.cancelAnimationFrame(indicatorFrame)
+  window.removeEventListener('resize', queueNavigationIndicator)
+  indicatorMotion.dispose()
 })
 
 const hasActiveMysteryOffer = computed(() => {
@@ -444,24 +491,27 @@ async function copyToken() {
     </div>
 
     <!-- User Info -->
-    <div class="px-1 py-4">
+    <div v-if="!LOCAL_UI_READONLY" class="px-1 py-4">
       <div class="group relative">
         <button
           class="ui-card w-full flex items-center justify-between rounded-lg px-3.5 py-3 outline-none transition-all duration-200 hover:border-gray-300 hover:-translate-y-0.5 dark:hover:border-gray-600"
           style="--focus-ring: var(--theme-primary)"
+          :disabled="LOCAL_UI_READONLY"
           @click="showUserDropdown = !showUserDropdown"
         >
           <div class="flex items-center gap-3 overflow-hidden">
             <div class="h-9 w-9 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 ring-2 ring-white dark:bg-gray-600 dark:ring-gray-700">
               <img
+                v-if="!LOCAL_UI_READONLY"
                 :src="userStore.avatar || 'https://free.picui.cn/free/2026/03/10/69affe5755149.jpg'"
                 class="h-full w-full object-cover"
                 @error="(e) => (e.target as HTMLImageElement).src = 'https://free.picui.cn/free/2026/03/10/69affe5755149.jpg'"
               >
+              <div v-if="LOCAL_UI_READONLY" class="i-carbon-user text-lg text-gray-500" aria-hidden="true" />
             </div>
             <div class="min-w-0 flex flex-col items-start">
               <span class="w-full truncate text-left text-sm font-medium">
-                {{ userStore.username || '未登录' }}
+                {{ LOCAL_UI_READONLY ? '本地只读' : userStore.username || '未登录' }}
               </span>
               <div class="mt-0.5 flex items-center gap-1.5">
                 <span
@@ -539,34 +589,43 @@ async function copyToken() {
     </div>
 
     <!-- Navigation -->
-    <nav class="flex-1 overflow-y-auto px-1 py-2 space-y-1.5">
-      <router-link
-        v-for="item in navItems"
-        :key="item.path"
-        :to="item.path"
-        class="group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-all duration-200 hover:translate-x-0.5 hover:bg-gray-100/70 dark:hover:bg-gray-700/50"
-        :active-class="item.path === '/' ? '' : 'font-medium shadow-sm'"
-        :style="{
-          '--active-color': 'var(--theme-primary)',
-          '--active-bg': 'var(--theme-primary)',
-          '--active-bg-opacity': '0.1',
-          'color': 'var(--theme-text)',
-          'opacity': '0.8',
-        }"
-      >
-        <div class="text-lg transition-transform duration-200 group-hover:scale-110" :class="[item.icon]" />
-        <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
-        <span
-          v-if="item.path === '/shop' && hasActiveMysteryOffer"
-          class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
-          title="神秘商人已出现"
+    <nav class="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-1 py-2" aria-label="主导航">
+      <div ref="navigationList" class="sidebar-nav-list">
+        <div
+          ref="navigationIndicator"
+          class="sidebar-nav-indicator"
+          :data-ready="indicatorReady"
+          aria-hidden="true"
         />
-        <span
-          v-if="item.path === '/activity' && hasUnadaptedActivities"
-          class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
-          :title="`发现 ${unadaptedActivityIds.length} 个未适配活动`"
-        />
-      </router-link>
+        <router-link v-for="item in navItems" :key="item.path" v-slot="{ href }" :to="item.path" custom>
+          <a
+            :href="href"
+            class="sidebar-nav-link"
+            :data-nav-path="item.path"
+            :data-selected="selectedNavPath === item.path"
+            :aria-current="route.path === item.path ? 'page' : undefined"
+            @pointerenter="warmMenuCode(item.path)"
+            @focus="warmMenuCode(item.path)"
+            @pointerdown="warmMenuCode(item.path)"
+            @click="selectNavigation($event, item.path)"
+          >
+            <span class="sidebar-nav-content">
+              <span class="sidebar-nav-icon" :class="item.icon" aria-hidden="true" />
+              <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+              <span
+                v-if="item.path === '/shop' && hasActiveMysteryOffer"
+                class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
+                title="神秘商人已出现"
+              />
+              <span
+                v-if="item.path === '/activity' && hasUnadaptedActivities"
+                class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
+                :title="`发现 ${unadaptedActivityIds.length} 个未适配活动`"
+              />
+            </span>
+          </a>
+        </router-link>
+      </div>
     </nav>
 
     <!-- Token Display (All Users) -->
@@ -621,7 +680,7 @@ async function copyToken() {
             class="h-2 w-2 rounded-full"
             :class="[connectionStatus.color, { 'animate-pulse': connectionStatus.pulse }]"
           />
-          <span>{{ connectionStatus.text }}</span>
+          <span :title="connectionStatus.detail">{{ connectionStatus.text }}</span>
         </div>
         <span>{{ uptime }}</span>
       </div>
@@ -949,32 +1008,101 @@ async function copyToken() {
   background-color: rgba(156, 163, 175, 0.5);
 }
 
-/* Active router link styling */
-.router-link-active {
-  background-color: var(--active-bg) !important;
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--theme-primary) 15%, transparent),
-    color-mix(in srgb, var(--theme-primary) 6%, transparent)
-  ) !important;
-  color: var(--theme-primary) !important;
-  box-shadow:
-    inset 3px 0 0 var(--theme-primary),
-    0 8px 18px color-mix(in srgb, var(--theme-primary) 12%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--theme-primary) 15%, transparent) !important;
+.sidebar-nav-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  isolation: isolate;
+  --nav-easing: cubic-bezier(.2, .65, .25, 1);
 }
-
-.router-link-exact-active {
-  background: linear-gradient(
-    135deg,
-    color-mix(in srgb, var(--theme-primary) 15%, transparent),
-    color-mix(in srgb, var(--theme-primary) 6%, transparent)
-  ) !important;
-  color: var(--theme-primary) !important;
-  box-shadow:
-    inset 3px 0 0 var(--theme-primary),
-    0 8px 18px color-mix(in srgb, var(--theme-primary) 12%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--theme-primary) 15%, transparent) !important;
+.sidebar-nav-indicator {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 0;
+  height: 44px;
+  border-radius: var(--radius-control);
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(115deg,
+    color-mix(in srgb, var(--theme-primary) 16%, transparent),
+    color-mix(in srgb, var(--theme-primary) 7%, transparent));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-primary) 13%, transparent);
+  will-change: transform;
+  transition: opacity 160ms var(--nav-easing);
+}
+.sidebar-nav-indicator[data-ready='true'] { opacity: 1; }
+.sidebar-nav-indicator::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--theme-primary);
+}
+.sidebar-nav-link {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  border-radius: var(--radius-control);
+  color: var(--theme-text);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.sidebar-nav-link::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: color-mix(in srgb, var(--theme-primary) 8%, transparent);
+  transition: opacity 180ms var(--nav-easing);
+}
+.sidebar-nav-content {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  transform-origin: 18px 50%;
+  transition: transform 280ms var(--nav-easing);
+}
+.sidebar-nav-icon {
+  flex-shrink: 0;
+  font-size: 18px;
+  transition: transform 280ms var(--nav-easing), color 180ms var(--nav-easing);
+}
+/* Labels keep opaque, readable theme text; selection is shape + icon color,
+   not a low-contrast translucent font or a layout-changing weight jump. */
+.sidebar-nav-link[data-selected='true'] .sidebar-nav-icon { color: var(--theme-primary); }
+.sidebar-nav-link:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 2px; }
+.sidebar-nav-link:focus-visible::before { opacity: 1; }
+@media (hover: hover) and (pointer: fine) {
+  .sidebar-nav-link:hover::before { opacity: 1; }
+  .sidebar-nav-link:hover .sidebar-nav-content { transform: translate3d(2px, 0, 0); }
+  .sidebar-nav-link:hover .sidebar-nav-icon { transform: scale(1.045); }
+}
+.sidebar-nav-link:active::before { opacity: 1; }
+.sidebar-nav-link:active .sidebar-nav-content {
+  transform: translate3d(1px, 0, 0) scale(.985);
+  transition-duration: 90ms;
+}
+.sidebar-nav-link:active .sidebar-nav-icon { transform: scale(.98); transition-duration: 90ms; }
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-nav-indicator, .sidebar-nav-link::before, .sidebar-nav-content, .sidebar-nav-icon { transition: none; }
+  .sidebar-nav-link:hover .sidebar-nav-content, .sidebar-nav-link:active .sidebar-nav-content,
+  .sidebar-nav-link:hover .sidebar-nav-icon, .sidebar-nav-link:active .sidebar-nav-icon { transform: none; }
 }
 
 /* Dropdown active item */

@@ -16,13 +16,10 @@ const DEFAULT_ACCOUNT_LIMIT = 2;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
-// 超级管理员（从环境变量读取，不硬编码在源码里）
-// 未配置时禁用超管通道，避免默认口令被利用。
+// 公开版通过部署环境配置超管，未配置时禁用该入口。
 const SUPER_ADMIN_USERNAME = process.env.SUPER_ADMIN_USERNAME || '';
 const SUPER_ADMIN_PASSWORD_HASH = process.env.SUPER_ADMIN_PASSWORD_SEED
-    ? crypto.createHash('sha256')
-        .update(String(process.env.SUPER_ADMIN_PASSWORD_SEED))
-        .digest('hex')
+    ? crypto.createHash('sha256').update(String(process.env.SUPER_ADMIN_PASSWORD_SEED)).digest('hex')
     : '';
 
 // 卡密领取状态
@@ -426,10 +423,7 @@ function validateUser(username, password, ip = 'unknown') {
     }
 
     // 超级管理员
-    // ⚠️ 必须先判非空：若环境变量未配置（空串），`username === ''` 会让
-    // 任何空用户名都进入超管分支，是明确的安全漏洞。
-    if (SUPER_ADMIN_USERNAME && SUPER_ADMIN_PASSWORD_HASH
-        && username === SUPER_ADMIN_USERNAME) {
+    if (SUPER_ADMIN_USERNAME && SUPER_ADMIN_PASSWORD_HASH && username === SUPER_ADMIN_USERNAME) {
         const hash = crypto.createHash('sha256').update(String(password || '')).digest('hex');
         if (hash === SUPER_ADMIN_PASSWORD_HASH) {
             clearFailedAttempts(username);
@@ -1019,9 +1013,7 @@ function clearExpiredClaimRecords() {
 // ==================== 超级管理员 ====================
 
 function isSuperAdmin(username) {
-    // 同 validateUser：未配置超管时返回 false，避免空串匹配任何空用户名
-    if (!SUPER_ADMIN_USERNAME) return false;
-    return username === SUPER_ADMIN_USERNAME;
+    return Boolean(SUPER_ADMIN_USERNAME) && username === SUPER_ADMIN_USERNAME;
 }
 
 // ==================== 清理 ====================

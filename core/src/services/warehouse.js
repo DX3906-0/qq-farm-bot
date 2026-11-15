@@ -8,7 +8,6 @@
  * - 自动使用化肥礼包
  * - 化肥容器时间计算
  */
-const protobuf = require('protobufjs');
 const {
   getFruitName,
   getPlantByFruitId,
@@ -24,6 +23,9 @@ const { sendMsgAsync, networkEvents, getUserState } = require('../utils/network'
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
 const { updateStatusGold } = require('./status');
+const { createGameCommandScope, quantity, positiveId, validation, unknown } = require('./game-command');
+const itemCommands = createGameCommandScope('warehouse');
+const isItemLocked = item => item?.locked === true || item?.locked === 1 || item?.locked === '1';
 
 // ---- 常量 ----
 
@@ -84,54 +86,84 @@ async function getBag() {
 }
 
 function toSellItem(raw) {
-  const id = toNum(raw && raw.id);
-  const count = toNum(raw && raw.count);
-  const uid = toNum(raw && raw.uid);
-  const item = { id: toLong(id), count: toLong(count) };
-  if (uid > 0) item.uid = toLong(uid);
+  const id = positiveId(raw?.id, '物品编号');
+  const count = quantity(raw?.count);
+  const uid = quantity(raw?.uid);
+  if (BigInt(count) <= 0n) throw validation('出售数量必须大于零');
+  const item = { id: String(id), count };
+  if (uid !== '0') item.uid = uid;
   return item;
 }
 
 async function sellItems(items) {
-  const request = types.SellRequest.encode(
-    types.SellRequest.create({ items: items.map(toSellItem) })
-  ).finish();
+  const normalized = items.map(toSellItem);
+  const latest = getBagItems(await getBag());
+  for (const request of normalized) {
+    const candidates = latest.filter(item => String(item.id) === request.id && (!request.uid || quantity(item.uid) === request.uid));
+    if (!candidates.length || candidates.some(isItemLocked)) throw validation('待售物品不存在或已锁定，禁止出售');
+  }
+  const request = types.SellRequest.encode(types.SellRequest.fromObject({ items: normalized })).finish();
   const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Sell', request);
   return types.SellReply.decode(body);
 }
 
-/**
- * 使用物品（含 raw protobuf 回退）
- */
-async function useItem(itemId, count = 1, landIds = []) {
-  const request = types.UseRequest.encode(
-    types.UseRequest.create({
-      item_id: toLong(itemId),
-      count: toLong(count),
-      land_ids: (landIds || []).map((id) => toLong(id)),
-    })
-  ).finish();
+/** 使用当前官方嵌套协议，只发送一次，锁定实例不参与使用。 */
+async function useItem(itemId, count = 1, landIds = [], requestedUid) {
+  const id = positiveId(itemId, '物品编号');
+  const amount = quantity(count);
+  if (BigInt(amount) <= 0n) throw validation('使用数量必须大于零');
+  if (id === 6001) return require('./firework-use').useFirework(Number(amount), requestedUid);
+  return itemCommands.execute(async session => {
+    const bag = await getBag();
+    const candidates = getBagItems(bag).filter(item => toNum(item.id) === id && !isItemLocked(item));
+    const item = requestedUid == null
+      ? candidates.find(entry => BigInt(quantity(entry.count)) >= BigInt(amount))
+      : candidates.find(entry => quantity(entry.uid) === quantity(requestedUid));
+    if (!item || BigInt(quantity(item.count)) < BigInt(amount)) throw validation('物品不存在、已锁定或可用数量不足');
+    const uid = quantity(item.uid);
+    const key = `use:${uid}:${id}`;
+    const reply = await itemCommands.rpc(session, 'gamepb.itempb.ItemService', 'Use', 'UseRequest', 'UseReply', {
+      item: { id: String(id), count: amount, uid },
+      target: { host_gid: session.gid, land_ids: (landIds || []).map(value => String(positiveId(value, '土地编号'))), use_config_id: 0 },
+    }, { write: true, key });
+    const confirmed = (reply.used_items || []).some(entry => toNum(entry.id) === id && BigInt(quantity(entry.count)) === BigInt(amount));
+    if (!confirmed) throw unknown('物品使用回包未确认本次消耗，请只刷新背包核对');
+    itemCommands.confirm(session, key);
+    const rewards = (reply.items || []).filter(entry => toNum(entry.id) > 0 && toNum(entry.count) > 0).map(entry => ({
+      id: toNum(entry.id), count: toNum(entry.count), name: getItemById(toNum(entry.id))?.name || `物品${toNum(entry.id)}`,
+      image: getItemImageById(toNum(entry.id)) || '',
+    }));
+    return { ...reply, rewards, resultState: 'completed', usedItemId: id, usedCount: Number(amount), accountId: session.accountId };
+  });
+}
 
-  try {
-    const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Use', request);
-    return types.UseReply.decode(body);
-  } catch (err) {
-    const msg = String(err && err.message || '');
-    const isBadParam = msg.includes('code=1000020') || msg.includes('请求参数错误');
-
-    if (!isBadParam) throw err;
-
-    // 回退：手工构建 raw protobuf
-    const writer = protobuf.Writer.create();
-    writer.uint32(10).fork();         // field 1, wire 2
-    writer.uint32(8).int64(toLong(itemId));  // field 1, varint
-    writer.uint32(16).int64(toLong(count));  // field 2, varint
-    writer.ldelim();
-
-    const raw = writer.finish();
-    const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Use', raw);
-    return types.UseReply.decode(body);
-  }
+/** Locks are instance-specific, never inferred from an item name or an aggregated count. */
+async function setItemsLocked(itemUids, locked) {
+  if (typeof locked !== 'boolean' || !Array.isArray(itemUids) || itemUids.length === 0 || itemUids.length > 50) throw validation('请选择1至50个物品实例并指定锁定状态');
+  const uids = itemUids.map(value => quantity(value, '物品UID'));
+  if (uids.some(uid => uid === '0') || new Set(uids).size !== uids.length) throw validation('物品UID无效或重复');
+  return itemCommands.execute(async session => {
+    const items = getBagItems(await getBag());
+    const actionable = [];
+    for (const uid of uids) {
+      const item = items.find(entry => quantity(entry.uid) === uid);
+      if (!item || ![5, 6, 17].includes(Number(getItemById(toNum(item.id))?.type))) throw validation('物品不存在或该类型不能锁定');
+      if (isItemLocked(item) !== locked) actionable.push(uid);
+    }
+    if (!actionable.length) return { skipped: true, reason: 'already_in_target_state', changed: 0 };
+    const method = locked ? 'LockItems' : 'UnlockItems';
+    const key = 'lock-state';
+    const reply = await itemCommands.rpc(session, 'gamepb.itempb.ItemService', method, `${method}Request`, `${method}Reply`,
+      { item_uids: actionable }, { write: true, key, allowEmpty: true });
+    let confirmed = new Set((reply.item_uids || []).map(value => quantity(value)));
+    if (!actionable.every(uid => confirmed.has(uid))) {
+      const after = getBagItems(await getBag());
+      confirmed = new Set(after.filter(item => isItemLocked(item) === locked).map(item => quantity(item.uid)));
+    }
+    if (!actionable.every(uid => confirmed.has(uid))) throw unknown('物品锁定状态未全部确认，请只刷新背包核对');
+    itemCommands.confirm(session, key);
+    return { changed: actionable.length, itemUids: actionable, locked, resultState: 'completed', accountId: session.accountId };
+  });
 }
 
 async function batchUseItems(entries) {
@@ -188,7 +220,7 @@ function collectFertilizerUsePayload(items) {
   for (const item of items || []) {
     const id = toNum(item && item.id);
     const count = Math.max(0, toNum(item && item.count));
-    if (id <= 0 || count <= 0) continue;
+    if (id <= 0 || count <= 0 || isItemLocked(item)) continue;
     if (!isFertilizerRelatedItemId(id)) continue;
     map.set(id, (map.get(id) || 0) + count);
   }
@@ -434,7 +466,7 @@ async function getBagDetail() {
     const count = toNum(item.count);
     const uid = toNum(item.uid);
     if (id <= 0 || count <= 0) continue;
-    originalItems.push({ id, count, uid });
+    originalItems.push({ id, count, uid: quantity(item.uid), locked: isItemLocked(item) });
   }
 
   // 按 ID 去重合并
@@ -467,9 +499,14 @@ async function getBagDetail() {
       priceId === 1005 ? '金豆豆' :
       priceId === 200 ? '点券' : '金';
 
-    if (!merged.has(id)) {
-      merged.set(id, {
+    // Keep locked/unlocked stacks separate; UID is retained for instance actions.
+    const groupKey = quantity(item.uid) !== '0' ? `uid:${quantity(item.uid)}` : `id:${id}:${isItemLocked(item)}`;
+    if (!merged.has(groupKey)) {
+      merged.set(groupKey, {
         id,
+        uid: quantity(item.uid),
+        groupKey,
+        locked: isItemLocked(item),
         count: 0,
         name,
         image: getItemImageById(id),
@@ -484,7 +521,7 @@ async function getBagDetail() {
         hoursText: '',
       });
     }
-    merged.get(id).count += count;
+    merged.get(groupKey).count += count;
   }
 
   // 计算容器时间显示
@@ -534,7 +571,7 @@ async function sellAllFruits() {
     for (const item of items) {
       const id = toNum(item.id);
       const count = toNum(item.count);
-      if (isFruitItemId(id) && count > 0) {
+      if (isFruitItemId(id) && count > 0 && !isItemLocked(item)) {
         fruits.push(item);
       }
     }
@@ -682,7 +719,7 @@ async function getBagSeeds() {
   for (const item of items || []) {
     const id = toNum(item && item.id);
     const count = toNum(item && item.count);
-    if (id <= 0 || count <= 0) continue;
+    if (id <= 0 || count <= 0 || isItemLocked(item)) continue;
 
     const plant = getPlantBySeedId(id);
     const info = getItemById(id) || null;
@@ -726,6 +763,8 @@ module.exports = {
   getBagDetail,
   sellItems,
   useItem,
+  setItemsLocked,
+  isItemLocked,
   batchUseItems,
   openFertilizerGiftPacksSilently,
   getFertilizerGiftDailyState: () => ({

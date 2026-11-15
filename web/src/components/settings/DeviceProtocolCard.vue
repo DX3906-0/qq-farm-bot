@@ -3,6 +3,7 @@ import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import BaseSwitch from '@/components/ui/BaseSwitch.vue'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 
 interface DeviceProtocolConfig {
   enabled: boolean
@@ -17,6 +18,10 @@ interface DeviceProtocolConfig {
 defineProps<{
   loading: boolean
   saving: boolean
+  ready?: boolean
+  readError?: string
+  unknown?: boolean
+  mutationError?: string
   presetOptions: { label: string, value: string | number }[]
 }>()
 
@@ -26,6 +31,7 @@ const emit = defineEmits<{
   randomDeviceId: []
   randomImei: []
   save: []
+  read: []
 }>()
 
 const form = defineModel<DeviceProtocolConfig>('form', { required: true })
@@ -33,7 +39,7 @@ const selectedPreset = defineModel<string | number>('selectedPreset', { required
 </script>
 
 <template>
-  <div class="border border-gray-200 rounded-lg bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+  <section class="ui-card p-4 sm:p-5">
     <h4 class="mb-3 flex items-center gap-2 text-base text-gray-900 font-bold dark:text-gray-100">
       <div class="i-carbon-mobile" />
       设备协议配置
@@ -44,7 +50,11 @@ const selectedPreset = defineModel<string | number>('selectedPreset', { required
       <p>加载中...</p>
     </div>
 
+    <div v-else-if="LOCAL_UI_READONLY" class="ui-empty-state"><p>本地只读浏览不读取用户设备配置。</p></div>
     <div v-else class="space-y-3">
+      <p v-if="readError || mutationError || !ready" class="ui-notice" role="status">{{ mutationError || readError || '设备配置尚未读取，不能保存默认占位内容。' }}</p>
+      <BaseButton v-if="unknown || readError || !ready" variant="outline" size="sm" :disabled="saving || loading" @click="emit('read')">读取核对</BaseButton>
+      <fieldset class="space-y-3 m-0 border-0 p-0" :disabled="saving || !ready || !!readError">
       <div class="rounded-lg bg-gray-50 p-3 dark:bg-gray-700/40">
         <BaseSwitch
           v-model="form.enabled"
@@ -132,11 +142,13 @@ const selectedPreset = defineModel<string | number>('selectedPreset', { required
           variant="primary"
           size="sm"
           :loading="saving"
+          :disabled="unknown || !ready || !!readError"
           @click="emit('save')"
         >
           保存设备协议配置
         </BaseButton>
       </div>
+      </fieldset>
     </div>
-  </div>
+  </section>
 </template>

@@ -9,10 +9,13 @@ rem  login via the Startup folder. Kept for manual restart.
 rem ============================================================
 cd /d "%~dp0"
 
-set PY=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\python.exe
-set PYW=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe
+if not defined FARM_PYTHON set FARM_PYTHON=python
+set "PY=%FARM_PYTHON%"
+if not defined FARM_PYTHONW set FARM_PYTHONW=pythonw
+set "PYW=%FARM_PYTHONW%"
 
-if not exist "%PY%" goto nopy
+where "%PY%" >nul 2>nul
+if errorlevel 1 goto nopy
 
 echo Starting napcat-code-guard daemon (silent) ...
 start "" "%PYW%" "%~dp0napcat-code-guard.py"

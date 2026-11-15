@@ -2,6 +2,7 @@
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 
 interface OfflineReminderConfig {
   channel: string
@@ -25,25 +26,34 @@ defineProps<{
   currentChannelDocUrl: string
   saving: boolean
   testing: boolean
+  ready?: boolean
+  readError?: string
+  unknown?: boolean
+  testUnknown?: boolean
+  mutationError?: string
 }>()
 
 const emit = defineEmits<{
   openDocs: []
   test: []
   save: []
+  read: []
 }>()
 
 const config = defineModel<OfflineReminderConfig>('config', { required: true })
 </script>
 
 <template>
-  <div class="border border-gray-200 rounded-lg bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+  <section class="ui-card p-4 sm:p-5">
     <h4 class="mb-3 flex items-center gap-2 text-base text-gray-900 font-bold dark:text-gray-100">
       <div class="i-carbon-notification" />
       下线提醒
     </h4>
 
-    <div class="space-y-3">
+    <p v-if="LOCAL_UI_READONLY" class="ui-notice">本地只读浏览不读取或保存推送配置，也不发送通知。</p>
+    <p v-if="!LOCAL_UI_READONLY && (readError || mutationError || !ready)" class="ui-notice" role="status">{{ mutationError || readError || '推送设置尚未读取，不能用默认占位保存。' }}</p>
+    <BaseButton v-if="!LOCAL_UI_READONLY && (unknown || readError || !ready)" variant="outline" size="sm" :disabled="saving || testing" @click="emit('read')">读取核对</BaseButton>
+    <fieldset class="space-y-3 border-0 p-0 m-0" :disabled="saving || testing || !ready || !!readError || LOCAL_UI_READONLY">
       <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
         <div class="flex flex-col gap-1.5">
           <div class="flex items-center justify-between">
@@ -60,6 +70,7 @@ const config = defineModel<OfflineReminderConfig>('config', { required: true })
           <BaseSelect
             v-model="config.channel"
             :options="channelOptions"
+            aria-label="推送渠道"
           />
         </div>
         <BaseInput
@@ -160,14 +171,14 @@ const config = defineModel<OfflineReminderConfig>('config', { required: true })
           placeholder="提醒内容"
         />
       </template>
-    </div>
+    </fieldset>
 
     <div class="mt-4 flex justify-end gap-2 border-t pt-3 dark:border-gray-700">
       <BaseButton
         variant="secondary"
         size="sm"
         :loading="testing"
-        :disabled="saving"
+        :disabled="saving || !ready || testUnknown || LOCAL_UI_READONLY"
         @click="emit('test')"
       >
         测试通知
@@ -176,11 +187,11 @@ const config = defineModel<OfflineReminderConfig>('config', { required: true })
         variant="primary"
         size="sm"
         :loading="saving"
-        :disabled="testing"
+        :disabled="testing || !ready || unknown || !!readError || LOCAL_UI_READONLY"
         @click="emit('save')"
       >
         保存下线提醒设置
       </BaseButton>
     </div>
-  </div>
+  </section>
 </template>

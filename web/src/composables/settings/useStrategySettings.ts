@@ -1,7 +1,7 @@
 import type { Ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import { computed, onScopeDispose, ref, watchEffect } from 'vue'
-import api from '@/api'
+import { computed, onScopeDispose, ref, watch, watchEffect } from 'vue'
+import api, { createReadCoordinator, invalidateSafeReads, isReadCanceled, safeGet } from '@/api'
 import { useFarmStore } from '@/stores/farm'
 import { useSettingStore } from '@/stores/setting'
 
@@ -28,10 +28,12 @@ const analyticsSortByMap: Record<string, string> = {
 
 export function useStrategySettings({
   currentAccountId,
+  activeTab,
   getAutomationSettings,
   showAlert,
 }: {
   currentAccountId: Ref<string | number | null | undefined>
+  activeTab?: Ref<string>
   getAutomationSettings: () => AutomationSettingsSnapshot
   showAlert: (message: string, type?: AlertType) => void
 }) {
@@ -81,6 +83,25 @@ export function useStrategySettings({
   const draggingBagSeedId = ref<number | null>(null)
   let bagSeedsRequestId = 0
   let strategyPreviewRequestId = 0
+  let disposed = false
+  let dataEpoch = 0
+  const reads = createReadCoordinator()
+  const visible = () => !disposed && (!activeTab || activeTab.value === 'strategy') && !document.hidden
+  watch([currentAccountId, () => activeTab?.value], () => {
+    dataEpoch++
+    reads.invalidate()
+    bagSeedsRequestId++
+    strategyPreviewRequestId++
+    bagSeedsLoading.value = false
+    // Changing visible tabs invalidates reads only, never an already-sent save.
+  }, { flush: 'sync' })
+  onScopeDispose(() => {
+    disposed = true
+    dataEpoch++
+    reads.invalidate()
+    bagSeedsRequestId++
+    strategyPreviewRequestId++
+  })
 
   const sortedBagSeeds = computed(() => {
     const priority = localStrategySettings.value.bagSeedPriority || []
@@ -102,7 +123,11 @@ export function useStrategySettings({
     return orderedSeeds
   })
 
-  async function fetchBagSeeds() {
+  function fetchBagSeeds() {
+    if (!visible()) return Promise.resolve()
+    return reads.run(`bag:${currentAccountId.value}:${dataEpoch}`, signal => readBagSeeds(signal))
+  }
+  async function readBagSeeds(signal: AbortSignal) {
     const accountId = currentAccountId.value
     if (!accountId)
       return
@@ -111,11 +136,12 @@ export function useStrategySettings({
     bagSeedsLoading.value = true
     bagSeedsError.value = null
     try {
-      const res = await api.get('/api/bag/seeds', {
-        headers: { 'x-account-id': accountId },
-      })
-      if (requestId !== bagSeedsRequestId || String(currentAccountId.value || '') !== requestedId)
+      const res = await safeGet('/api/bag/seeds', {
+        headers: { 'x-account-id': accountId }, signal,
+      }, dataEpoch)
+      if (!visible() || signal.aborted || requestId !== bagSeedsRequestId || String(currentAccountId.value || '') !== requestedId)
         return
+      if (!res.data?.ok) throw new Error(res.data?.error || '背包种子读取失败')
       if (res.data.ok) {
         bagSeeds.value = res.data.data || []
         const currentIds = bagSeeds.value.map(seed => Number(seed.seedId)).filter(seedId => seedId > 0)
@@ -139,6 +165,7 @@ export function useStrategySettings({
       }
     }
     catch (e: any) {
+      if (isReadCanceled(e) || signal.aborted || !visible()) return
       if (requestId === bagSeedsRequestId && String(currentAccountId.value || '') === requestedId)
         bagSeedsError.value = e.message || '加载失败'
     }
@@ -216,14 +243,14 @@ export function useStrategySettings({
   }
 
   watchEffect(() => {
-    if (localStrategySettings.value.plantingStrategy === 'bag_priority' && currentAccountId.value) {
-      fetchBagSeeds()
+    if (visible() && localStrategySettings.value.plantingStrategy === 'bag_priority' && currentAccountId.value) {
+      void fetchBagSeeds().catch(() => {})
     }
   })
 
   const bagSeedsRefreshTimer = window.setInterval(() => {
-    if (localStrategySettings.value.plantingStrategy === 'bag_priority' && currentAccountId.value && !bagSeedsLoading.value)
-      void fetchBagSeeds()
+    if (visible() && localStrategySettings.value.plantingStrategy === 'bag_priority' && currentAccountId.value && !bagSeedsLoading.value)
+      void fetchBagSeeds().catch(() => {})
   }, 15_000)
   onScopeDispose(() => window.clearInterval(bagSeedsRefreshTimer))
 
@@ -241,8 +268,11 @@ export function useStrategySettings({
 
   const strategyPreviewLabel = ref<string | null>(null)
 
-  watchEffect(async () => {
+  watchEffect(async (onCleanup) => {
+    const controller = new AbortController()
+    onCleanup(() => controller.abort())
     const requestId = ++strategyPreviewRequestId
+    if (!visible()) return
     let strategy = localStrategySettings.value.plantingStrategy
     if (strategy === 'preferred') {
       strategyPreviewLabel.value = null
@@ -286,9 +316,9 @@ export function useStrategySettings({
         }
         const requestedId = String(accountId)
         const res = await api.get(`/api/analytics?sort=${sortBy}`, {
-          headers: { 'x-account-id': accountId },
+          headers: { 'x-account-id': accountId }, signal: controller.signal,
         })
-        if (requestId !== strategyPreviewRequestId || String(currentAccountId.value || '') !== requestedId)
+        if (!visible() || requestId !== strategyPreviewRequestId || String(currentAccountId.value || '') !== requestedId)
           return
         const rankings: any[] = res.data.ok ? (res.data.data || []) : []
         const availableIds = new Set(available.map(s => s.seedId))
@@ -326,39 +356,72 @@ export function useStrategySettings({
     }
   }
 
-  async function loadStrategyData() {
+  function loadStrategyData() {
+    if (disposed) return Promise.resolve()
+    return reads.run(`strategy:${currentAccountId.value}:${dataEpoch}`, signal => readStrategyData(signal)).catch((error) => {
+      if (!disposed && !isReadCanceled(error)) showAlert(error?.message || '策略加载失败', 'danger')
+      return false
+    })
+  }
+  async function readStrategyData(signal: AbortSignal) {
     if (currentAccountId.value) {
       const accountId = String(currentAccountId.value)
-      await settingStore.fetchSettings(accountId)
+      const epoch = dataEpoch
+      const loaded = await settingStore.fetchSettings(accountId)
+      if (loaded === false || disposed || signal.aborted || epoch !== dataEpoch || String(currentAccountId.value) !== accountId) return false
       syncLocalStrategySettings()
-      await farmStore.fetchSeeds(accountId)
+      if (visible()) await farmStore.fetchSeeds(accountId, signal)
+      return !disposed && !signal.aborted && epoch === dataEpoch && String(currentAccountId.value) === accountId
     }
   }
 
+  watch(() => activeTab?.value, (tab) => {
+    if (tab === 'strategy' && currentAccountId.value && visible())
+      void reads.run(`seeds:${currentAccountId.value}:${dataEpoch}`, signal => farmStore.fetchSeeds(String(currentAccountId.value), signal)).catch(() => {})
+  })
+
   async function saveStrategySettings() {
-    if (!currentAccountId.value)
-      return
+    if (!currentAccountId.value || strategySaving.value)
+      return false
+    const id = String(currentAccountId.value)
+    const epoch = dataEpoch
+    const current = () => !disposed && epoch === dataEpoch && id === String(currentAccountId.value)
     strategySaving.value = true
+    invalidateSafeReads()
     try {
+      // Save this editor only. The neighbouring automation editor may contain
+      // unsaved switches; clicking "保存策略" must never apply those switches.
       const fullSettings = {
-        ...settings.value,
         ...localStrategySettings.value,
-        automation: getAutomationSettings().automation,
+        automation: { harvest_delay_min: getAutomationSettings().automation.harvest_delay_min },
       }
-      const res = await settingStore.saveSettings(String(currentAccountId.value), fullSettings)
+      reads.invalidate()
+      const res = await settingStore.saveSettings(id, fullSettings)
+      if (!current()) return false
       if (res.ok) {
         showAlert('策略设置已保存', 'primary')
       }
       else {
         showAlert(`保存失败: ${res.error}`, 'danger')
       }
+      return res.ok === true
+    }
+    catch (error: any) {
+      if (current() && !isReadCanceled(error)) showAlert(error?.message || '策略保存失败', 'danger')
+      return false
     }
     finally {
+      invalidateSafeReads()
+      if (current()) reads.invalidate()
       strategySaving.value = false
     }
   }
 
   function resetStrategyState() {
+    dataEpoch++
+    reads.invalidate()
+    bagSeedsRequestId++
+    strategyPreviewRequestId++
     bagSeeds.value = []
     bagSeedsError.value = null
     bagSeedsLoading.value = false

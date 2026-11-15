@@ -99,20 +99,16 @@ function registerAdminBagRoutes({
       return;
 
     try {
-      const { itemId, count } = req.body;
+      const { itemId, count, uid } = req.body;
       if (!itemId)
         return res.status(400).json({ ok: false, error: "缺少 itemId" });
 
       const usedItemId = toNum(itemId);
       const usedCount = Math.max(1, toNum(count) || 1);
       const usedItemName = getItemName(usedItemId);
-      const bagBefore = await provider.getBag(accountId);
-
-      await provider.useItem(accountId, usedItemId, usedCount);
-      await wait(500);
-
-      const bagAfter = await provider.getBag(accountId);
-      const newItems = getNewItemsAfterUse(bagBefore, bagAfter, usedItemId);
+      const used = await provider.useItem(accountId, usedItemId, usedCount, uid);
+      if (used?.resultState !== 'completed') throw Object.assign(new Error('使用结果未确认，请只刷新核对'), { resultState: 'unknown', sent: true, outcomeUnknown: true });
+      const newItems = Array.isArray(used.rewards) ? used.rewards : [];
 
       emitRealtimeLog({
         accountId,
@@ -126,7 +122,9 @@ function registerAdminBagRoutes({
       res.json({
         ok: true,
         data: {
-          items: newItems,
+          items: Array.isArray(used?.rewards) ? used.rewards : newItems,
+          rewards: Array.isArray(used?.rewards) ? used.rewards : newItems,
+          resultState: used?.resultState,
           usedItemName,
           usedCount,
         },

@@ -383,10 +383,13 @@ function loadConfigs() {
             let decoRegistered = 0;
             for (const [itemId, info] of itemInfoMap.entries()) {
                 const iconRes = String((info && info.icon_res) || '');
-                // gui/texture/<子目录>/<名字>/spriteFrame  →  取 <名字>
-                const iconMatch = iconRes.match(/gui\/texture\/[^/]+\/([^/]+)/);
-                if (!iconMatch) continue;
-                const fileName = `${iconMatch[1]}.png`;
+                // 子目录可以嵌套（nameplate/icon/<名字>/spriteFrame）。先去掉
+                // 资源类型后缀，再取最后的资源名，不能误把 icon 目录当图片。
+                const iconPath = iconRes.replace(/\/(?:spriteFrame|texture)$/, '');
+                if (!iconPath.startsWith('gui/texture/')) continue;
+                const iconName = iconPath.split('/').filter(Boolean).pop();
+                if (!iconName) continue;
+                const fileName = `${iconName}.png`;
                 if (!decoFiles.has(fileName)) continue;
                 if (skinDetailImageMap.has(itemId)) continue;
                 skinDetailImageMap.set(itemId, `/game-config/deco_icons/${fileName}`);

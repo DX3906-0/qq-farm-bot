@@ -8,14 +8,22 @@ import type {
   MilkTeaRecipe,
   MilkTeaShopSlot,
 } from '@/stores/activity'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
+import type { ActivityOverview } from '@/utils/activity-overview'
+import { milkTeaNavigationTarget } from '@/utils/activity-overview'
+import ActivityOverviewPanel from '@/components/activity/ActivityOverviewPanel.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
+import { cancelContentMotion, moveSlidingTabFocus, useSlidingTabs, vFoldMotion, vSlidingTabs } from '@/composables/useContentMotion'
+import { formatActivityDeadline } from '@/constants/activity-windows'
 
 const props = defineProps<{
   activity?: MilkTeaActivityData | null
   page?: string
   loading?: boolean
   operateLoading?: boolean
+  embedded?: boolean
+  accountId?: string
+  overview?: ActivityOverview
 }>()
 
 const emit = defineEmits<{
@@ -29,7 +37,7 @@ const TABS: Array<{ key: string, label: string, icon: string }> = [
   { key: 'workshop', label: '制作台', icon: 'i-carbon-tool-kit' },
   { key: 'hireList', label: '雇佣', icon: 'i-carbon-user-multiple' },
   { key: 'upgrade', label: '升级', icon: 'i-carbon-arrow-up' },
-  { key: 'work', label: '打工', icon: 'i-carbon-briefcase' },
+  { key: 'work', label: '打工', icon: 'i-carbon-portfolio' },
   { key: 'exchange', label: '兑换商店', icon: 'i-carbon-shopping-cart' },
   { key: 'fund', label: '成长基金', icon: 'i-carbon-growth' },
   { key: 'rank', label: '排行榜', icon: 'i-carbon-trophy' },
@@ -53,11 +61,62 @@ const activityEnded = computed(() => {
   return a.endTime > 0 && a.endTime * 1000 < Date.now()
 })
 
-function switchTab(key: string) {
-  if (key === currentTab.value) return
-  currentTab.value = key
-  emit('navigate', key)
+const milkTeaContent = ref<HTMLElement | null>(null)
+const toolbar = ref<HTMLElement | null>(null)
+const milkTeaPanelId = useId()
+const { select: selectMilkTeaTab, selected: selectedMilkTeaTab } = useSlidingTabs(currentTab, () => milkTeaContent.value, () => TABS.map(tab => tab.key), () => props.accountId)
+watch(currentTab, (key, previous) => { if (key !== previous && props.page !== key) emit('navigate', key) })
+let disposed = false
+let navigationIntent = 0
+let scrollingTarget: HTMLElement | null = null
+function releaseTargetScroll() {
+  scrollingTarget?.removeEventListener('scrollend', releaseTargetScroll)
+  scrollingTarget = null
 }
+function cancelTargetScroll() {
+  const scroller = scrollingTarget
+  releaseTargetScroll()
+  // A user who switches tabs during our explicit smooth jump keeps the current
+  // pixels. Stop only this panel's own scroll, never restore an old position.
+  if (scroller?.isConnected) scroller.scrollTo({ top: scroller.scrollTop, left: scroller.scrollLeft, behavior: 'instant' })
+}
+const pendingTarget = ref<{ page: string, anchor: string, accountId?: string, intent: number } | null>(null)
+function switchTab(key: string) {
+  if (!TABS.some(tab => tab.key === key)) return
+  navigationIntent++
+  pendingTarget.value = null
+  cancelTargetScroll()
+  selectMilkTeaTab(key)
+}
+function navigateTo(target: string) {
+  const next = milkTeaNavigationTarget(target)
+  if (!next) return
+  cancelTargetScroll()
+  pendingTarget.value = { ...next, accountId: props.accountId, intent: ++navigationIntent }
+  selectMilkTeaTab(next.page)
+  void revealTarget()
+}
+async function revealTarget() {
+  await nextTick()
+  const pending = pendingTarget.value
+  if (disposed || !pending || pending.intent !== navigationIntent || pending.accountId !== props.accountId
+    || currentTab.value !== pending.page || props.page && props.page !== pending.page || props.loading) return
+  const entry = [...(milkTeaContent.value?.querySelectorAll<HTMLElement>('[data-milk-tea-action]') || [])]
+    .find(element => element.dataset.milkTeaAction === pending.anchor)
+  if (!entry) return
+  pendingTarget.value = null
+  cancelContentMotion('overlay')
+  entry.style.scrollMarginTop = `${Math.ceil((toolbar.value?.getBoundingClientRect().height || 0) + 12)}px`
+  entry.focus({ preventScroll: true })
+  releaseTargetScroll()
+  scrollingTarget = entry.closest<HTMLElement>('[data-page-viewport]')
+  scrollingTarget?.addEventListener('scrollend', releaseTargetScroll, { once: true })
+  entry.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+}
+watch([currentTab, () => props.page, () => props.loading, activity], () => { void revealTarget() }, { flush: 'post' })
+watch(() => props.accountId, () => { navigationIntent++; pendingTarget.value = null; cancelTargetScroll(); goodsCount.value = {}; renaming.value = false; shopNameInput.value = '' }, { flush: 'sync' })
+onBeforeUnmount(() => { disposed = true; navigationIntent++; pendingTarget.value = null; cancelTargetScroll() })
+defineExpose({ navigateTo })
 
 function fmtTime(value?: number) {
   if (!value) return '—'
@@ -238,54 +297,52 @@ const newRecipes = computed(() => {
 </script>
 
 <template>
-  <div class="space-y-4">
-    <template v-if="activityEnded && !opened">
-      <div class="rounded-xl bg-white p-5 text-center shadow-sm dark:bg-gray-800">
+  <div class="milk-tea-panel space-y-3">
+    <!-- Frequent actions come first and remain mounted while page data loads. -->
+    <div ref="toolbar" class="milk-tea-toolbar ui-card">
+      <div class="milk-tea-toolbar-heading">
+        <div class="milk-tea-shop-identity">
+          <span class="i-carbon-cafe" aria-hidden="true" /><h3>{{ summary?.shopName || (props.embedded ? '奶茶店' : activity?.title || '奶茶热销中') }}</h3>
+          <span v-if="opened" class="milk-tea-level">Lv.{{ summary?.level }}</span>
+        </div>
+        <div class="milk-tea-toolbar-actions">
+          <span class="milk-tea-balance">奶茶券 <strong>{{ balances ? fmtNum(balances.milkTeaToken) : '—' }}</strong></span>
+          <BaseButton variant="primary" size="sm" data-milk-tea-exchange-entry :disabled="!props.accountId" @click="navigateTo('exchange')">
+            <span class="i-carbon-shopping-cart mr-1.5" aria-hidden="true" />前往兑换
+          </BaseButton>
+        </div>
+      </div>
+      <p v-if="!props.embedded" class="milk-tea-schedule text-xs">
+        经营截止 <strong>{{ formatActivityDeadline(activity?.settleStartTime) }}</strong> ·
+        领奖截止 <strong>{{ formatActivityDeadline(activity?.endTime) }}</strong> · 北京时间
+      </p>
+      <nav v-sliding-tabs class="ui-tabs milk-tea-tabs" role="tablist" aria-label="奶茶店功能">
+        <button v-for="tab in TABS" :id="`${milkTeaPanelId}-${tab.key}`" :key="tab.key" type="button" class="ui-tab" role="tab"
+          :data-active="selectedMilkTeaTab === tab.key" :aria-selected="selectedMilkTeaTab === tab.key"
+          :aria-controls="`${milkTeaPanelId}-content`" :tabindex="selectedMilkTeaTab === tab.key ? 0 : -1"
+          data-motion-nav @click="switchTab(tab.key)" @keydown="moveSlidingTabFocus"
+        >
+          <span :class="tab.icon" aria-hidden="true" /><span class="ui-tab-label">{{ tab.label }}</span>
+        </button>
+      </nav>
+    </div>
+    <details v-if="props.overview" v-fold-motion class="milk-tea-todo ui-card">
+        <summary><span class="i-carbon-task" aria-hidden="true" /><span>当前待办</span><span class="milk-tea-todo-count">{{ props.overview.known ? `${props.overview.ready ?? 0} 项可处理` : loading || operateLoading ? '正在确认' : '进度待确认' }}</span><span class="milk-tea-todo-hint">按需查看</span><span class="i-carbon-chevron-down milk-tea-todo-chevron" aria-hidden="true" /></summary>
+        <ActivityOverviewPanel :overview="props.overview" :loading="loading || operateLoading" @navigate="navigateTo" />
+    </details>
+    <div :id="`${milkTeaPanelId}-content`" ref="milkTeaContent" class="tab-motion-viewport milk-tea-content" role="tabpanel" :aria-labelledby="`${milkTeaPanelId}-${currentTab}`" :aria-busy="loading">
+      <div class="space-y-4" data-motion-entry>
+    <div v-if="!activity?.summary || activity.active == null" class="ui-empty-state" role="status"><span class="i-carbon-cafe" aria-hidden="true" /><h3>{{ loading ? '正在读取店铺进度' : '店铺进度尚未确认' }}</h3><p>读取到完整活动数据后显示；未加载不等于尚未开店。</p></div>
+    <template v-else-if="activityEnded && !opened">
+      <div class="ui-card p-5 text-center shadow-sm dark:bg-gray-800">
         <p class="text-sm font-semibold text-gray-900 dark:text-white">奶茶热销中活动已结束</p>
         <p class="mt-1 text-xs text-gray-500">已结束的活动不可再经营店铺。</p>
       </div>
     </template>
 
     <template v-else>
-      <!-- 头部：店铺概览 -->
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
-        <div class="min-w-0">
-          <h3 class="flex items-center gap-2 font-semibold text-gray-900 dark:text-white">
-            <span class="i-carbon-cafe text-amber-500" />
-            {{ activity?.title || '奶茶热销中' }}
-            <span v-if="opened" class="rounded-md bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
-              Lv.{{ summary?.level || 0 }} {{ summary?.shopName }}
-            </span>
-          </h3>
-          <p class="mt-1 text-xs text-gray-500">
-            {{ fmtTime(activity?.startTime) }} — {{ fmtTime(activity?.endTime) }}
-            <span v-if="settling" class="ml-2 text-orange-500">结算期</span>
-          </p>
-        </div>
-        <div class="flex flex-wrap items-center gap-4 text-right">
-          <div>
-            <div class="text-lg font-bold text-amber-600 dark:text-amber-300">{{ fmtNum(summary?.totalRevenue) }}</div>
-            <div class="text-xs text-gray-500">累计营业额</div>
-          </div>
-          <div v-if="balances" class="flex items-center gap-4">
-            <div>
-              <div class="text-lg font-bold text-orange-600 dark:text-orange-300">{{ fmtNum(balances.milkTeaToken) }}</div>
-              <div class="text-xs text-gray-500">奶茶券 (1041)</div>
-            </div>
-            <div>
-              <div class="text-lg font-bold text-yellow-600 dark:text-yellow-300">{{ fmtNum(balances.goldCoin) }}</div>
-              <div class="text-xs text-gray-500">金币 (1001)</div>
-            </div>
-          </div>
-          <div v-if="summary?.hasUnclaimedWage">
-            <div class="text-lg font-bold text-emerald-600 dark:text-emerald-300">待领</div>
-            <div class="text-xs text-gray-500">打工工资</div>
-          </div>
-        </div>
-      </div>
-
       <!-- 未开业：开店引导 -->
-      <div v-if="!opened" class="rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
+      <div v-if="!opened" class="ui-card p-5 shadow-sm dark:bg-gray-800" data-milk-tea-action="opening" tabindex="-1">
         <h4 class="font-semibold text-gray-900 dark:text-white">开启你的奶茶店</h4>
         <p class="mt-1 text-xs text-gray-500">开业可获得礼包奖励，店铺名可在开业后 24 小时内修改一次。</p>
         <div v-if="summary?.openingGiftPreview?.length" class="mt-3 flex flex-wrap gap-3">
@@ -324,7 +381,7 @@ const newRecipes = computed(() => {
 
       <template v-else>
         <!-- 店铺快捷操作 -->
-        <div class="flex flex-wrap items-center gap-2 rounded-xl bg-white p-4 shadow-sm dark:bg-gray-800">
+        <div v-if="currentTab === 'shop'" class="flex flex-wrap items-center gap-2 ui-card p-4 shadow-sm dark:bg-gray-800" data-milk-tea-action="cashier" tabindex="-1">
           <BaseButton
             variant="primary"
             :loading="operateLoading"
@@ -377,40 +434,24 @@ const newRecipes = computed(() => {
           <span v-if="summary?.hireDisabled" class="text-xs text-gray-400">已关闭被雇佣，好友无法雇佣你</span>
         </div>
 
-        <!-- 面板内页签 -->
-        <div class="inline-flex flex-wrap gap-1.5 rounded-xl border border-gray-200 bg-white p-1.5 shadow-sm dark:border-gray-700 dark:bg-gray-800">
-          <button
-            v-for="tab in TABS"
-            :key="tab.key"
-            class="rounded-lg px-3 py-1 text-sm whitespace-nowrap transition"
-            :class="currentTab === tab.key
-              ? 'text-white font-medium'
-              : 'text-gray-600 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white'"
-            :style="currentTab === tab.key ? { backgroundColor: 'var(--theme-primary)' } : {}"
-            @click="switchTab(tab.key)"
-          >
-            <span :class="tab.icon" class="mr-1" />{{ tab.label }}
-          </button>
-        </div>
-
         <!-- 店铺 -->
-        <div v-if="currentTab === 'shop'" class="space-y-4">
+        <div v-if="currentTab === 'shop'" class="space-y-4" data-milk-tea-action="shop" tabindex="-1">
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div class="rounded-lg bg-amber-50 px-4 py-3 dark:bg-amber-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">当前等级</div>
-              <div class="mt-1 text-2xl font-bold text-amber-600 dark:text-amber-300">Lv.{{ activity?.shop?.level || summary?.level || 0 }}</div>
+              <div class="milk-tea-value mt-1 text-2xl font-semibold">Lv.{{ activity?.shop?.level || summary?.level || 0 }}</div>
             </div>
-            <div class="rounded-lg bg-orange-50 px-4 py-3 dark:bg-orange-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">累计营业额</div>
-              <div class="mt-1 text-2xl font-bold text-orange-600 dark:text-orange-300">{{ fmtNum(activity?.shop?.totalRevenue) }}</div>
+              <div class="milk-tea-value mt-1 text-2xl font-semibold">{{ fmtNum(activity?.shop?.totalRevenue) }}</div>
             </div>
-            <div class="rounded-lg bg-sky-50 px-4 py-3 dark:bg-sky-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">每小时杯数</div>
-              <div class="mt-1 text-2xl font-bold text-sky-600 dark:text-sky-300">{{ activity?.shop?.effectiveCupsPerHour || 0 }}</div>
+              <div class="milk-tea-value mt-1 text-2xl font-semibold">{{ activity?.shop?.effectiveCupsPerHour || 0 }}</div>
             </div>
-            <div class="rounded-lg bg-emerald-50 px-4 py-3 dark:bg-emerald-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">收银台进度</div>
-              <div class="mt-1 text-2xl font-bold text-emerald-600 dark:text-emerald-300">{{ activity?.shop?.cashierElapsedSec || 0 }}s</div>
+              <div class="milk-tea-value mt-1 text-2xl font-semibold">{{ activity?.shop?.cashierElapsedSec || 0 }}s</div>
               <div class="mt-0.5 text-xs text-gray-500">/ {{ activity?.shop?.cashierCapacitySec || 0 }}s</div>
             </div>
           </div>
@@ -421,7 +462,7 @@ const newRecipes = computed(() => {
               <span>{{ fmtNum(activity?.shop?.totalRevenue) }} / {{ fmtNum(activity?.shop?.nextLevelRevenue) }}</span>
             </div>
             <div class="h-2.5 w-full overflow-hidden rounded-full bg-gray-100 dark:bg-gray-700">
-              <div class="h-full rounded-full bg-gradient-to-r from-amber-400 to-orange-500" :style="{ width: levelProgress + '%' }" />
+              <div class="h-full rounded-full bg-gradient-primary" :style="{ width: levelProgress + '%' }" />
             </div>
           </div>
 
@@ -466,7 +507,7 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 制作台 -->
-        <div v-else-if="currentTab === 'workshop'" class="space-y-3">
+        <div v-else-if="currentTab === 'workshop'" class="space-y-3" data-milk-tea-action="workshop" tabindex="-1">
           <p class="text-xs text-gray-500">
             用活动果实制作奶茶补充库存。库存杯数会在营业中被自动消耗，缺货会拖慢收银速度。
           </p>
@@ -503,7 +544,7 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 雇佣 -->
-        <div v-else-if="currentTab === 'hireList'" class="space-y-3">
+        <div v-else-if="currentTab === 'hireList'" class="space-y-3" data-milk-tea-action="hireList" tabindex="-1">
           <div class="flex flex-wrap items-center gap-2">
             <button
               v-for="d in [1, 2, 3]"
@@ -552,8 +593,8 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 升级 -->
-        <div v-else-if="currentTab === 'upgrade'" class="space-y-3">
-          <div class="rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
+        <div v-else-if="currentTab === 'upgrade'" class="space-y-3" data-milk-tea-action="upgrade" tabindex="-1">
+          <div class="ui-card p-5 shadow-sm dark:bg-gray-800">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h4 class="font-semibold text-gray-900 dark:text-white">
@@ -588,7 +629,7 @@ const newRecipes = computed(() => {
             </div>
           </div>
 
-          <div class="overflow-hidden rounded-xl bg-white shadow-sm dark:bg-gray-800">
+          <div class="overflow-hidden ui-card shadow-sm dark:bg-gray-800">
             <table class="w-full text-sm">
               <thead class="bg-gray-50 text-xs text-gray-500 dark:bg-gray-900/40">
                 <tr>
@@ -618,8 +659,8 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 打工 -->
-        <div v-else-if="currentTab === 'work'" class="space-y-3">
-          <div v-if="work?.myShift" class="rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
+        <div v-else-if="currentTab === 'work'" class="space-y-3" data-milk-tea-action="work" tabindex="-1">
+          <div v-if="work?.myShift" class="ui-card p-5 shadow-sm dark:bg-gray-800">
             <h4 class="font-semibold text-gray-900 dark:text-white">我的班次</h4>
             <p class="mt-1 text-xs text-gray-500">
               在「{{ work.myShift.shopName }}」为 {{ work.myShift.employer?.name || '店主' }} 打工 ·
@@ -641,11 +682,11 @@ const newRecipes = computed(() => {
               </BaseButton>
             </div>
           </div>
-          <div v-else class="rounded-xl bg-white p-5 text-sm text-gray-500 shadow-sm dark:bg-gray-800">
+          <div v-else class="ui-card p-5 text-sm text-gray-500 shadow-sm dark:bg-gray-800">
             当前没有进行中的打工班次。
           </div>
 
-          <div class="rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
+          <div class="ui-card p-5 shadow-sm dark:bg-gray-800" data-milk-tea-action="wages" tabindex="-1">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h4 class="font-semibold text-gray-900 dark:text-white">工资单</h4>
@@ -679,12 +720,12 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 兑换商店 -->
-        <div v-else-if="currentTab === 'exchange'" class="space-y-3">
+        <div v-else-if="currentTab === 'exchange'" class="space-y-3" data-milk-tea-action="exchange" tabindex="-1">
           <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-gray-50 px-3 py-2 text-xs dark:bg-gray-900/40">
             <span class="text-gray-500">共 {{ goods.length }} 件商品，可用金币或奶茶券兑换。</span>
             <span v-if="balances" class="text-gray-600 dark:text-gray-300">
-              奶茶券 <b class="text-orange-600 dark:text-orange-300">{{ fmtNum(balances.milkTeaToken) }}</b>
-              · 金币 <b class="text-yellow-600 dark:text-yellow-300">{{ fmtNum(balances.goldCoin) }}</b>
+              奶茶券 <b class="milk-tea-value">{{ fmtNum(balances.milkTeaToken) }}</b>
+              · 金币 <b class="milk-tea-value">{{ fmtNum(balances.goldCoin) }}</b>
             </span>
           </div>
           <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -737,8 +778,8 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 成长基金 -->
-        <div v-else-if="currentTab === 'fund'" class="space-y-3">
-          <div class="rounded-xl bg-white p-5 shadow-sm dark:bg-gray-800">
+        <div v-else-if="currentTab === 'fund'" class="space-y-3" data-milk-tea-action="fund" tabindex="-1">
+          <div class="ui-card p-5 shadow-sm dark:bg-gray-800">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h4 class="font-semibold text-gray-900 dark:text-white">
@@ -796,11 +837,11 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 排行榜 -->
-        <div v-else-if="currentTab === 'rank'" class="space-y-3">
-          <div class="rounded-xl bg-white p-4 text-xs text-gray-500 shadow-sm dark:bg-gray-800">
+        <div v-else-if="currentTab === 'rank'" class="space-y-3" data-milk-tea-action="rank" tabindex="-1">
+          <div class="ui-card p-4 text-xs text-gray-500 shadow-sm dark:bg-gray-800">
             我的排名：{{ activity?.rank?.myRank || '未上榜' }} · 第 {{ activity?.rank?.page || 1 }} 页
           </div>
-          <div class="overflow-hidden rounded-xl bg-white shadow-sm dark:bg-gray-800">
+          <div class="overflow-hidden ui-card shadow-sm dark:bg-gray-800">
             <table class="w-full text-sm">
               <thead class="bg-gray-50 text-xs text-gray-500 dark:bg-gray-900/40">
                 <tr>
@@ -826,26 +867,26 @@ const newRecipes = computed(() => {
         </div>
 
         <!-- 销售日志 -->
-        <div v-else-if="currentTab === 'logs'" class="space-y-3">
+        <div v-else-if="currentTab === 'logs'" class="space-y-3" data-milk-tea-action="logs" tabindex="-1">
           <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div class="rounded-lg bg-amber-50 px-4 py-3 dark:bg-amber-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">当日营业额</div>
-              <div class="mt-1 text-xl font-bold text-amber-600 dark:text-amber-300">{{ fmtNum(activity?.logs?.coin) }}</div>
+              <div class="milk-tea-value mt-1 text-xl font-semibold">{{ fmtNum(activity?.logs?.coin) }}</div>
             </div>
-            <div class="rounded-lg bg-orange-50 px-4 py-3 dark:bg-orange-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">奶茶券收入</div>
-              <div class="mt-1 text-xl font-bold text-orange-600 dark:text-orange-300">{{ fmtNum(activity?.logs?.token) }}</div>
+              <div class="milk-tea-value mt-1 text-xl font-semibold">{{ fmtNum(activity?.logs?.token) }}</div>
             </div>
-            <div class="rounded-lg bg-sky-50 px-4 py-3 dark:bg-sky-900/20">
+            <div class="ui-subtle-panel milk-tea-metric px-4 py-3">
               <div class="text-xs text-gray-500 dark:text-gray-400">售出杯数</div>
-              <div class="mt-1 text-xl font-bold text-sky-600 dark:text-sky-300">{{ fmtNum(activity?.logs?.cups) }}</div>
+              <div class="milk-tea-value mt-1 text-xl font-semibold">{{ fmtNum(activity?.logs?.cups) }}</div>
             </div>
             <div class="rounded-lg bg-gray-50 px-4 py-3 dark:bg-gray-900/20">
               <div class="text-xs text-gray-500 dark:text-gray-400">统计日</div>
               <div class="mt-1 text-sm font-bold text-gray-700 dark:text-gray-200">{{ fmtTime(activity?.logs?.day) }}</div>
             </div>
           </div>
-          <div v-if="activity?.logs?.items?.length" class="rounded-xl bg-white p-4 shadow-sm dark:bg-gray-800">
+          <div v-if="activity?.logs?.items?.length" class="ui-card p-4 shadow-sm dark:bg-gray-800">
             <h4 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">当日产出</h4>
             <div class="flex flex-wrap gap-2">
               <div v-for="(item, idx) in activity.logs.items" :key="idx" class="flex items-center gap-2 rounded-lg bg-gray-50 px-3 py-1.5 text-sm dark:bg-gray-900/40">
@@ -858,5 +899,39 @@ const newRecipes = computed(() => {
         </div>
       </template>
     </template>
+      </div>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.milk-tea-panel { min-width: 0; color: var(--theme-text); }
+.milk-tea-toolbar { position: sticky; top: 0; z-index: 5; padding: 12px 14px 10px; overflow-anchor: none; }
+.milk-tea-toolbar-heading, .milk-tea-shop-identity, .milk-tea-toolbar-actions { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.milk-tea-toolbar-heading { justify-content: space-between; flex-wrap: wrap; }
+.milk-tea-shop-identity { flex: 1; }
+.milk-tea-shop-identity h3 { margin: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.milk-tea-shop-identity > span:first-child { color: var(--theme-primary); font-size: 18px; }
+.milk-tea-level { color: var(--muted-text); font-size: 12px; white-space: nowrap; }
+.milk-tea-toolbar-actions { flex-shrink: 0; }
+.milk-tea-balance { color: var(--muted-text); font-size: 12px; white-space: nowrap; }
+.milk-tea-balance strong { color: var(--theme-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.milk-tea-tabs { margin: 10px -8px 0; padding: 4px; border: 0; background: transparent; }
+.milk-tea-todo { margin: 0; overflow-anchor: none; }
+.milk-tea-todo > summary { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 6px 14px; cursor: pointer; list-style: none; color: var(--muted-text); font-size: 12px; }
+.milk-tea-todo > summary::-webkit-details-marker { display: none; }
+.milk-tea-todo-count { color: var(--theme-text); font-variant-numeric: tabular-nums; }
+.milk-tea-todo-hint { margin-left: auto; }
+.milk-tea-todo-chevron { transition: transform 160ms ease; }
+.milk-tea-todo[open] .milk-tea-todo-chevron { transform: rotate(180deg); }
+.milk-tea-todo :deep(.activity-overview) { padding: 12px 14px; border: 0; border-radius: 0; box-shadow: none; }
+.milk-tea-content { min-height: 180px; }
+@media (max-width: 640px) { .milk-tea-toolbar { padding: 10px 12px; }.milk-tea-toolbar-actions { gap: 8px; }.milk-tea-todo > summary { padding-left: 12px; padding-right: 12px; }.milk-tea-tabs .ui-tab { padding: 6px 8px; font-size: 12px; } }
+.milk-tea-value { color: var(--theme-text); font-variant-numeric: tabular-nums; }
+.milk-tea-metric { min-width: 0; }
+.milk-tea-schedule { color: var(--muted-text); }
+.milk-tea-schedule strong { color: var(--theme-text); font-weight: 600; }
+.milk-tea-claimable { color: var(--status-success); }
+/* Informational labels remain readable without changing disabled controls. */
+.milk-tea-panel :is(.text-gray-400, .text-gray-500, .text-gray-600):not(button):not(input):not(select):not(textarea):not(a) { color: var(--muted-text); }
+</style>

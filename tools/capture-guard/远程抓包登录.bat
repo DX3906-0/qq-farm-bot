@@ -24,5 +24,5 @@ echo Logs:
 echo   _pick-result.txt   (OCR lines + click log of the pick-account dialog)
 echo   _activate-farm.log (farm window loading/keep-alive log)
 echo.
-node remote-capture.js --panel http://YOUR_PANEL_HOST:3007 --user admin --pass "$FARM_PANEL_PASS" %* --probe-account --pick-account
+node remote-capture.js %* --probe-account --pick-account
 exit /b %ERRORLEVEL%

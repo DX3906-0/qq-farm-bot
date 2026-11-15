@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import type { ActivityLabels } from './types'
 import type { HeluDrawReward, HeluSolarTerm, HeluSolarTerms } from '@/stores/activity'
+import { computed } from 'vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
+import { currentSolarTerm, orderSolarTerms, solarTermName, solarTermStatusLabel } from '@/config/solarTerms'
 
-defineProps<{
+const props = defineProps<{
   solarTerms?: HeluSolarTerms | null
   loading?: boolean
-  labels: ActivityLabels
+  labels: Pick<ActivityLabels, 'notesTab' | 'empty'>
 }>()
 
 defineEmits<{
@@ -24,6 +26,9 @@ const T = {
   claimReward: '\u9886\u53D6\u5956\u52B1',
   unavailable: '\u4E0D\u53EF\u9886\u53D6',
 }
+
+const currentTerm = computed(() => currentSolarTerm(props.solarTerms?.terms, props.solarTerms?.nowTime))
+const orderedTerms = computed(() => orderSolarTerms(props.solarTerms?.terms || [], props.solarTerms?.nowTime || 0))
 
 function formatTime(value?: number) {
   const raw = Number(value || 0)
@@ -66,7 +71,7 @@ function previewRewards(items?: HeluDrawReward[]) {
             {{ labels.notesTab }}
           </h2>
           <div class="mt-0.5 truncate text-xs text-gray-500 dark:text-gray-400">
-            {{ T.currentTerm }} {{ solarTerms?.currentTerm?.title || '-' }}
+            {{ T.currentTerm }} {{ solarTermName(currentTerm) }}
           </div>
         </div>
       </div>
@@ -89,16 +94,16 @@ function previewRewards(items?: HeluDrawReward[]) {
 
     <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(156px,1fr))] gap-3 p-4">
       <article
-        v-for="term in solarTerms.terms"
+        v-for="term in orderedTerms"
         :key="term.id"
         class="min-h-[216px] min-w-0 flex flex-col overflow-hidden border border-gray-200 rounded-lg bg-white shadow-sm dark:border-gray-700 dark:bg-gray-900/20"
       >
         <div class="relative grid h-24 place-items-center bg-gray-50 dark:bg-gray-900/40">
           <span
             class="absolute left-0 top-0 rounded-br-lg px-2 py-1 text-[10px] font-semibold"
-            :class="term.claimable ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300' : 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-300'"
+            :class="term.status === 4 ? 'bg-orange-50 text-orange-800 dark:bg-orange-900/30 dark:text-orange-200' : term.claimable ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300' : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'"
           >
-            {{ term.statusLabel }}
+            {{ solarTermStatusLabel(term) }}
           </span>
           <img
             v-if="term.rewards?.[0]?.image"
@@ -107,13 +112,13 @@ function previewRewards(items?: HeluDrawReward[]) {
             class="max-h-16 max-w-16 object-contain"
           >
           <div v-else class="grid h-14 w-14 place-items-center rounded-lg bg-white text-sm text-gray-500 font-semibold dark:bg-gray-800">
-            {{ (term.title || `${T.termPrefix}${term.id}`).slice(0, 1) }}
+            {{ solarTermName(term).slice(0, 1) }}
           </div>
         </div>
 
         <div class="min-h-[120px] flex flex-1 flex-col p-3">
           <div class="truncate text-sm text-gray-900 font-semibold dark:text-gray-100">
-            {{ term.title || `${T.termPrefix} ${term.id}` }}
+            {{ solarTermName(term) }}
           </div>
           <div class="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
             {{ formatTime(term.startTime) }} - {{ formatTime(term.endTime) }}
@@ -146,7 +151,7 @@ function previewRewards(items?: HeluDrawReward[]) {
             :disabled="!term.claimable"
             @click="$emit('claim', term)"
           >
-            {{ term.claimable ? T.claimReward : (term.statusLabel || T.unavailable) }}
+            {{ term.claimable ? T.claimReward : solarTermStatusLabel(term) }}
           </BaseButton>
         </div>
       </article>

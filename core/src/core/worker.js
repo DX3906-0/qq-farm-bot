@@ -51,7 +51,9 @@ const {
     syncFriendsFromGids,
     bootstrapQqFriendGids,
     fetchFriendsDogInfo,
-    delFriend
+    delFriend,
+    getFriendVisitSessionSnapshot,
+    recoverLegacyFriendVisit
 } = require('../services/friend');
 const { getInteractRecords } = require('../services/interact');
 const { processInviteCodes } = require('../services/invite');
@@ -81,7 +83,9 @@ const {
 const {
     recordOperation,
     initStatsWithPersistence,
-    saveStats
+    pauseExpObservations,
+    setExpConnectionReady,
+    resumeExpObservations
 } = require('../services/stats');
 const {
     initStatusBar,
@@ -108,10 +112,18 @@ const {
     getWs,
     getUserState,
     isConnected,
+    applyUserExpPatch,
     networkEvents,
     // ⭐ 亚健康退避闸门（2026-11-01）：传输层统一拦截业务请求
     setHealthBackoff,
-    clearHealthBackoff
+    clearHealthBackoff,
+    getDiagnosticSnapshot,
+    runWithRequestContext,
+    getRequestContext,
+    throwIfRequestCancelled,
+    isHealthBackoffActive,
+    getPendingWriteCount,
+    quiesceAndDrain
 } = require('../utils/network');
 const { loadProto } = require('../utils/proto');
 const { runWithRequestPriority } = require('../utils/request-priority');
@@ -183,7 +195,7 @@ setLogHook((tag, msg, isWarn, meta) => {
 
 setRecordGoldExpHook((gold, exp) => {
     const { recordGoldExp } = require('../services/stats');
-    recordGoldExp(gold, exp);
+    if (isRunning && loginReady && statsObservationsReady) recordGoldExp(gold, exp);
     sendToMaster({
         type: 'stat_update',
         data: { gold, exp }
@@ -194,6 +206,8 @@ setRecordGoldExpHook((gold, exp) => {
 
 let isRunning = false;
 let loginReady = false;
+let statsObservationsReady = false;
+let loginInitializationEpoch = 0;
 let appliedConfigRevision = 0;
 let unifiedSchedulerRunning = false;
 
@@ -226,6 +240,7 @@ let onDogSkillGiftPending = null;
 let harvestSellRunning = false;
 let onWsError = null;
 let onDisconnectHandler = null;
+let onExperienceObserved = null;
 // ===== 网关重连状态（2026-11-01）=====
 // 提升到模块级而非 startBot 内部：stopBot 需要能清理这些 timer，
 // 否则用户点「停止」后已排队的重连仍会跑一轮，表现为"停了又自己起来"。
@@ -239,8 +254,110 @@ let onConnectionDegraded = null;
 let onConnectionRecovered = null;
 let wsErrorHandledAt = 0;
 let lastDailyRunDate = '';
-let friendSyncPaused = false;
+let friendSyncPaused = 0;
 let starActivityClaimRunning = false;
+let onExpConnectionInterrupted = null;
+let statsConnectionEpoch = null;
+let statsConnectionGid = 0;
+let statsConnectionReadyAt = 0;
+let statsConnectionPaused = false;
+let gatewayHealthSnapshot = {};
+let workerStopPromise = null;
+const MAX_DRAIN_MS = 155000;
+
+const MAX_API_CONTROLS = 100;
+const apiControls = new Map();
+const SAFE_API_READS = new Set([
+    'getLands', 'getSeeds', 'getBag', 'getBagSeeds', 'getSkins', 'getPetOverview',
+    'getUnifiedHarvest', 'getFriends', 'getSchedulers', 'getTransportDiagnostics',
+]);
+
+function isSafeApiRead(msg) {
+    return msg.readOnly === true && Array.isArray(msg.args) && SAFE_API_READS.has(msg.method)
+        && (msg.method === 'getFriends'
+            ? msg.args.length <= 1 && (msg.args.length === 0 || msg.args[0] === false || msg.args[0] === undefined)
+            : msg.args.length === 0);
+}
+
+function apiErrorMeta(error) {
+    const meta = {};
+    for (const key of ['errorCode', 'stage', 'retryAfterMs', 'sent', 'resultState', 'outcomeUnknown',
+        'holdUntilTransportEpochChanged', 'friendGid', 'processing']) {
+        if (error?.[key] !== undefined) meta[key] = error[key];
+        else if (error?.errorMeta?.[key] !== undefined) meta[key] = error.errorMeta[key];
+    }
+    if (meta.outcomeUnknown === undefined && meta.resultState !== undefined) {
+        meta.outcomeUnknown = ['unknown', 'resultunknown'].includes(meta.resultState);
+    }
+    return meta;
+}
+
+function rejectApiCall(id, message, errorCode) {
+    sendToMaster({ type: 'api_response', id, result: null, error: message,
+        errorMeta: { errorCode, stage: 'worker', sent: false, resultState: 'not_sent', outcomeUnknown: false } });
+}
+
+function cancelApiReads() {
+    for (const control of apiControls.values()) {
+        if (control.readOnly) control.controller.abort();
+    }
+}
+
+async function dispatchApiCall(msg) {
+    if (apiControls.has(msg.id)) return rejectApiCall(msg.id, 'API 请求 ID 重复', 'API_DUPLICATE_ID');
+    if (apiControls.size >= MAX_API_CONTROLS) return rejectApiCall(msg.id, 'API 请求队列已满', 'API_QUEUE_FULL');
+    if (!isRunning && loginInitializationEpoch > 0) return rejectApiCall(msg.id, 'Worker 已停止', 'WORKER_STOPPED');
+    if (!Array.isArray(msg.args) || !Number.isFinite(msg.deadline)) {
+        return rejectApiCall(msg.id, 'API 请求参数或期限无效', 'API_INVALID_REQUEST');
+    }
+    const controller = new AbortController();
+    let complete;
+    const control = { controller, readOnly: isSafeApiRead(msg), timer: null,
+        completion: new Promise(resolve => { complete = resolve; }) };
+    apiControls.set(msg.id, control);
+    // 期限始终传给传输层；已发写不因页面取消中断，后续未发步骤仍受期限约束。
+    if (msg.deadline > Date.now()) {
+        control.timer = setTimeout(() => controller.abort(), Math.min(2147483647, msg.deadline - Date.now()));
+    }
+    try {
+        await runWithRequestContext({ signal: controller.signal, deadline: msg.deadline, priority: 'foreground' },
+            () => handleApiCall(msg));
+    } catch (error) {
+        sendToMaster({ type: 'api_response', id: msg.id, result: null,
+            error: typeof error === 'string' ? error : error.message, errorMeta: apiErrorMeta(error) });
+    } finally {
+        if (control.timer) clearTimeout(control.timer);
+        apiControls.delete(msg.id);
+        complete();
+    }
+}
+
+function getTransportDiagnostics() {
+    const native = getDiagnosticSnapshot?.() || {};
+    // 只复制已知诊断字段，禁止扩散连接状态中的凭据、token 或原始帧。
+    const pick = (source, keys) => Object.fromEntries(keys.filter(key =>
+        ['number', 'boolean'].includes(typeof source?.[key])).map(key => [key, source[key]]));
+    const queue = pick(native.queue, ['active', 'businessActive', 'criticalActive', 'queued', 'maxActive', 'maxCritical', 'maxQueued', 'closed']);
+    queue.byPriority = pick(native.queue?.byPriority, ['critical', 'foreground', 'farm', 'friend', 'background']);
+    queue.metrics = pick(native.queue?.metrics, ['acquired', 'released', 'cancelled', 'expired', 'rejected']);
+    const reads = pick(native.reads, ['inFlight', 'shareable', 'waiters', 'mutationGeneration', 'maxEntries', 'maxWaiters']);
+    reads.metrics = pick(native.reads?.metrics, ['started', 'shared', 'cancelled', 'invalidated', 'settled']);
+    const remainingMs = Math.max(Number(native.healthBackoff?.remainingMs) || 0, gatewayHealthBackoffUntil - Date.now(), 0);
+    const health = pick({ ...gatewayHealthSnapshot, ...(native.health || native.gatewayHealth || {}) }, [
+        'healthy', 'linkHealthy', 'businessHealthy', 'connectionDead', 'timeoutStreak', 'requestTimeoutStreak',
+        'lastInboundAt', 'inboundAgeMs', 'heartbeatAgeMs', 'aceAgeMs', 'businessAgeMs', 'businessReplyAgeMs',
+        'oldestPendingAgeMs', 'queueLength', 'pendingCount', 'businessPendingCount', 'criticalPendingCount',
+        'businessLimit', 'businessNoResponseSince', 'healthBackoffUntil', 'connectionEpoch',
+    ]);
+    return {
+        ...pick(native, ['connectionEpoch', 'connected', 'detached', 'pending', 'pendingWrites', 'quiescing', 'oldestPendingStartedAt']),
+        sessionEpoch: native.connectionEpoch, currentGid: Number(native.gid ?? getUserState().gid) || 0,
+        queue, reads, health, healthBackoff: { active: remainingMs > 0, remainingMs },
+        apiControls: { active: apiControls.size, maxActive: MAX_API_CONTROLS },
+        // 该快照只含有界本地状态，不发送Enter/Leave；真实原始阶段与本次请求发送状态分开。
+        friendVisit: getFriendVisitSessionSnapshot({ observeTransport: false }),
+    };
+}
 
 // 奶茶热销中（S4）声明式自动化：自动化 key → 服务层动作名。
 // 一个循环遍历即可，无需为每个开关写一个 runXxxAutoClaims 函数（对齐 404 的 AUTO_ACTIONS）。
@@ -622,6 +739,8 @@ async function runStarActivityAutoClaims() {
     const useRainPoemPrankEnabled = automation.rain_poem_prank_use === true;
     const unlockRainPoemResearchEnabled = automation.rain_poem_research_unlock === true;
     const claimSolarTermsEnabled = automation.solar_terms_claim === true;
+    const solarQuizNotifyEnabled = automation.solar_terms_quiz_notify === true;
+    const solarAutoAnswerEnabled = automation.solar_terms_auto_answer === true;
     const claimHonghuaShareEnabled = automation.honghua_share_claim === true;
     const claimHonghuaTiersEnabled = automation.honghua_tiers_claim === true;
     const donateHonghuaLoveEnabled = automation.honghua_love_donate === true;
@@ -656,7 +775,7 @@ async function runStarActivityAutoClaims() {
         && !useQixiDewEnabled && !buildQixiBridgeEnabled && !giftQixiSachetEnabled
         && !buyRainPoemBottleEnabled && !collectRainPoemWeatherEnabled && !useRainPoemSummonEnabled && !useRainPoemPrankEnabled
         && !unlockRainPoemResearchEnabled
-        && !claimSolarTermsEnabled
+        && !claimSolarTermsEnabled && !solarQuizNotifyEnabled && !solarAutoAnswerEnabled
         && !claimHonghuaShareEnabled && !claimHonghuaTiersEnabled && !donateHonghuaLoveEnabled
         && !petDiaryAnyEnabled
         && !wishShareAnyEnabled
@@ -681,7 +800,7 @@ async function runStarActivityAutoClaims() {
         } = require('../services/honghua-activity');
         // 心许千灯星垂野整棵活动树已于 2026-08-28 下线：仅在仍有依赖它的开关开启时才请求，
         // 否则每次轮询都白跑一次「活动已结束或不存在」的失败请求。
-        const needStarActivity = claimPassport || claimRecords || claimSolarTermsEnabled;
+        const needStarActivity = claimPassport || claimRecords;
         const activity = needStarActivity ? await getStarActivity() : null;
         if (claimPassport && Number(activity?.passport?.claimableLevels || 0) > 0) {
             try {
@@ -719,38 +838,69 @@ async function runStarActivityAutoClaims() {
             }
         }
 
-        // 节令小札（节令小礼）：有可领取节令时循环领取，直到无可领取为止
-        if (claimSolarTermsEnabled && Number(activity?.solarTerms?.claimableCount || 0) > 0) {
+        // One existing switch, one basic gift per event. V2 progress is primary;
+        // V1 is retained only for IDs not returned by V2. Read/write errors never
+        // trigger an alternate-service retry. No automatic quizzes/albums.
+        let solarObserved = null;
+        if (claimSolarTermsEnabled) {
             try {
+                const v2 = await require('../services/solar-calendar').autoClaimSolarGifts();
+                solarObserved = v2.calendar || null;
+                const claimedIds = new Set(v2.handledIds || []);
                 let claimed = 0;
-                for (let guard = 0; guard < 12; guard++) {
-                    const info = await getSolarTermsInfo();
-                    const next = (info.terms || []).find(t => t.claimable);
-                    if (!next) break;
-                    const r = await claimSolarTermsReward(next.id);
+                for (const result of v2.results || []) {
+                    if (result.resultState !== 'completed' || !result.rewards?.length) throw new Error('新版节令奖励尚未确认');
                     claimed++;
-                    log('活动', `自动领取节令小札：${  r?.term?.title || ''  }`, {
-                        module: 'activity',
-                        event: '节令小札自动领取',
-                        result: 'success',
-                        termId: next.id,
-                        title: r?.term?.title || ''
+                    log('活动', `自动领取节令小礼（V2）：${result.name}`, {
+                        module: 'activity', event: '节令小札自动领取', result: 'success',
+                        version: 2, termId: result.id, title: result.name, rewardCount: result.rewards.length
                     });
                 }
-                if (claimed > 0) {
-                    log('活动', `节令小札自动领取完成：共 ${  claimed  } 个`, {
-                        module: 'activity',
-                        event: '节令小札自动领取',
-                        result: 'ok',
-                        count: claimed
+                for (let guard = 0; guard < 12; guard++) {
+                    const info = await getSolarTermsInfo();
+                    const next = (info.terms || []).find(t => t.claimable && !claimedIds.has(t.id));
+                    if (!next) break;
+                    const result = await claimSolarTermsReward(next.id);
+                    claimedIds.add(next.id);
+                    const state = result.solarTerms?.terms?.find(term => term.id === next.id) || result.term;
+                    if (!result.rewards?.length || ![3, 5].includes(Number(state?.status))) throw new Error('旧版节令奖励或领取状态未确认');
+                    claimed++;
+                    log('活动', `自动领取节令小礼（旧版）：${result.term?.title || ''}`, {
+                        module: 'activity', event: '节令小札自动领取', result: 'success',
+                        version: 1, termId: next.id, title: result.term?.title || '', rewardCount: result.rewards.length
+                    });
+                }
+                if (claimed > 0) log('活动', `节令小礼自动领取完成：共 ${claimed} 个`, {
+                    module: 'activity', event: '节令小札自动领取', result: 'ok', count: claimed
+                });
+            } catch (err) {
+                log('活动', `自动领取节令小礼未完成: ${err.message}`, {
+                    module: 'activity', event: '节令小札自动领取', result: 'error',
+                    resultState: err.resultState || '', outcomeUnknown: err.outcomeUnknown === true
+                });
+            }
+        }
+
+        if (solarQuizNotifyEnabled || solarAutoAnswerEnabled) {
+            try {
+                const solar = require('../services/solar-calendar');
+                const calendar = solarObserved || await solar.getSolarCalendar({ priority: 'background' });
+                if (solarQuizNotifyEnabled) {
+                    const result = await require('../services/friend-alert').notifySolarQuiz({ accountId: calendar.accountId,
+                        accountName: getUserState()?.name || calendar.accountId, events: calendar.events });
+                    if (!result.skipped) log('活动', result.ok ? '节令答题微信订阅提醒已提交 PushPlus，送达待平台确认' : '节令答题微信订阅提醒未确认', {
+                        module: 'activity', event: 'solar_quiz_notify', result: result.resultState, channel: 'wechat',
+                        delivered: false, count: result.count, code: result.code, message: result.message || '', shortCode: result.shortCode || ''
+                    });
+                }
+                if (solarAutoAnswerEnabled) {
+                    const result = await solar.autoAnswerSolarQuizzes();
+                    if (result.skipped) log('活动', '节令自动答题已跳过：没有独立核验的可靠答案，保留唯一答题机会', {
+                        module: 'activity', event: 'solar_quiz_auto', result: 'skipped', reason: result.reason
                     });
                 }
             } catch (err) {
-                log('活动', `自动领取节令小札失败: ${  err.message}`, {
-                    module: 'activity',
-                    event: '节令小札自动领取',
-                    result: 'error'
-                });
+                log('活动', `节令问答检查未完成: ${err.message}`, { module: 'activity', event: 'solar_quiz_check', result: 'error' });
             }
         }
 
@@ -1141,7 +1291,7 @@ async function runStarActivityAutoClaims() {
         // 奶茶热销中（S4）声明式自动化：一个循环遍历 key→动作表，
         // 不新增 N 个 runXxxAutoClaims 函数。phase 前置条件 + 结算期白名单见 performMilkTeaOperation。
         if (milkTeaAnyEnabled) {
-            const { getMilkTeaActivity, operateMilkTeaActivity } = require('../services/activity');
+            const { getMilkTeaActivity, operateMilkTeaActivity, isMilkTeaGoldSeed } = require('../services/activity');
             // 结算期只允许领奖类操作（与 service 层白名单一致，双保险）
             const settlingAllowed = new Set(['milk_tea_cashier', 'milk_tea_wages', 'milk_tea_share_daily', 'milk_tea_share_rewards', 'milk_tea_fund_rewards']);
             // 无需开业即可执行的动作（与 service 层 MILK_TEA_NO_SHOP_REQUIRED 一致）
@@ -1184,13 +1334,13 @@ async function runStarActivityAutoClaims() {
                             .some(i => !(state.shop?.slots || []).some(s => s.slotIndex === i && s.endAt > nowSec));
                         if (!free) continue;
                     }
-                    if (action === 'seedBuy' && !(state.goods || []).some(g => g.categoryTag === 'seed' && g.unlocked && !g.paid && g.remaining > 0 && g.affordable)) continue;
+                    if (action === 'seedBuy' && !(state.goods || []).some(g => isMilkTeaGoldSeed(g) && g.unlocked && !g.paid && g.remaining > 0 && g.affordable)) continue;
                     if (action === 'shareDaily' && state.share?.daily?.claimed) continue;
                     if (action === 'shareRewards' && !(state.share?.milestones || []).some(t => t.claimable)) continue;
                     if (action === 'fundClaim' && (!state.fund?.unlocked || !(state.fund?.tiers || []).some(t => t.state === 2))) continue;
 
                     const params = {};
-                    if (action === 'seedBuy') params.count = 1;
+                    if (action === 'seedBuy') { params.count = 1; params.auto = true; }
                     if (action === 'craft') params.auto = true;
                     if (action === 'hire') {
                         params.autoSelect = true;
@@ -1747,9 +1897,12 @@ onMasterMessage(async (msg) => {
         if (msg.type === 'start') {
             await startBot(msg.config);
         } else if (msg.type === 'stop') {
-            await stopBot();
+            await stopBot({ preserveSession: msg.preserveSession === true });
         } else if (msg.type === 'api_call') {
-            handleApiCall(msg);
+            await dispatchApiCall(msg);
+        } else if (msg.type === 'api_cancel') {
+            const control = apiControls.get(msg.id);
+            if (control?.readOnly) control.controller.abort();
         } else if (msg.type === 'config_sync') {
             applyRuntimeConfig(msg.config || {}, true);
         }
@@ -1836,13 +1989,15 @@ function startBadHourlyTimer() {
 // ==================== 启动/停止 Bot ====================
 
 async function startBot(config) {
-    if (isRunning) return;
+    if (isRunning || workerStopPromise) return;
     isRunning = true;
 
     const { code, platform } = config;
+    const connectionOptions = { resumeSession: config.resumeSession === true };
     CONFIG.platform = platform || 'qq';
 
     await loadProto();
+    if (!isRunning || workerStopPromise) return;
     log('系统', '正在连接服务器...');
 
     applyRuntimeConfig(getConfigSnapshot(), false);
@@ -1891,31 +2046,48 @@ async function startBot(config) {
     networkEvents.on('heartbeat_dead', onHeartbeatDead);
 
     if (onCodeInvalid) networkEvents.off('code_invalid', onCodeInvalid);
-    onCodeInvalid = () => {
-        log('系统', 'Code 已失效，网关已停止自动重连，请重新抓包/扫码');
-        sendToMaster({ type: 'ws_reconnect_failed', reason: 'code_invalid' });
-        // Code 失效 PushPlus 告警（notifyCodeExpired 内按账号节流，避免刷屏）
+    onCodeInvalid = (payload = {}) => {
+        const continuingRecovery = payload.needRescan === true && payload.networkStopped === false;
+        log('系统', continuingRecovery
+            ? '微信授权恢复未成功，建议在面板重新扫码；网关仍按预算退避重试'
+            : CONFIG.platform === 'wx'
+                ? '微信登录授权不可用，请在面板重新扫码'
+                : 'Code 已失效，请重新更新 QQ 登录码');
+        sendToMaster({ type: 'ws_reconnect_failed', reason: payload.reason || 'code_invalid',
+            needRescan: payload.needRescan === true, networkStopped: payload.networkStopped });
+        // 告警只是建议，不声称网关已停，也不把微信扫码误报为抓包。
         notifyCodeExpired({
             accountId: process.env.FARM_ACCOUNT_ID || '',
             platform: CONFIG.platform || 'qq',
-            message: 'code_invalid',
+            message: continuingRecovery ? '微信授权恢复未成功，自动恢复仍按预算继续' : 'code_invalid',
+            needRescan: payload.needRescan === true,
+            networkStopped: payload.networkStopped,
         }).catch(() => { });
     };
     networkEvents.on('code_invalid', onCodeInvalid);
 
     // 网关亚健康退避：业务请求连续超时(未到判死)时暂停自动化发请求，给心跳让路自愈
     if (onConnectionDegraded) networkEvents.off('connection_degraded', onConnectionDegraded);
-    onConnectionDegraded = (payload) => {
-        const backoffMs = Number(payload && payload.backoffMs) || 60000;
-        gatewayHealthBackoffUntil = Date.now() + backoffMs;
-        gatewayHealthBackoffReason = `业务请求连续超时(${payload && payload.degradedStreak || 1})`;
+    onConnectionDegraded = (payload = {}) => {
+        if (!isRunning) return;
+        gatewayHealthSnapshot = { ...payload, businessHealthy: false };
+        pauseExpObservations(Date.now());
+        statsConnectionPaused = true;
+        const requestedMs = Number(payload.retryAfterMs ?? payload.backoffMs);
+        const backoffMs = Number.isFinite(requestedMs) && requestedMs > 0 ? requestedMs : 60000;
+        gatewayHealthBackoffUntil = Math.max(gatewayHealthBackoffUntil, Date.now() + backoffMs);
+        const timeoutStreak = Number(payload.timeoutStreak) || 0;
+        gatewayHealthBackoffReason = timeoutStreak > 0 ? `业务请求连续超时(${timeoutStreak})` : '业务请求连续超时';
         // ⭐ 2026-11-01：同步下推到 gateway-client 的传输层闸门。
         // 原来只有 runUnifiedTick 检查 gatewayHealthBackoffUntil，其余 10+ 个业务入口
         // 完全无视退避，继续往假死连接打请求 → pending 堆积 → 更快判死重连 → 消耗 Code → 1006。
         // 现在由 sendMsgAsync 统一拦截，才真正做到"暂停所有业务请求、只留心跳"。
         try {
             if (typeof setHealthBackoff === 'function') {
-                setHealthBackoff(backoffMs, gatewayHealthBackoffReason);
+                const known = getDiagnosticSnapshot().healthBackoff;
+                if (!known?.active || Number(known.remainingMs) < backoffMs) {
+                    setHealthBackoff(backoffMs, gatewayHealthBackoffReason);
+                }
             }
         } catch { /* 兼容直连模式：无此接口时静默跳过 */ }
         console.log(`[worker] 网关亚健康退避 ${Math.round(backoffMs / 1000)}s，暂停农场/帮助/偷菜给心跳让路`);
@@ -1927,14 +2099,36 @@ async function startBot(config) {
                 tag: '保活',
                 msg: `网关亚健康退避 ${Math.round(backoffMs / 1000)}s（连接假死前自动让路，避免判死掉线）`,
                 isWarn: true,
-                meta: { event: 'connection_degraded', backoffMs }
+                meta: { event: 'connection_degraded', backoffMs,
+                    retryAfterMs: Math.max(0, gatewayHealthBackoffUntil - Date.now()), timeoutStreak }
             }
         });
     };
     networkEvents.on('connection_degraded', onConnectionDegraded);
 
     if (onConnectionRecovered) networkEvents.off('connection_recovered', onConnectionRecovered);
-    onConnectionRecovered = () => {
+    onConnectionRecovered = (payload = {}) => {
+        if (!isRunning) return;
+        const at = payload.at === undefined ? Date.now() : Number(payload.at);
+        const diagnostic = getDiagnosticSnapshot?.() || {};
+        const epoch = diagnostic.connectionEpoch;
+        if (!Number.isFinite(at) || at < statsConnectionReadyAt || at > Date.now()
+            || (payload.connectionEpoch !== undefined
+                && payload.connectionEpoch !== (diagnostic.remoteGeneration ?? epoch))) return;
+        gatewayHealthSnapshot = { ...gatewayHealthSnapshot, ...payload };
+        if (payload.businessHealthy === false) {
+            const remaining = gatewayHealthBackoffUntil - Date.now();
+            const known = getDiagnosticSnapshot().healthBackoff;
+            if (remaining > 0 && !known?.active) setHealthBackoff(remaining, gatewayHealthBackoffReason);
+            return;
+        }
+        gatewayHealthSnapshot.businessHealthy = true;
+        if (loginReady && statsObservationsReady && isConnected()
+            && epoch === statsConnectionEpoch && Number(getUserState().gid) === statsConnectionGid
+            && (!statsConnectionPaused || resumeExpObservations?.(at) === true)) {
+            setExpConnectionReady(true, at);
+            statsConnectionPaused = false;
+        }
         if (gatewayHealthBackoffUntil) {
             gatewayHealthBackoffUntil = 0;
             gatewayHealthBackoffReason = '';
@@ -1942,16 +2136,36 @@ async function startBot(config) {
             // 必须先 clear 再往下走，否则 sendMsgAsync 仍会拒绝业务请求，
             // 出现"日志说已恢复、实际一个请求都发不出去"的假恢复（这类不一致排查成本极高）。
             try {
-                if (typeof clearHealthBackoff === 'function') clearHealthBackoff();
+                if (getDiagnosticSnapshot().healthBackoff?.active) clearHealthBackoff();
             } catch { /* 兼容直连模式 */ }
             log('系统', '网关亚健康已恢复，立即恢复自动化任务');
         }
     };
     networkEvents.on('connection_recovered', onConnectionRecovered);
 
+    if (onExpConnectionInterrupted) {
+        for (const event of ['heartbeat_timeout', 'connection_dead', 'heartbeat_dead']) {
+            networkEvents.off(event, onExpConnectionInterrupted);
+        }
+    }
+    onExpConnectionInterrupted = () => {
+        gatewayHealthSnapshot = { ...gatewayHealthSnapshot, linkHealthy: false };
+        pauseExpObservations(Date.now());
+        statsConnectionPaused = true;
+        cancelApiReads();
+    };
+    for (const event of ['heartbeat_timeout', 'connection_dead', 'heartbeat_dead']) {
+        networkEvents.on(event, onExpConnectionInterrupted);
+    }
+
     // 断线监听
     if (onDisconnectHandler) networkEvents.off('disconnect', onDisconnectHandler);
     onDisconnectHandler = () => {
+        loginInitializationEpoch += 1;
+        statsObservationsReady = false;
+        pauseExpObservations(Date.now());
+        statsConnectionPaused = true;
+        cancelApiReads();
         if (!loginReady) return;
         loginReady = false;
         log('系统', '连接断开，暂停自动化任务，等待重连...');
@@ -1970,6 +2184,33 @@ async function startBot(config) {
         scheduleGatewayReconnect();
     };
     networkEvents.on('disconnect', onDisconnectHandler);
+
+    if (onExperienceObserved) networkEvents.off('experienceObserved', onExperienceObserved);
+    onExperienceObserved = (observation) => {
+        if (!isRunning || !loginReady || !statsObservationsReady || !isConnected()) return;
+        const observedGid = Number(observation?.gid);
+        const currentGid = Number(getUserState().gid);
+        if (!Number.isSafeInteger(observedGid) || observedGid <= 0
+            || !Number.isSafeInteger(currentGid) || currentGid <= 0
+            || observedGid !== currentGid || currentGid !== statsConnectionGid
+            || getDiagnosticSnapshot().connectionEpoch !== statsConnectionEpoch) return;
+        if (statsConnectionPaused) {
+            const exp = Number(observation.exp);
+            const at = observation.at === undefined ? Date.now() : Number(observation.at);
+            if (!Number.isSafeInteger(exp) || exp < 0 || !Number.isFinite(at)
+                || at < statsConnectionReadyAt || at > Date.now()
+                || (observation.connectionEpoch !== undefined
+                    && observation.connectionEpoch !== (getDiagnosticSnapshot?.()?.remoteGeneration ?? statsConnectionEpoch))) return;
+            if (resumeExpObservations?.(at) !== true) return;
+            // 实际余额可确认收益，但业务未确认恢复时不能延伸在线闲置尾段。
+            if (gatewayHealthSnapshot.businessHealthy === true && !isHealthBackoffActive?.()) {
+                setExpConnectionReady(true, at);
+                statsConnectionPaused = false;
+            }
+        }
+        require('../services/stats').noteExpObservation(observation.exp, observation.at);
+    };
+    networkEvents.on('experienceObserved', onExperienceObserved);
 
     // ===== 网关重连（带退避 + 风暴防护）=====
     // 三道闸门，缺一不可（吸取 2026-09-02「单账号重连风暴拖垮同网关其它账号」的教训）：
@@ -2020,7 +2261,7 @@ async function startBot(config) {
                 if (gatewayReconnectWatchdog.unref) gatewayReconnectWatchdog.unref();
                 // 复用既有 connect：onReady 是完整的初始化入口（启调度器/注册定时器/syncStatus），
                 // connect 内部会 ensureSocket() 自动重建到网关的 socket 并重发 connect 帧。
-                connect(code, onReady);
+                connect(code, onReady, connectionOptions);
             } catch (e) {
                 gatewayReconnectInFlight = false;
                 clearReconnectTimer();
@@ -2033,6 +2274,17 @@ async function startBot(config) {
 
     // 登录成功回调
     const onReady = async () => {
+        if (!isRunning || workerStopPromise) return;
+        const initializationEpoch = ++loginInitializationEpoch;
+        const connectionEpoch = getDiagnosticSnapshot().connectionEpoch;
+        const readyGid = Number(getUserState().gid);
+        const isCurrentReady = () => isRunning && loginReady && isConnected()
+            && initializationEpoch === loginInitializationEpoch
+            && getDiagnosticSnapshot().connectionEpoch === connectionEpoch
+            && Number.isSafeInteger(readyGid) && readyGid > 0 && Number(getUserState().gid) === readyGid;
+        statsObservationsReady = false;
+        pauseExpObservations();
+        loginReady = false;
         // 重连成功：复位退避状态，本次会话不再受之前失败计数影响
         gatewayReconnectInFlight = false;
         gatewayReconnectAttempt = 0;
@@ -2086,6 +2338,7 @@ async function startBot(config) {
         // 否则前端「金豆」恒为 0。上游实现同样在此处同时读 1002/1005。
         try {
             const bag = await getBag();
+            if (!isCurrentReady()) return;
             const items = getBagItems(bag);
             let couponCount = 0;
             let goldBeanCount = 0;
@@ -2106,22 +2359,56 @@ async function startBot(config) {
             if (actMod.getQixiEndedState) actMod.getQixiEndedState().catch(() => null);
         } catch { /* 预热失败不影响启动 */ }
 
-        // 初始化统计数据（含金豆；initStatsWithPersistence 内部会恢复今日累计增益，
-        // 之后不再 resetSessionGains，避免重登后今日金币/点券/金豆加减归零）
+        // 保留网关会话时 Login 帧里的经验可能仍是第一次登录快照。
+        // 只查一次自己的生涯，确认当前经验，不用旧快照清空已保存的速率样本。
+        if (!isCurrentReady()) return;
         const userState = getUserState();
         const accountId = process.env.FARM_ACCOUNT_ID || '';
+        const loginGid = Number(userState.gid);
+        let snapshotOnly = connectionOptions.resumeSession === true || process.env.FARM_NETWORK_MODE === 'gateway';
+        if (snapshotOnly && loginGid > 0) {
+            try {
+                const current = await require('../services/career').getCareerInfo(loginGid);
+                if (!isCurrentReady()) return;
+                if (Number(current.gid) !== loginGid || current.expAvailable !== true
+                    || !Number.isSafeInteger(Number(current.exp)) || Number(current.exp) < 0) {
+                    throw new Error('当前经验响应未确认同账号经验');
+                }
+                if (typeof applyUserExpPatch === 'function') {
+                    applyUserExpPatch({ exp: Number(current.exp), level: Number(current.level) });
+                } else {
+                    userState.exp = Number(current.exp);
+                    if (Number(current.level) > 0) userState.level = Number(current.level);
+                }
+                snapshotOnly = false;
+            } catch (error) {
+                log('统计', `当前经验查询未完成，保留历史观测，不采用旧登录值重置: ${error.message}`, {
+                    module: 'stats', event: '经验基准', result: 'warning'
+                });
+            }
+        }
+        if (!isCurrentReady()) return;
         initStatsWithPersistence(
             accountId,
             Number(userState.gold || 0),
             Number(userState.exp || 0),
             Number(userState.coupon || 0),
-            Number(userState.goldBean || 0)
+            Number(userState.goldBean || 0),
+            { snapshotOnly }
         );
+        if (!isCurrentReady()) return;
+        statsConnectionEpoch = connectionEpoch;
+        statsConnectionGid = readyGid;
+        statsConnectionReadyAt = Date.now();
+        gatewayHealthSnapshot = { linkHealthy: true, connectionDead: false, connectionEpoch };
+        statsObservationsReady = true;
+        statsConnectionPaused = false;
+        setExpConnectionReady(true, Date.now());
 
         // 恢复今日已用捣乱预算（虫/草共享 99），跨 worker 重启保留，避免重连后预算归零叠加超放
         initLocalBadCount(accountId);
         // 恢复今日「帮忙经验已满」状态（跨重启保留），否则手动一键务农被服务端拒绝时
-        // 本地以为还能帮，只能给笼统提示（2026-10-22 希恩斯实测）
+        // 本地以为还能帮，只能给笼统提示（2026-10-22 账号乙实测）
         require('../services/friend-operation-limits').restoreHelpExpLimit(accountId);
 
         // QQ 好友列表接口（GetGameFriends）按「已知 GID」拉取：抓包登录只在抓包那一刻
@@ -2142,11 +2429,13 @@ async function startBot(config) {
 
         // 处理邀请码
         await processInviteCodes();
+        if (!isCurrentReady()) return;
 
         // 打开肥料礼包
         if (getAutomation().fertilizer_gift) {
             await openFertilizerGiftPacksSilently().catch(() => 0);
         }
+        if (!isCurrentReady()) return;
 
         // 延迟执行放虫放草
         workerScheduler.setTimeoutTask('bad_startup_once', 15000, async () => {
@@ -2183,82 +2472,128 @@ async function startBot(config) {
         syncStatus();
     };
 
-    // 建立连接
-    connect(code, onReady);
+    // 部署恢复只接回既有网关会话，不拿磁盘旧 Code 替换在线连接。
+    connect(code, onReady, connectionOptions);
 
     // 定期同步状态
     workerScheduler.setIntervalTask('status_sync', 5000, syncStatus, { preventOverlap: true });
 }
 
-async function stopBot() {
-    if (!isRunning) return exitWorker(0);
-    saveStats();
-    isRunning = false;
-    loginReady = false;
-    friendSyncPaused = false;
+async function stopBot({ preserveSession = false } = {}) {
+    if (workerStopPromise) return workerStopPromise;
+    workerStopPromise = (async () => {
+        const drainDeadline = Date.now() + MAX_DRAIN_MS;
+        loginInitializationEpoch += 1;
+        cancelApiReads();
+        statsObservationsReady = false;
+        statsConnectionPaused = true;
+        isRunning = false;
+        loginReady = false;
+        pauseExpObservations(Date.now());
 
-    stopUnifiedScheduler();
-    stopMysteryShopAutoBuyTimer();
-    stopEmailClaimTimer();
-    stopDailyReportTimer();
-    stopBadHourlyTimer();
-    stopPetFoodTimer();
+        stopUnifiedScheduler();
+        stopMysteryShopAutoBuyTimer();
+        stopEmailClaimTimer();
+        stopDailyReportTimer();
+        stopBadHourlyTimer();
+        stopPetFoodTimer();
 
-    networkEvents.off('kickout', onKickout);
-    networkEvents.off('reconnect_failed', onReconnectFailed);
-    if (onHeartbeatDead) {
-        networkEvents.off('heartbeat_dead', onHeartbeatDead);
-        onHeartbeatDead = null;
-    }
-    if (onCodeInvalid) {
-        networkEvents.off('code_invalid', onCodeInvalid);
-        onCodeInvalid = null;
-    }
-    if (onConnectionDegraded) {
-        networkEvents.off('connection_degraded', onConnectionDegraded);
-        onConnectionDegraded = null;
-    }
-    if (onConnectionRecovered) {
-        networkEvents.off('connection_recovered', onConnectionRecovered);
-        onConnectionRecovered = null;
-    }
+        networkEvents.off('kickout', onKickout);
+        networkEvents.off('reconnect_failed', onReconnectFailed);
+        if (onHeartbeatDead) {
+            networkEvents.off('heartbeat_dead', onHeartbeatDead);
+            onHeartbeatDead = null;
+        }
+        if (onCodeInvalid) {
+            networkEvents.off('code_invalid', onCodeInvalid);
+            onCodeInvalid = null;
+        }
+        if (onConnectionDegraded) {
+            networkEvents.off('connection_degraded', onConnectionDegraded);
+            onConnectionDegraded = null;
+        }
+        if (onConnectionRecovered) {
+            networkEvents.off('connection_recovered', onConnectionRecovered);
+            onConnectionRecovered = null;
+        }
+        if (onExpConnectionInterrupted) {
+            for (const event of ['heartbeat_timeout', 'connection_dead', 'heartbeat_dead']) {
+                networkEvents.off(event, onExpConnectionInterrupted);
+            }
+            onExpConnectionInterrupted = null;
+        }
 
-    if (onDisconnectHandler) {
-        networkEvents.off('disconnect', onDisconnectHandler);
-        onDisconnectHandler = null;
-    }
-    // ⭐ 2026-11-01：清掉已排队的网关重连 timer。
-    // 只靠 isRunning=false 不足以阻止：timer 已经排队，触发时会先检查 isRunning 没错，
-    // 但若不清理，用户"停止后马上启动"会遇上旧 timer 用旧 code 抢连，形成两条并行的重连。
-    if (gatewayReconnectTimer) { clearTimeout(gatewayReconnectTimer); gatewayReconnectTimer = null; }
-    if (gatewayReconnectWatchdog) { clearTimeout(gatewayReconnectWatchdog); gatewayReconnectWatchdog = null; }
-    gatewayReconnectInFlight = false;
-    gatewayReconnectAttempt = 0;
-    if (onWsError) {
-        networkEvents.off('ws_error', onWsError);
-        onWsError = null;
-    }
-    if (onSellGain) {
-        networkEvents.off('sell', onSellGain);
-        onSellGain = null;
-    }
-    if (onFarmHarvested) {
-        networkEvents.off('farmHarvested', onFarmHarvested);
-        onFarmHarvested = null;
-    }
+        if (onDisconnectHandler) {
+            networkEvents.off('disconnect', onDisconnectHandler);
+            onDisconnectHandler = null;
+        }
+        if (onExperienceObserved) {
+            networkEvents.off('experienceObserved', onExperienceObserved);
+            onExperienceObserved = null;
+        }
+        // 清掉旧网关重连计时器，排空期间不能创建新连接。
+        if (gatewayReconnectTimer) { clearTimeout(gatewayReconnectTimer); gatewayReconnectTimer = null; }
+        if (gatewayReconnectWatchdog) { clearTimeout(gatewayReconnectWatchdog); gatewayReconnectWatchdog = null; }
+        gatewayReconnectInFlight = false;
+        gatewayReconnectAttempt = 0;
+        if (onWsError) {
+            networkEvents.off('ws_error', onWsError);
+            onWsError = null;
+        }
+        if (onSellGain) {
+            networkEvents.off('sell', onSellGain);
+            onSellGain = null;
+        }
+        if (onFarmHarvested) {
+            networkEvents.off('farmHarvested', onFarmHarvested);
+            onFarmHarvested = null;
+        }
 
-    stopFarmCheckLoop();
-    stopFriendCheckLoop();
-    stopDailyRoutineTimer();
-    stopStarActivityClaimTimer();
-    cleanupTaskSystem();
-    workerScheduler.clearAll();
-    stopNetwork('账号停止');
+        stopFarmCheckLoop();
+        stopFriendCheckLoop();
+        stopDailyRoutineTimer();
+        stopStarActivityClaimTimer();
+        cleanupTaskSystem();
+        workerScheduler.clearAll();
+        sendToMaster({ type: 'worker_quiescing', pendingWrites: getPendingWriteCount?.() || 0, maxDrainMs: MAX_DRAIN_MS });
+        // 传输层覆盖后台自动化已发写，API completion 另等业务收尾；两者共用排空上限。
+        let capTimer;
+        const capped = new Promise(resolve => {
+            capTimer = setTimeout(() => resolve(false), Math.max(0, drainDeadline - Date.now()));
+        });
+        let drainError;
+        const draining = (async () => {
+            try {
+                const result = await quiesceAndDrain?.({ timeoutMs: Math.max(0, drainDeadline - Date.now()) });
+                if (result?.drained === false) drainError = new Error('传输层写请求未完成排空');
+            } catch (error) {
+                drainError = error;
+            }
+            await Promise.all([...apiControls.values()].filter(control => !control.readOnly).map(control => control.completion));
+            return !drainError;
+        })();
+        let completed = false;
+        try {
+            completed = await Promise.race([draining, capped]);
+        } catch (error) {
+            drainError = error;
+        } finally {
+            clearTimeout(capTimer);
+        }
+        if (!completed) {
+            sendToMaster({ type: 'worker_drain_incomplete', pendingWrites: getPendingWriteCount?.() || 0,
+                error: drainError?.message || 'Worker 写请求排空期限已到',
+                errorMeta: { errorCode: drainError?.errorCode || 'WORKER_DRAIN_TIMEOUT', stage: 'drain',
+                    sent: true, resultState: 'unknown', outcomeUnknown: true } });
+        }
+        stopNetwork(preserveSession ? '业务重载' : '账号停止', { preserveSession });
 
-    const ws = getWs();
-    if (ws) ws.close();
+        const ws = getWs();
+        if (ws) ws.close();
 
-    exitWorker(0);
+        exitWorker(0);
+    })();
+    return workerStopPromise;
 }
 
 // ==================== 踢下线处理 ====================
@@ -2290,23 +2625,28 @@ async function handleApiCall(msg) {
     const { id, method, args } = msg;
     let result = null;
     let error = null;
+    let errorMeta = null;
+    const checkReadCancelled = () => {
+        if (apiControls.get(id)?.readOnly) throwIfRequestCancelled(getRequestContext());
+    };
 
     // 好友同步操作期间暂停自动化
     const isFriendSync = method === 'getFriends' && args[0] === true
         || method === 'fetchFriendsDogInfo'
-        || method === 'syncFriendsFromGids';
+        || method === 'syncFriendsFromGids'
+        || method === 'recoverLegacyFriendVisit';
 
-    if (isFriendSync) {
-        friendSyncPaused = true;
-        log('系统', '好友同步操作开始，已暂停其他自动化进程', {
-            module: 'system', event: '好友同步暂停', method
-        });
-    }
+    if (isFriendSync) friendSyncPaused += 1;
 
     try {
+        throwIfRequestCancelled(getRequestContext());
+        if (isFriendSync) log('系统', '好友同步操作开始，已暂停其他自动化进程', {
+            module: 'system', event: '好友同步暂停', method
+        });
         switch (method) {
             case 'getLands':
                 result = await getLandsDetail();
+                checkReadCancelled();
                 if (result?.lands?.length) {
                     try {
                         const { isQixiDewApplied, clearQixiDewApplied, getQixiEndedStateCached } = require('../services/activity');
@@ -2331,12 +2671,16 @@ async function handleApiCall(msg) {
                         }
                     } catch { /* 活动模块异常时忽略灵露标记 */ }
                 }
+                checkReadCancelled();
                 try {
                     const { getOwnWeatherStatus } = require('../services/activity');
                     result.weather = await getOwnWeatherStatus();
                 } catch (weatherError) {
+                    checkReadCancelled();
+                    if (weatherError?.errorCode || weatherError?.errorMeta || weatherError?.stage) throw weatherError;
                     result.weather = null;
                 }
+                checkReadCancelled();
                 break;
             case 'getFriends':
                 result = await getFriendsList(args[0] === true);
@@ -2379,7 +2723,34 @@ async function handleApiCall(msg) {
                 result = await require('../services/skin').getSkinOverview();
                 break;
             case 'equipSkin':
-                result = await require('../services/skin').equipSkin(args[0], args[1]);
+                result = await require('../services/skin').equipSkin(args[0], args[1], args[2] || {});
+                break;
+            case 'getAvatarFrames':
+                result = await require('../services/avatar-frame').getAvatarFrames();
+                break;
+            case 'operateAvatarFrame':
+                result = await require('../services/avatar-frame').operateAvatarFrame(args[0], args[1] || {});
+                break;
+            case 'getSolarTermsInfo':
+                result = await require('../services/activity').getSolarTermsInfo();
+                break;
+            case 'getSolarCalendar':
+                result = await require('../services/solar-calendar').getSolarCalendar();
+                break;
+            case 'getSolarQuestion':
+                result = await require('../services/solar-calendar').getSolarQuestion(args[0]);
+                break;
+            case 'operateSolarCalendar':
+                result = await require('../services/solar-calendar').operateSolarCalendar(args[0], args[1] || {});
+                break;
+            case 'setItemsLocked':
+                result = await require('../services/warehouse').setItemsLocked(args[0], args[1]);
+                break;
+            case 'getOpenServerGifts':
+                result = await require('../services/openserver').getOpenServerGifts();
+                break;
+            case 'claimOpenServerGift':
+                result = await require('../services/openserver').claimOpenServerGift(args[0]);
                 break;
             case 'getBagSeeds':
                 result = await require('../services/warehouse').getBagSeeds();
@@ -2417,7 +2788,7 @@ async function handleApiCall(msg) {
                 const { useItem } = require('../services/warehouse');
                 const itemId = Number(args[0]) || 0;
                 const count = Math.max(1, Number(args[1]) || 1);
-                result = await useItem(itemId, count, []);
+                result = await useItem(itemId, count, [], args[2]);
                 break;
             }
             case 'sellItems': {
@@ -2496,7 +2867,10 @@ async function handleApiCall(msg) {
             }
             case 'getMallGoods': {
                 const { getMallGoodsList } = require('../services/mall');
-                result = await getMallGoodsList(0);
+                // slotType 由调用方传入（1=主商城 4=SVIP 5=限时）；缺省回落 1。
+                // 旧实现硬编码 0，拿到的列表与游戏内「商城」页不一致。
+                const slotType = Number.isFinite(Number(args[0])) ? Number(args[0]) : 1;
+                result = await getMallGoodsList(slotType);
                 break;
             }
             case 'buyMallGoods': {
@@ -2743,6 +3117,26 @@ async function handleApiCall(msg) {
                 result = await getIllustratedListV2(args[0], args[1]);
                 break;
             }
+            // ===== 藏品（collectionpb，2026-11-03 新增）=====
+            case 'getCollections': {
+                const { getCollections } = require('../services/collection');
+                result = await getCollections(args[0] || []);
+                break;
+            }
+            case 'upgradeCollection': {
+                const { upgradeCollection } = require('../services/collection');
+                result = await upgradeCollection(args[0], args[1], args[2] || {});
+                break;
+            }
+            case 'claimCollectionReward': {
+                const { claimCollectionReward } = require('../services/collection');
+                result = await claimCollectionReward(args[0]);
+                break;
+            }
+            case 'setCollectionDisplay': {
+                result = await require('../services/collection').setCollectionDisplay(args[0] || {});
+                break;
+            }
             case 'claimIllustratedRewards': {
                 const { claimAllRewardsV2 } = require('../services/illustrated');
                 result = await claimAllRewardsV2(args[0]);
@@ -2758,6 +3152,12 @@ async function handleApiCall(msg) {
                 break;
             case 'getSchedulers':
                 result = getSchedulerRegistrySnapshot();
+                break;
+            case 'getTransportDiagnostics':
+                result = getTransportDiagnostics();
+                break;
+            case 'recoverLegacyFriendVisit':
+                result = await recoverLegacyFriendVisit(args[0] || {});
                 break;
             case 'fertilizeLand': {
                 const landId = Number(args[0]) || 0;
@@ -2810,24 +3210,31 @@ async function handleApiCall(msg) {
                 break;
             }
             default:
-                error = 'Unknown method';
+                throw Object.assign(new Error('Unknown method'), {
+                    errorCode: 'API_UNKNOWN_METHOD', stage: 'worker', sent: false,
+                    resultState: 'not_sent', outcomeUnknown: false,
+                });
         }
+        checkReadCancelled();
     } catch (err) {
-        error = err.message;
-    }
-
-    if (isFriendSync) {
-        friendSyncPaused = false;
-        log('系统', '好友同步操作完成，已恢复自动化进程', {
-            module: 'system', event: '好友同步恢复', method
-        });
+        result = null;
+        error = typeof err === 'string' ? err : err.message;
+        errorMeta = apiErrorMeta(err);
+    } finally {
+        if (isFriendSync) {
+            friendSyncPaused -= 1;
+            if (friendSyncPaused === 0) log('系统', '好友同步操作完成，已恢复自动化进程', {
+                module: 'system', event: '好友同步恢复', method
+            });
+        }
     }
 
     sendToMaster({
         type: 'api_response',
         id,
         result,
-        error
+        error,
+        ...(errorMeta ? { errorMeta } : {}),
     });
 }
 
@@ -2938,15 +3345,18 @@ function syncStatus() {
     const userState = getUserState();
     const connected = !!(loginReady && isConnected());
 
+    const limits = require('../services/friend').getOperationLimits();
+    const connectionReady = connected && statsObservationsReady
+        && gatewayHealthSnapshot.businessHealthy !== false && !statsConnectionPaused
+        && gatewayHealthBackoffUntil <= Date.now() && !isHealthBackoffActive?.();
+    const stats = require('../services/stats').getStats(statusData, userState, connected, limits, { connectionReady });
+    stats.badTask = require('../services/friend').getBadTaskSnapshot?.() || null;
     let levelProgress = null;
-    const level = userState.level ?? statusData.level ?? 0;
-    const exp = userState.exp ?? statusData.exp ?? 0;
+    const level = stats.status.level;
+    const exp = stats.status.exp;
     if (level > 0 && exp >= 0) {
         levelProgress = getLevelExpProgress(level, exp);
     }
-
-    const limits = require('../services/friend').getOperationLimits();
-    const stats = require('../services/stats').getStats(statusData, userState, connected, limits);
 
     const now = Date.now();
     const farmRemainSec = Math.max(0, Math.ceil((Number(nextFarmRunAt || 0) - now) / 1000));
@@ -2963,6 +3373,7 @@ function syncStatus() {
     stats.preferredSeed = getPreferredSeed();
     stats.levelProgress = levelProgress;
     stats.configRevision = appliedConfigRevision;
+    stats.gatewayTransport = getTransportDiagnostics();
 
     const hash = JSON.stringify(stats);
     const now2 = Date.now();

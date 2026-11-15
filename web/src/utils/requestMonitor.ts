@@ -318,11 +318,31 @@ export function patchFetchMonitor() {
 
 const BADGE_ID = 'panel-req-monitor'
 const HIDE_KEY = 'panel_req_monitor_hidden'
+const ENABLE_KEY = 'panel_req_monitor_enabled'
+let badgeTimer: ReturnType<typeof setInterval> | undefined
+export function isRequestDiagnosticsEnabled() {
+  try { return localStorage.getItem(ENABLE_KEY) === '1' }
+  catch { return false }
+}
+export function setRequestDiagnosticsEnabled(enabled: boolean) {
+  try {
+    if (enabled) { localStorage.setItem(ENABLE_KEY, '1'); localStorage.removeItem(HIDE_KEY) }
+    else localStorage.removeItem(ENABLE_KEY)
+  }
+  catch { /* Diagnostic preferences are optional. */ }
+  if (enabled) mountMonitorBadge()
+  else {
+    document.getElementById(BADGE_ID)?.remove()
+    if (badgeTimer !== undefined) clearInterval(badgeTimer)
+    badgeTimer = undefined
+  }
+}
 
-/** 左下角小角标：只读显示，点击打印明细，× 隐藏（持久化） */
+/** Opt-in diagnostics only; ordinary pages never mount developer chrome. */
 export function mountMonitorBadge() {
+  if (!isRequestDiagnosticsEnabled()) return
   const attach = () => {
-    if (document.getElementById(BADGE_ID) || localStorage.getItem(HIDE_KEY) === '1')
+    if (!isRequestDiagnosticsEnabled() || document.getElementById(BADGE_ID) || localStorage.getItem(HIDE_KEY) === '1')
       return
 
     const box = document.createElement('div')
@@ -345,12 +365,11 @@ export function mountMonitorBadge() {
 
     const close = document.createElement('span')
     close.textContent = '×'
-    close.title = '隐藏（如需恢复：localStorage.removeItem("panel_req_monitor_hidden")）'
+    close.title = '关闭诊断角标，可在设置中重新开启'
     close.style.cssText = 'margin-left:6px;opacity:.65;padding:0 2px'
     close.addEventListener('click', (e) => {
       e.stopPropagation()
-      localStorage.setItem(HIDE_KEY, '1')
-      box.remove()
+      setRequestDiagnosticsEnabled(false)
     })
 
     box.addEventListener('click', () => dumpToConsole(60))
@@ -377,7 +396,8 @@ export function mountMonitorBadge() {
     }
 
     render()
-    setInterval(render, 1000)
+    if (badgeTimer !== undefined) clearInterval(badgeTimer)
+    badgeTimer = setInterval(render, 1000)
   }
 
   if (document.body)
@@ -392,5 +412,5 @@ export function installRequestMonitor(axiosInstance?: AxiosInstance) {
   if (axiosInstance)
     attachAxiosMonitor(axiosInstance)
   mountMonitorBadge()
-  ;(window as any).__reqMonitor = { summarize, dumpRecords, dumpToConsole, dumpTopUrls }
+  ;(window as any).__reqMonitor = { summarize, dumpRecords, dumpToConsole, dumpTopUrls, setEnabled: setRequestDiagnosticsEnabled }
 }

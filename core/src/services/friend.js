@@ -18,6 +18,7 @@ const {
   runBadOnceOnStartup,
   runBadHourly,
   isHelpExpLimitReached,
+  getBadTaskSnapshot,
   clearFriendsListCache,
   syncFriendsFromGids,
 } = require('./friend-orchestrator');
@@ -33,6 +34,7 @@ module.exports = {
   runGoldenBugPlacement,
   isHelpExpLimitReached,
   getOperationLimits,
+  getBadTaskSnapshot,
   getFriendsList,
   getFriendLandsDetail,
   doFriendOperation,
@@ -43,4 +45,8 @@ module.exports = {
   bootstrapQqFriendGids: friendApi.bootstrapQqFriendGids,
   fetchFriendsDogInfo,
   delFriend: friendApi.delFriend,
+  withFriendVisitSession: friendApi.withFriendVisitSession,
+  getFriendVisitSessionSnapshot: friendApi.getFriendVisitSessionSnapshot,
+  recoverLegacyFriendVisit: friendApi.recoverLegacyFriendVisit,
+  noteFriendGidDeleted: friendApi.noteFriendGidDeleted,
 };

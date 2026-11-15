@@ -68,17 +68,26 @@ function registerAdminSkinRoutes({
     if (!accountId)
       return;
 
-    const skinId = toNum(req.body && req.body.skinId);
-    const slotType = toNum(req.body && req.body.slotType);
-    if (skinId <= 0) {
-      return res.status(400).json({ ok: false, error: "无效的装扮ID" });
+    const body = req.body || {};
+    const skinId = toNum(body.skinId);
+    const slotType = toNum(body.slotType);
+    const expectedId = body.expectedEquippedSkinId;
+    if (typeof body.skinId === "boolean" || !Number.isSafeInteger(skinId) || skinId <= 0
+      || typeof body.slotType === "boolean" || !Number.isSafeInteger(slotType) || slotType <= 0) {
+      return res.status(400).json({ ok: false, error: "无效的装扮ID或槽位", sent: false, resultState: "not_sent" });
+    }
+    if (body.confirmed !== true || expectedId == null || typeof expectedId === "boolean" || expectedId === ""
+      || !Number.isSafeInteger(Number(expectedId)) || Number(expectedId) < 0) {
+      return res.status(400).json({ ok: false, error: "请刷新后确认当前外观与目标装扮", sent: false, resultState: "not_sent" });
     }
 
     try {
-      const result = await provider.equipSkin(accountId, skinId, slotType);
+      const result = await provider.equipSkin(accountId, skinId, slotType, {
+        confirmed: true, expectedEquippedSkinId: Number(expectedId),
+      });
       // 换装是用户可见的外观变化，实时日志留一条便于回溯
       try {
-        if (emitRealtimeLog) {
+        if (emitRealtimeLog && result?.resultState === "completed") {
           emitRealtimeLog({
             accountId,
             tag: "装扮",
@@ -91,7 +100,9 @@ function registerAdminSkinRoutes({
           });
         }
       }
-      catch { /* 实时日志失败不影响换装 */ }
+      catch (error) {
+        adminLogger.warn("换装结果已确认，实时日志输出失败", { accountId, error: error.message });
+      }
       res.json({ ok: true, data: result });
     }
     catch (error) {

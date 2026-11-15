@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, onScopeDispose, ref } from 'vue'
 import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import AutomationSettingsTab from '@/components/settings/AutomationSettingsTab.vue'
@@ -7,6 +7,10 @@ import StrategySettingsTab from '@/components/settings/StrategySettingsTab.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseSwitch from '@/components/ui/BaseSwitch.vue'
 import { defaultAutomation } from '@/composables/settings/useAutomationSettings'
+import { copySettings, createSettingsDraft, SETTINGS_DRAFT_REGISTRY, settingsFingerprint } from '@/composables/settings/useSettingsDraft'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { vSlidingTabs } from '@/composables/useContentMotion'
+import { useSettingStore } from '@/stores/setting'
 
 interface BagSeedItem {
   seedId: number
@@ -33,6 +37,10 @@ const emit = defineEmits<{
   notify: [message: string, type?: 'primary' | 'danger']
 }>()
 
+const settingStore = useSettingStore()
+const planReadError = ref('')
+const planUnknown = computed(() => settingStore.userMutationStates['default-plan'] === 'unknown')
+const planError = computed(() => settingStore.userMutationErrors['default-plan'] || planReadError.value)
 const activeSection = ref<'strategy' | 'automation'>('strategy')
 const loading = ref(false)
 const saving = ref(false)
@@ -47,6 +55,13 @@ let draggedSeedId: number | null = null
 const strategySettings = ref(createStrategySettings())
 const automationSettings = ref(createAutomationSettings())
 const autoCodeRefresh = ref({ enabled: false, intervalMinutes: 60 })
+let disposed = false
+const draft = createSettingsDraft(() => ({ enabled: enabled.value, strategy: strategySettings.value, automation: automationSettings.value, autoCode: autoCodeRefresh.value }),
+  value => { enabled.value = value.enabled; strategySettings.value = value.strategy; automationSettings.value = value.automation; autoCodeRefresh.value = value.autoCode })
+const registry = inject(SETTINGS_DRAFT_REGISTRY, null)
+const unregister = registry?.register('default-plan', { label: '默认方案', scope: 'page', dirty: () => draft.dirty.value,
+  saving: () => saving.value || importing.value || resetting.value, reset: draft.reset })
+onScopeDispose(() => { disposed = true; unregister?.(); draft.clear() })
 
 function createStrategySettings() {
   return {
@@ -66,7 +81,7 @@ function createStrategySettings() {
 function createAutomationSettings() {
   return {
     // 复用 composable 的默认值，避免第二份字面量与奶茶等新增字段不同步
-    automation: { ...defaultAutomation },
+    automation: copySettings(defaultAutomation),
     autoAcceptFriendMinLevel: 0,
     fertilizerBuyOrganicCount: 1,
     fertilizerBuyOrganicThresholdHours: 10,
@@ -122,86 +137,95 @@ const updatedAtLabel = computed(() => {
   return new Date(updatedAt.value).toLocaleString('zh-CN', { hour12: false })
 })
 
+function pickPlanConfig(config: any) {
+  const keys = ['automation', 'autoCodeRefresh', 'plantingStrategy', 'preferredSeedId', 'prioritize2x2Crops',
+    'intervals', 'friendQuietHours', 'stealDelaySeconds', 'plantOrderRandom', 'plantDelaySeconds',
+    'fertilizerBuyOrganicCount', 'fertilizerBuyOrganicThresholdHours', 'fertilizerBuyNormalCount',
+    'fertilizerBuyNormalThresholdHours', 'fertilizerBuyCheckIntervalMinutes', 'goldenBugKeepCount',
+    'goldenBugRoundLimit', 'friendBadTargets', 'autoAcceptFriendMinLevel', 'bagSeedPriority', 'bagSeedFallbackStrategy', 'capitalMode']
+  return Object.fromEntries(keys.filter(key => config[key] !== undefined).map(key => [key, config[key]]))
+}
 function buildConfig() {
-  return {
-    ...strategySettings.value,
-    ...automationSettings.value,
-    autoCodeRefresh: autoCodeRefresh.value,
-  }
+  const strategy = Object.fromEntries(Object.keys(createStrategySettings()).map(key => [key, (strategySettings.value as any)[key]]))
+  const automation = Object.fromEntries(Object.keys(createAutomationSettings()).map(key => [key, (automationSettings.value as any)[key]]))
+  return pickPlanConfig({ ...strategySettings.value, ...automationSettings.value, ...strategy, ...automation, autoCodeRefresh: autoCodeRefresh.value })
 }
 
+function rebasePlan(data: any, priorEditing: boolean) {
+  const previous = copySettings({ enabled: enabled.value, strategy: strategySettings.value, automation: automationSettings.value, autoCode: autoCodeRefresh.value })
+  applyPlan(data)
+  const confirmed = copySettings({ enabled: enabled.value, strategy: strategySettings.value, automation: automationSettings.value, autoCode: autoCodeRefresh.value })
+  if (priorEditing) { enabled.value = previous.enabled; strategySettings.value = previous.strategy; automationSettings.value = previous.automation; autoCodeRefresh.value = previous.autoCode }
+  draft.rebase(confirmed)
+}
 async function fetchPlan() {
+  if (LOCAL_UI_READONLY || disposed || loading.value) return
   loading.value = true
+  planReadError.value = ''
   try {
-    const { data } = await api.get('/api/settings/default-plan')
-    if (data?.ok)
-      applyPlan(data.data)
+    const result = await settingStore.fetchUserConfig('default-plan')
+    if (disposed) return
+    if (!result.ok) { planReadError.value = result.error || '默认方案加载失败'; return }
+    rebasePlan(result.config, draft.dirty.value)
   }
-  catch (error: any) {
-    emit('notify', error.response?.data?.error || '默认方案加载失败', 'danger')
-  }
-  finally {
-    loading.value = false
-  }
+  finally { loading.value = false }
 }
 
 async function savePlan() {
+  if (LOCAL_UI_READONLY || disposed || saving.value || importing.value || resetting.value || planUnknown.value || !draft.ready.value || planReadError.value) return
+  const intervals = strategySettings.value.intervals
+  if (intervals.farmMin > intervals.farmMax || intervals.helpMin > intervals.helpMax || intervals.stealMin > intervals.stealMax) { emit('notify', '巡查最小间隔不能大于最大间隔', 'danger'); return }
+  const submission = copySettings({ enabled: enabled.value, strategy: strategySettings.value, automation: automationSettings.value, autoCode: autoCodeRefresh.value })
+  const payload = copySettings({ enabled: enabled.value, config: buildConfig() })
   saving.value = true
   try {
-    const { data } = await api.put('/api/settings/default-plan', {
-      enabled: enabled.value,
-      config: buildConfig(),
-    })
-    if (!data?.ok)
-      throw new Error(data?.error || '保存失败')
-    applyPlan(data.data)
-    emit('notify', '默认方案已保存')
+    const result = await settingStore.saveUserConfig('default-plan', () => api.put('/api/settings/default-plan', payload), { exists: true, ...payload }, {})
+    if (disposed) return
+    if (!result.ok) { emit('notify', result.error || '默认方案保存未确认', 'danger'); return }
+    const changedAfterSubmit = settingsFingerprint(submission) !== settingsFingerprint({ enabled: enabled.value, strategy: strategySettings.value, automation: automationSettings.value, autoCode: autoCodeRefresh.value })
+    rebasePlan(result.config, changedAfterSubmit)
+    emit('notify', '默认方案已读回确认')
   }
-  catch (error: any) {
-    emit('notify', error.response?.data?.error || error.message || '默认方案保存失败', 'danger')
-  }
-  finally {
-    saving.value = false
-  }
+  finally { saving.value = false }
 }
 
 async function importCurrentAccount() {
-  if (!props.currentAccountId)
-    return
+  if (!props.currentAccountId || LOCAL_UI_READONLY || disposed || importing.value || saving.value || resetting.value || planUnknown.value || !draft.ready.value) return
+  const accountId = String(props.currentAccountId), accountName = props.currentAccountName || '当前账号'
   importing.value = true
   try {
-    const { data } = await api.post('/api/settings/default-plan/import', {}, {
-      headers: { 'x-account-id': String(props.currentAccountId) },
-    })
-    if (!data?.ok)
-      throw new Error(data?.error || '导入失败')
-    applyPlan(data.data)
-    emit('notify', `已从 ${props.currentAccountName || '当前账号'} 导入默认方案`)
+    const { data } = await api.get('/api/settings', { headers: { 'x-account-id': accountId } })
+    if (disposed || accountId !== String(props.currentAccountId)) return
+    if (data?.ok !== true || !data.data) { emit('notify', data?.error || '账号配置读取失败，未导入', 'danger'); return }
+    const before = await settingStore.fetchUserConfig('default-plan')
+    if (!before.ok || disposed || accountId !== String(props.currentAccountId)) return
+    const expected = { exists: true, enabled: before.config.enabled, config: pickPlanConfig(data.data) }
+    const result = await settingStore.saveUserConfig('default-plan', () => api.post('/api/settings/default-plan/import', {}, { headers: { 'x-account-id': accountId } }), expected, before.config)
+    if (disposed) return
+    if (!result.ok) { emit('notify', result.error || '导入结果未确认', 'danger'); return }
+    rebasePlan(result.config, false)
+    emit('notify', `已从 ${accountName} 导入并读回确认默认方案`)
   }
-  catch (error: any) {
-    emit('notify', error.response?.data?.error || error.message || '导入默认方案失败', 'danger')
-  }
-  finally {
-    importing.value = false
-  }
+  finally { importing.value = false }
 }
 
 async function resetPlan() {
+  if (LOCAL_UI_READONLY || disposed || resetting.value || saving.value || importing.value || planUnknown.value || !draft.ready.value) return
   resetting.value = true
   try {
-    const { data } = await api.post('/api/settings/default-plan/reset')
-    if (!data?.ok)
-      throw new Error(data?.error || '恢复失败')
-    applyPlan(data.data)
+    const { data } = await api.get('/api/settings/default')
+    if (disposed || data?.ok !== true || !data.data) { emit('notify', '系统默认配置读取失败，未发送恢复请求', 'danger'); return }
+    const before = await settingStore.fetchUserConfig('default-plan')
+    if (!before.ok || disposed) return
+    const expected = { exists: true, enabled: before.config.enabled, config: pickPlanConfig(data.data) }
+    const result = await settingStore.saveUserConfig('default-plan', () => api.post('/api/settings/default-plan/reset'), expected, before.config)
+    if (disposed) return
     showResetConfirm.value = false
-    emit('notify', '默认方案已恢复为系统默认')
+    if (!result.ok) { emit('notify', result.error || '恢复结果未确认', 'danger'); return }
+    rebasePlan(result.config, false)
+    emit('notify', '默认方案已恢复并读回确认')
   }
-  catch (error: any) {
-    emit('notify', error.response?.data?.error || error.message || '恢复系统默认失败', 'danger')
-  }
-  finally {
-    resetting.value = false
-  }
+  finally { resetting.value = false }
 }
 
 function resetBagSeedPriority() {
@@ -247,6 +271,10 @@ onMounted(fetchPlan)
 
 <template>
   <div class="space-y-4">
+    <p v-if="LOCAL_UI_READONLY" class="ui-notice">默认方案属于用户配置，本地只读浏览不读取或保存此配置。</p>
+    <p v-else-if="planError" class="ui-notice" role="status">{{ planError }}{{ planUnknown ? ' 保留修改，不重复保存、导入或恢复。' : '' }}</p>
+    <p v-else-if="draft.dirty.value" class="ui-notice" role="status">默认方案有未保存修改；离开前会提醒，不自动保存。</p>
+    <BaseButton v-if="!LOCAL_UI_READONLY && (planUnknown || planReadError || !draft.ready.value)" variant="outline" size="sm" :disabled="loading || saving || importing || resetting" @click="fetchPlan">读取核对</BaseButton>
     <div class="flex flex-col gap-3 border-b border-gray-200 pb-4 lg:flex-row lg:items-center lg:justify-between dark:border-gray-700">
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-3">
@@ -254,7 +282,7 @@ onMounted(fetchPlan)
             <span class="i-carbon-settings-adjust" />
             默认方案
           </h3>
-          <BaseSwitch v-model="enabled" label="新账号自动应用" />
+          <BaseSwitch v-model="enabled" label="新账号自动应用" :disabled="LOCAL_UI_READONLY || saving || importing || resetting || !draft.ready.value" />
         </div>
         <div class="mt-1 text-xs text-gray-500 dark:text-gray-400">
           {{ exists ? `最后保存：${updatedAtLabel}` : '尚未保存默认方案' }}
@@ -266,36 +294,32 @@ onMounted(fetchPlan)
           variant="outline"
           size="sm"
           :loading="importing"
-          :disabled="!currentAccountId || loading"
+          :disabled="!currentAccountId || loading || saving || resetting || planUnknown || !draft.ready.value || LOCAL_UI_READONLY"
           :title="currentAccountId ? `从 ${currentAccountName || '当前账号'} 导入` : '请先选择账号'"
           @click="importCurrentAccount"
         >
           <span class="i-carbon-document-import mr-1.5" />
           从当前账号导入
         </BaseButton>
-        <BaseButton variant="ghost" size="sm" :disabled="loading" @click="showResetConfirm = true">
+        <BaseButton variant="ghost" size="sm" :disabled="loading || saving || importing || resetting || planUnknown || !draft.ready.value || LOCAL_UI_READONLY" @click="showResetConfirm = true">
           <span class="i-carbon-reset mr-1.5" />
           恢复系统默认
         </BaseButton>
       </div>
     </div>
 
-    <div class="inline-flex border border-gray-200 rounded-lg bg-gray-50 p-1 dark:border-gray-700 dark:bg-gray-900/30">
+    <div v-if="!LOCAL_UI_READONLY" v-sliding-tabs class="ui-tabs" aria-label="默认方案分类">
       <button
         data-testid="default-plan-strategy-section"
-        class="flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
-        :class="activeSection === 'strategy' ? 'text-white' : 'text-gray-600 dark:text-gray-300'"
-        :style="activeSection === 'strategy' ? { background: 'var(--theme-primary)' } : {}"
+        class="ui-tab" :data-active="activeSection === 'strategy'"
         @click="activeSection = 'strategy'"
       >
-        <span class="i-fas-cogs" />
+        <span class="i-carbon-settings" />
         策略设置
       </button>
       <button
         data-testid="default-plan-automation-section"
-        class="flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
-        :class="activeSection === 'automation' ? 'text-white' : 'text-gray-600 dark:text-gray-300'"
-        :style="activeSection === 'automation' ? { background: 'var(--theme-primary)' } : {}"
+        class="ui-tab" :data-active="activeSection === 'automation'"
         @click="activeSection = 'automation'"
       >
         <span class="i-carbon-toggle-on" />
@@ -308,13 +332,17 @@ onMounted(fetchPlan)
       <div>加载中...</div>
     </div>
 
+    <div v-else-if="LOCAL_UI_READONLY" class="ui-empty-state"><span class="i-carbon-settings-adjust" aria-hidden="true" /><p>未读取用户默认方案</p><p>本地浏览只检查界面，不使用模拟账号或配置。</p></div>
+
+    <fieldset v-else class="m-0 min-w-0 border-0 p-0" :disabled="saving || importing || resetting || !draft.ready.value">
     <StrategySettingsTab
-      v-else-if="activeSection === 'strategy'"
+      v-if="activeSection === 'strategy'"
       v-model:settings="strategySettings"
-      current-account-id="default-plan"
+      :current-account-id="draft.ready.value && !planReadError ? 'default-plan' : ''"
       :current-account-name="null"
       :loading="false"
-      :saving="saving"
+      :saving="saving || importing || resetting"
+      :show-save="false"
       title="默认策略"
       save-label="保存默认方案"
       :planting-strategy-options="plantingStrategyOptions"
@@ -339,10 +367,11 @@ onMounted(fetchPlan)
       v-else
       v-model:settings="automationSettings"
       v-model:auto-code-refresh="autoCodeRefresh"
-      current-account-id="default-plan"
+      :current-account-id="draft.ready.value && !planReadError ? 'default-plan' : ''"
       :current-account-name="null"
       :loading="false"
-      :saving="saving"
+      :saving="saving || importing || resetting"
+      :show-save="false"
       :auto-code-refreshing="false"
       :show-run-auto-code-refresh="false"
       title="默认自动控制"
@@ -351,7 +380,12 @@ onMounted(fetchPlan)
       :fertilizer-options="fertilizerOptions"
       @save="savePlan"
     />
+    </fieldset>
 
+    <div v-if="!LOCAL_UI_READONLY && draft.ready.value" class="default-plan-savebar ui-subtle-panel">
+      <span>{{ saving || importing || resetting ? '请求处理中，请等待确认' : planUnknown ? '结果未确认，先读取核对' : draft.dirty.value ? '有未保存修改' : '当前无待保存修改' }}</span>
+      <BaseButton variant="primary" :loading="saving" :disabled="importing || resetting || planUnknown || !!planReadError || !draft.dirty.value" @click="savePlan">保存默认方案</BaseButton>
+    </div>
     <ConfirmModal
       :show="showResetConfirm"
       :loading="resetting"
@@ -364,3 +398,8 @@ onMounted(fetchPlan)
     />
   </div>
 </template>
+
+<style scoped>
+.default-plan-savebar { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; z-index: 10; border: 1px solid var(--surface-border-strong); border-radius: var(--radius-card); color: var(--theme-text); background: var(--surface-1); }
+.default-plan-savebar > span { font-size: 14px; }
+</style>

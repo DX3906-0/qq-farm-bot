@@ -1,16 +1,17 @@
 const protobuf = require('protobufjs');
 
 const { PlantPhase } = require('../config/config');
-const { getFriendBlacklist } = require('../models/store');
+const { getFriendBlacklist, isAutomationOn } = require('../models/store');
 const { getUserState, sendMsgAsync } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { log, logWarn, randomDelay, toLong, toNum } = require('../utils/utils');
 const {
-  enterFriendFarm,
+  withFriendVisitSession,
+  runFriendVisitOperation,
+  assertFriendVisitActive,
   extractReplyFriends,
   getAllFriends,
   handleFriendEnterError,
-  leaveFriendFarm,
 } = require('./friend-api');
 const { getCurrentPhase } = require('./farm-land-analyzer');
 const { getBag, getBagItems } = require('./warehouse');
@@ -81,10 +82,14 @@ function encodeRainPoemPrankRequest(gid, itemId, itemUid, landId) {
   return writer.finish();
 }
 
-async function putRainPoemPrankBottle(gid, itemId, itemUid, landId) {
-  const payload = encodeRainPoemPrankRequest(gid, itemId, itemUid, landId);
-  const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Use', payload);
-  return types.UseReply.decode(body);
+async function putRainPoemPrankBottle(gid, itemId, itemUid, landId, onSuccess = () => {}) {
+  return runFriendVisitOperation(gid, async () => {
+    const payload = encodeRainPoemPrankRequest(gid, itemId, itemUid, landId);
+    const { body } = await sendMsgAsync('gamepb.itempb.ItemService', 'Use', payload);
+    const reply = types.UseReply.decode(body);
+    onSuccess();
+    return reply;
+  });
 }
 
 /**
@@ -117,46 +122,39 @@ async function putRainPoemPrankOnFriend(friendGid, itemId, landId) {
   if (!friendGidNum || !itemIdNum) {
     return { ok: false, itemId: itemIdNum, itemUid: 0, friendGid: friendGidNum, landId: toNum(landId || 0), placed: false, error: '缺少好友或瓶类型' };
   }
-  let entered = false;
+  let itemUid = 0;
+  let effectiveLandId = toNum(landId || 0);
+  let placed = false;
   try {
-    const visit = await enterFriendFarm(friendGidNum);
-    entered = true;
-
-    const items = getBagItems(await getBag());
-    const itemUid = getPrankItemUid(items, itemIdNum);
-    if (!itemUid) {
-      return { ok: false, itemId: itemIdNum, itemUid: 0, friendGid: friendGidNum, landId: toNum(landId || 0), placed: false, error: '背包中无该使坏瓶' };
-    }
-
-    let effectiveLandId = toNum(landId || 0);
-    if (!effectiveLandId) {
-      const candidates = getPrankCandidateLandIds(visit?.lands, itemIdNum);
-      if (Array.isArray(candidates) && candidates.length > 0) effectiveLandId = toNum(candidates[0]);
-    }
-    if (!effectiveLandId) {
-      return { ok: false, itemId: itemIdNum, itemUid, friendGid: friendGidNum, landId: 0, placed: false, error: '该好友没有可投放使坏瓶的生长中地块' };
-    }
-
-    await putRainPoemPrankBottle(friendGidNum, itemIdNum, itemUid, effectiveLandId);
-    return {
-      ok: true,
-      itemId: itemIdNum,
-      itemUid,
-      friendGid: friendGidNum,
-      landId: effectiveLandId,
-      placed: true,
-    };
+    return await withFriendVisitSession(friendGidNum, async visit => {
+      const items = getBagItems(await runFriendVisitOperation(friendGidNum, () => getBag()));
+      itemUid = getPrankItemUid(items, itemIdNum);
+      if (!itemUid) {
+        return { ok: false, itemId: itemIdNum, itemUid: 0, friendGid: friendGidNum, landId: effectiveLandId, placed: false, error: '背包中无该使坏瓶' };
+      }
+      if (!effectiveLandId) effectiveLandId = toNum(getPrankCandidateLandIds(visit?.lands, itemIdNum)[0]);
+      if (!effectiveLandId) {
+        return { ok: false, itemId: itemIdNum, itemUid, friendGid: friendGidNum, landId: 0, placed: false, error: '该好友没有可投放使坏瓶的生长中地块' };
+      }
+      await putRainPoemPrankBottle(friendGidNum, itemIdNum, itemUid, effectiveLandId, () => { placed = true; });
+      return { ok: true, itemId: itemIdNum, itemUid, friendGid: friendGidNum, landId: effectiveLandId, placed: true };
+    });
   } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    return { ok: false, itemId: itemIdNum, itemUid: 0, friendGid: friendGidNum, landId: toNum(landId || 0), placed: false, error: msg };
-  } finally {
-    if (entered) {
-      try { await leaveFriendFarm(friendGidNum); } catch (_e) { /* ignore */ }
-    }
+    const handled = err.friendEnterHandling || (err.visitStage === 'enter'
+      ? handleFriendEnterError(friendGidNum, `GID:${friendGidNum}`, err) : null);
+    const unknown = err.resultState === 'unknown' || err.outcomeUnknown === true || err.holdUntilTransportEpochChanged === true;
+    const skipped = !unknown && (handled?.handled || isRainPoemPrankAlreadyActiveError(err));
+    logWarn('活动', `给 GID:${friendGidNum} 使用使坏瓶${skipped ? '跳过' : '失败'}: ${err.message}`, {
+      module: 'activity', event: '雨落成诗手动使坏', result: skipped ? 'skipped' : unknown ? 'unknown' : 'failed',
+      friendGid: friendGidNum, itemId: itemIdNum, landId: effectiveLandId, placed,
+    });
+    return { ok: false, failed: !skipped, skipped: !!skipped, unknown, itemId: itemIdNum, itemUid,
+      friendGid: friendGidNum, landId: effectiveLandId, placed, error: err.message, errorMeta: { ...err } };
   }
 }
 
 async function runRainPoemPrankPlacement() {
+  if (!isAutomationOn('rain_poem_prank_use')) return { skipped: true, reason: 'automation_disabled' };
   const userState = getUserState();
   const myGid = toNum(userState?.gid);
   if (!myGid) throw new Error('尚未获取当前账号 GID');
@@ -184,47 +182,43 @@ async function runRainPoemPrankPlacement() {
     .sort((a, b) => b.level - a.level);
 
   const placed = { frog: 0, cloud: 0 };
-  let consecutiveFailures = 0;
   let activeFriends = 0;
+  let skippedFriends = 0;
   for (const friend of friends) {
-    if (queue.length === 0 || consecutiveFailures >= 3) break;
-    let entered = false;
+    if (queue.length === 0 || !isAutomationOn('rain_poem_prank_use')) break;
     try {
-      const visit = await enterFriendFarm(friend.gid);
-      entered = true;
-      for (let index = 0; index < queue.length;) {
-        const { itemId, itemUid } = queue[index];
-        const landId = getPrankCandidateLandIds(visit?.lands, itemId)[0];
-        if (!landId) {
-          index++;
-          continue;
-        }
-        try {
-          await putRainPoemPrankBottle(friend.gid, itemId, itemUid, landId);
-          queue.splice(index, 1);
-          if (itemId === RAIN_POEM_FROG_BOTTLE_ITEM_ID) placed.frog++;
-          else placed.cloud++;
-          consecutiveFailures = 0;
-          break;
-        } catch (err) {
-          if (isRainPoemPrankAlreadyActiveError(err)) {
-            activeFriends++;
-            break;
-          }
-          consecutiveFailures++;
-          logWarn('活动', `给 ${friend.name || `GID:${friend.gid}`} 使用使坏瓶失败: ${err.message}`, {
-            module: 'activity', event: '雨落成诗自动使坏', result: 'error',
-            friendGid: friend.gid, landId, itemId,
+      await withFriendVisitSession(friend.gid, async visit => {
+        for (let index = 0; index < queue.length; index++) {
+          assertFriendVisitActive(friend.gid);
+          if (!isAutomationOn('rain_poem_prank_use')) break;
+          const { itemId, itemUid } = queue[index];
+          const landId = getPrankCandidateLandIds(visit?.lands, itemId)[0];
+          if (!landId) continue;
+          await putRainPoemPrankBottle(friend.gid, itemId, itemUid, landId, () => {
+            queue.splice(index, 1);
+            if (itemId === RAIN_POEM_FROG_BOTTLE_ITEM_ID) placed.frog++;
+            else placed.cloud++;
           });
           break;
         }
-      }
+      });
     } catch (err) {
-      handleFriendEnterError(friend.gid, friend.name || `GID:${friend.gid}`, err);
-    } finally {
-      if (entered) {
-        try { await leaveFriendFarm(friend.gid); } catch { }
+      const handled = err.friendEnterHandling || (err.visitStage === 'enter'
+        ? handleFriendEnterError(friend.gid, friend.name || `GID:${friend.gid}`, err) : null);
+      const unknown = err.resultState === 'unknown' || err.outcomeUnknown === true || err.holdUntilTransportEpochChanged === true;
+      if (!unknown && handled?.handled) {
+        skippedFriends++;
+        continue;
       }
+      if (!unknown && isRainPoemPrankAlreadyActiveError(err)) {
+        activeFriends++;
+        continue;
+      }
+      logWarn('活动', `给 ${friend.name || `GID:${friend.gid}`} 使用使坏瓶失败: ${err.message}`, {
+        module: 'activity', event: '雨落成诗自动使坏', result: unknown ? 'unknown' : 'failed', friendGid: friend.gid,
+      });
+      return { ok: false, failed: true, unknown, placed: placed.frog + placed.cloud, ...placed,
+        inventory, remaining: queue.length, activeFriends, error: err.message, errorMeta: { ...err } };
     }
     if (queue.length > 0) await randomDelay(500, 1500);
   }
@@ -235,7 +229,8 @@ async function runRainPoemPrankPlacement() {
       module: 'activity', event: '雨落成诗自动使坏', result: 'ok', count: total,
     });
   }
-  return { placed: total, ...placed, inventory, remaining: queue.length, activeFriends };
+  return { placed: total, ...placed, inventory, remaining: queue.length, activeFriends, skippedFriends,
+    skipped: total === 0 && (activeFriends > 0 || skippedFriends > 0) };
 }
 
 module.exports = {

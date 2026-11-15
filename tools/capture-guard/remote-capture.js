@@ -11,7 +11,7 @@
  *      否则添加新账号；最后恢复原始系统代理
  *
  * 用法：
- *   node remote-capture.js --panel http://YOUR_PANEL_HOST:3007 --user admin --pass $FARM_PANEL_PASS
+ *   node remote-capture.js --panel http://192.0.2.1:3007 --user admin --pass 密码
  *   node remote-capture.js --cert-only --panel ...   # 仅下载服务器 CA 证书
  *
  * 参数均可省略：首次填写（或命令行传入）后会保存到本目录
@@ -259,8 +259,8 @@ function probeAccountWindow(openTarget) {
  * 让脚本监控 QQ "选择账号" 弹窗并自动点确定。
  * 优先 OCR 模式：把目标账号的 QQ 号（gid）传给 pick-account.py --qq-id，
  * 它会截图选号框 + Windows OCR 读取每行文本，精确点显示该 QQ 号的那一行
- * —— 不依赖行顺序假设（历史事故：行顺序变化导致罗辑的 Code 写到了
- * 比尔希恩斯头上）。OCR 不可用时退回按 id 推导的行号模式。
+ * —— 不依赖行顺序假设（历史事故：行顺序变化导致账号甲的 Code 写到了
+ * 示例账号乙头上）。OCR 不可用时退回按 id 推导的行号模式。
  * 非阻塞，不打断抓码主流程。
  */
 function pickAccountWindow(targetAccount) {
@@ -270,11 +270,11 @@ function pickAccountWindow(targetAccount) {
     return;
   }
   const gid = targetAccount && targetAccount.gid ? String(targetAccount.gid) : '';
-  // 关键：面板 gid 是农场游戏 ID，不是选号框上显示的 QQ 号（实测 gid=1000000003
+  // 关键：面板 gid 是农场游戏 ID，不是选号框上显示的 QQ 号（实测 gid=1000000002
   // 的账号在选号框显示 1000000002）。所以 gid 经常匹配不到任何行，昵称关键词才是
   // 首选（CJK OCR 对大字远比小字号数字可靠）。
   const nick = targetAccount ? String(targetAccount.nick || targetAccount.name || '') : '';
-  // 历史默认映射（QQ NT 弹窗顺序: 第一行=比尔希恩斯 id=10, 第二行=罗輯 id=1），
+  // 历史默认映射（QQ NT 弹窗顺序: 第一行=示例账号乙 id=10, 第二行=账号甲 id=1），
   // 仅作 OCR 失败时的兜底。
   const tid = targetAccount ? targetAccount.id : null;
   const row = (tid === 10) ? 1 : 2;
@@ -284,7 +284,7 @@ function pickAccountWindow(targetAccount) {
     try {
       const outFile = path.join(__dirname, '_pick-result.txt');
       // Prefer the managed Python known in this environment; fall back to PATH.
-      let pythonExe = 'C:\\Users\\HP\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe';
+      let pythonExe = process.env.FARM_PYTHON || 'python';
       if (!fs.existsSync(pythonExe)) {
         pythonExe = 'python';
       }
@@ -510,7 +510,7 @@ async function main() {
   }
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-  const panelUrl = String(args.panel || saved.panel || await ask(rl, '面板地址（如 http://YOUR_PANEL_HOST:3007）: ')).replace(/\/+$/, '');
+  const panelUrl = String(args.panel || saved.panel || await ask(rl, '面板地址（如 http://192.0.2.1:3007）: ')).replace(/\/+$/, '');
   const username = args.user || saved.user || await ask(rl, '用户名: ');
   const password = args.pass || saved.pass || await ask(rl, '密码: ');
   rl.close();
@@ -672,7 +672,7 @@ async function main() {
       //       → 保活验证期内窗口不被 Chromium 遮挡降级 → 停靠到屏幕边缘露一角。
       setTimeout(() => {
         try {
-          const pythonExe = 'C:\\Users\\HP\\.workbuddy\\binaries\\python\\versions\\3.13.12\\python.exe';
+          const pythonExe = process.env.FARM_PYTHON || 'python';
           const activatePy = path.join(__dirname, 'activate-farm.py');
           if (fs.existsSync(activatePy)) {
             console.log('[i] --activate-farm: 已启动后台加载激活器(等待农场窗口出现, 最长90s)...');

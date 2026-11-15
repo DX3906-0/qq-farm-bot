@@ -14,7 +14,7 @@ const { generateMachineId, getMachineIdDisplay } = require('../utils/machine-id'
 const { getDataFile, ensureDataDir } = require('../config/runtime-paths');
 const { LICENSE_ENABLED } = require('../config/license-config');
 
-// 许可证密钥种子（从环境变量读取；未配置则许可证校验默认不通过）
+// 许可证密钥种子
 const LICENSE_SECRET = process.env.LICENSE_SECRET || '';
 
 // 许可证文件路径
@@ -53,6 +53,7 @@ function generateLicenseKey(machineId, secret = LICENSE_SECRET) {
  * 验证许可证密钥是否有效
  */
 function verifyLicenseKey(machineId, licenseKey, secret = LICENSE_SECRET) {
+    if (!secret) return false;
   const expectedKey = generateLicenseKey(machineId, secret);
   const normalizedInput = licenseKey.replace(/-/g, '').toUpperCase();
   return expectedKey.replace(/-/g, '') === normalizedInput;

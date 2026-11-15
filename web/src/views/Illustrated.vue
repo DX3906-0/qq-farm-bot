@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, useId, watch } from 'vue'
+import { moveSlidingTabFocus, useSlidingTabs, vSlidingTabs } from '@/composables/useContentMotion'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import IllustratedItemCard from '@/components/illustrated/IllustratedItemCard.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -46,11 +47,10 @@ const filterTabs: Array<{ value: 'all' | 'unlocked' | 'locked', label: string }>
   { value: 'locked', label: '未解锁' },
 ]
 
-function segmentedButtonClasses(active: boolean) {
-  return active
-    ? 'text-white shadow-sm'
-    : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700'
-}
+const illustratedContent = ref<HTMLElement | null>(null)
+const illustratedPanelId = useId()
+const { select: selectIllustratedType, selected: selectedIllustratedType } = useSlidingTabs(illustratedType, () => illustratedContent.value, () => typeTabs.map(item => item.value), () => currentAccountId.value)
+const { select: selectIllustratedFilter, selected: selectedIllustratedFilter } = useSlidingTabs(filter, () => illustratedContent.value, () => filterTabs.map(item => item.value), () => `${currentAccountId.value}:${illustratedType.value}`)
 
 function getUnlockHint(item: any) {
   if (item.unlocked)
@@ -195,28 +195,40 @@ onMounted(() => {
         </div>
 
         <div class="flex shrink-0 flex-wrap items-center gap-2">
-          <div class="h-9 inline-flex overflow-hidden border border-gray-200 rounded-lg bg-white p-0.5 dark:border-gray-700 dark:bg-gray-800">
+          <div v-sliding-tabs class="ui-tabs !gap-1 !rounded-lg !p-1" role="tablist" aria-label="图鉴分类">
             <button
               v-for="item in typeTabs"
+              :id="`${illustratedPanelId}-type-${item.value}`"
               :key="item.value"
-              class="min-w-20 rounded-md px-3 text-sm font-medium transition"
-              :class="segmentedButtonClasses(illustratedType === item.value)"
-              :style="illustratedType === item.value ? { backgroundColor: 'var(--theme-primary)' } : {}"
-              @click="illustratedType = item.value"
+              type="button"
+              class="ui-tab min-w-20 !min-h-8 !px-3 !py-1 !text-sm"
+              role="tab"
+              :data-active="selectedIllustratedType === item.value"
+              :aria-selected="selectedIllustratedType === item.value"
+              :aria-controls="`${illustratedPanelId}-content`"
+              :tabindex="selectedIllustratedType === item.value ? 0 : -1"
+              @click="selectIllustratedType(item.value)"
+              @keydown="moveSlidingTabFocus"
             >
-              {{ item.label }}
+              <span class="ui-tab-label">{{ item.label }}</span>
             </button>
           </div>
-          <div class="h-9 inline-flex overflow-hidden border border-gray-200 rounded-lg bg-white p-0.5 dark:border-gray-700 dark:bg-gray-800">
+          <div v-sliding-tabs class="ui-tabs !gap-1 !rounded-lg !p-1" role="tablist" aria-label="图鉴解锁筛选">
             <button
               v-for="item in filterTabs"
+              :id="`${illustratedPanelId}-filter-${item.value}`"
               :key="item.value"
-              class="min-w-16 rounded-md px-3 text-sm font-medium transition"
-              :class="segmentedButtonClasses(filter === item.value)"
-              :style="filter === item.value ? { backgroundColor: 'var(--theme-primary)' } : {}"
-              @click="filter = item.value"
+              type="button"
+              class="ui-tab min-w-16 !min-h-8 !px-3 !py-1 !text-sm"
+              role="tab"
+              :data-active="selectedIllustratedFilter === item.value"
+              :aria-selected="selectedIllustratedFilter === item.value"
+              :aria-controls="`${illustratedPanelId}-content`"
+              :tabindex="selectedIllustratedFilter === item.value ? 0 : -1"
+              @click="selectIllustratedFilter(item.value)"
+              @keydown="moveSlidingTabFocus"
             >
-              {{ item.label }}
+              <span class="ui-tab-label">{{ item.label }}</span>
             </button>
           </div>
           <BaseButton class="w-28" variant="primary" :loading="buying" :disabled="summary.canBuy <= 0" @click="confirmBuyAll">
@@ -228,6 +240,8 @@ onMounted(() => {
         </div>
       </div>
 
+      <div :id="`${illustratedPanelId}-content`" ref="illustratedContent" class="tab-motion-viewport" role="tabpanel" :aria-labelledby="`${illustratedPanelId}-type-${illustratedType} ${illustratedPanelId}-filter-${filter}`" :aria-busy="loading">
+        <div data-motion-entry>
       <div v-if="error" class="mb-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-400">
         {{ error }}
       </div>
@@ -256,6 +270,8 @@ onMounted(() => {
             :unlock-hint="getUnlockHint(item)"
             @buy="confirmBuySeed"
           />
+        </div>
+      </div>
         </div>
       </div>
     </div>

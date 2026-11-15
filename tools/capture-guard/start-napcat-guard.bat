@@ -5,9 +5,11 @@ rem  Start the NapCat code guard in the background
 rem =========================================
 cd /d "%~dp0"
 
-set PY=C:\Users\HP\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe
+if not defined FARM_PYTHONW set FARM_PYTHONW=pythonw
+set "PY=%FARM_PYTHONW%"
 
-if not exist "%PY%" goto nopy
+where "%PY%" >nul 2>nul
+if errorlevel 1 goto nopy
 
 echo Starting napcat-code-guard daemon ...
 start "" "%PY%" "napcat-code-guard.py"
