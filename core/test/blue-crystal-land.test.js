@@ -1266,7 +1266,7 @@ print(json.dumps({'ok':True,'unchangedGitBlob':True}))
   assert.equal(JSON.parse(execFileSync(python, ['-c', script, image], { encoding: 'utf8', timeout: 15000, windowsHide: true })).ok, true);
 });
 
-test('蓝晶图片双根纯静态发布不触发重载，check/accept不发游戏RPC', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('蓝晶图片双根纯静态发布不触发重载，check/accept不发游戏RPC', () => {
   const { execFileSync } = require('node:child_process');
   const python = process.env.FARM_DEPLOY_PYTHON || (process.platform === 'win32' ? 'C:/Program Files/Python310/python.exe' : 'python3');
   const root = path.join(__dirname, '../..');
@@ -1280,14 +1280,14 @@ constants = {}
 for node in tree.body:
     if isinstance(node, ast.Assign):
         for target in node.targets:
-            if isinstance(target, ast.Name) and target.id in {'RELEASE_STATIC_ALLOWLIST', 'RELEASE_BACKEND_ALLOWLIST', 'RELEASE_INSPECT_SCRIPT', 'RELEASE_INSTALL_SCRIPT'}:
+            if isinstance(target, ast.Name) and target.id in {'RELEASE_STATIC_ALLOWLIST', 'RELEASE_BACKEND_ALLOWLIST', 'RELEASE_INSPECT_SCRIPT', 'RELEASE_INSTALL_SCRIPT', 'RELEASE_COMBINED_MIGRATION'}:
                 constants[target.id] = ast.literal_eval(node.value)
 assert constants['RELEASE_STATIC_ALLOWLIST'] == {'core/src/gameConfig/land_images/land_valid6.png', 'core/src/gameConfig/land_images/land_valid6_2x2.png', 'core/src/gameConfig/land_images/sources.json'}
-functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {'load_release_manifest', 'deploy_release', 'inspect_release'}]
+functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {'registered_release_artwork', 'load_release_manifest', 'deploy_release', 'inspect_release'}]
 env = {**constants, 'pathlib': pathlib, 'io': io, 'json': json, 'hashlib': hashlib, 'tarfile': tarfile,
        'shlex': shlex, 'datetime': datetime, 'REMOTE': '/fixture/project'}
 exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), env)
-main = {'id': 'business', 'startedAt': 'same-main-time', 'mounts': {'/app/core/src': '/fixture/project/core/src', '/app/web/dist': '/home/example/web-dist'}}
+main = {'id': 'business', 'startedAt': 'same-main-time', 'mounts': {'/app/core/src': '/fixture/project/core/src', '/app/web/dist': '/home/azureuser/web-dist'}}
 gateway = {'id': 'gateway', 'startedAt': 'same-gateway-time', 'health': 'healthy', 'running': True}
 class Channel:
     def recv_exit_status(self): return 0
@@ -1368,14 +1368,15 @@ test('蓝晶候选导入严格校验hash并先检查双根，拒绝旧拼铺/篡
   const script = String.raw`
 import ast, json, io, pathlib, sys, tempfile, contextlib
 root = pathlib.Path(sys.argv[1])
-source = root / 'tools/asset-fetcher/fetch-qqext-assets.py'
+source = root / '.workbuddy/scripts/fetch-qqext-assets.py'
 tree = ast.parse(source.read_text(encoding='utf-8'))
 functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {'import_blue_crystal_2x2', 'import_blue_crystal_asset'}]
 env = {'io': io, 'json': json}
 exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), env)
 assert 'build_blue_crystal_2x2' not in source.read_text(encoding='utf-8'), '废弃的16格拼铺入口必须删除'
-# 公开副本不需要私有工作记录目录；临时素材由系统临时目录隔离管理。
-with tempfile.TemporaryDirectory(prefix='blue-crystal-import-') as folder:
+parent = root / '.workbuddy'
+assert parent.is_dir()
+with tempfile.TemporaryDirectory(prefix='blue-crystal-import-', dir=parent) as folder:
     test = pathlib.Path(folder)
     core = test / 'core/src/gameConfig/land_images'
     web = test / 'web/public/game-config/land_images'

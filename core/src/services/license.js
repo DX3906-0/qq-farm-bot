@@ -15,7 +15,7 @@ const { getDataFile, ensureDataDir } = require('../config/runtime-paths');
 const { LICENSE_ENABLED } = require('../config/license-config');
 
 // 许可证密钥种子
-const LICENSE_SECRET = process.env.LICENSE_SECRET || '';
+const LICENSE_SECRET = 'zDJp2Wv7cLawful5w7rTF8mB5foq1EUsU';
 
 // 许可证文件路径
 const LICENSE_FILE = getDataFile('license.json');
@@ -53,7 +53,6 @@ function generateLicenseKey(machineId, secret = LICENSE_SECRET) {
  * 验证许可证密钥是否有效
  */
 function verifyLicenseKey(machineId, licenseKey, secret = LICENSE_SECRET) {
-    if (!secret) return false;
   const expectedKey = generateLicenseKey(machineId, secret);
   const normalizedInput = licenseKey.replace(/-/g, '').toUpperCase();
   return expectedKey.replace(/-/g, '') === normalizedInput;

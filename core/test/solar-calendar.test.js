@@ -39,7 +39,8 @@ function harness() {
     const snapshot = { accountId: 'test-account', connectionEpoch: 7, remoteGeneration: 42,
         loggedIn: true, connected: true, detached: false };
     const user = { gid: 123 };
-    const h = { config, event, season, snapshot, user, calls, writes, onRead: null, onWrite: null };
+    const sources = {};
+    const h = { config, event, season, snapshot, user, calls, writes, sources, onRead: null, onWrite: null };
     const network = {
         getDiagnosticSnapshot: () => ({ ...snapshot }),
         getUserState: () => user,
@@ -100,7 +101,7 @@ function harness() {
         '../utils/proto': { types: { ...types } },
         '../utils/request-priority': priority,
         './game-command': commandModule.exports,
-        './solar-config': { getSolarConfig: async () => ({ ...config, sources: {}, sync: { status: 'fixture', officialCurrent: false } }) },
+        './solar-config': { getSolarConfig: async () => ({ ...config, sources, sync: { status: 'fixture', officialCurrent: false } }) },
         'node:crypto': { createHash },
         '../config/gameConfig': { getItemById: () => ({ name: '点券' }), getItemImageById: () => '' },
     };
@@ -425,9 +426,34 @@ test('单次答题答错后即使服务端次日复位仍不重发，自动答�
     await assert.rejects(h.service.operateSolarCalendar('answer', answerInput));
     assert.equal(h.writes.length, 1);
     const unknown = harness();
-    assert.equal((await unknown.service.autoAnswerSolarQuizzes()).reason, 'no_independently_verified_answer');
+    assert.equal((await unknown.service.autoAnswerSolarQuizzes()).reason, 'no_verified_or_user_confirmed_answer');
     assert.equal(unknown.writes.length, 0);
     assert.equal(unknown.service.configSources.answerOriginVerified, false);
+});
+
+test('用户已确认的参考题库摘要允许后台自动答题，题库更新后跳过且每题严格单次', async () => {
+    const h = harness();
+    h.sources[403] = { kind: 'upstream-live-reference',
+        sha256: 'f470c32cd5f7c6f433619b431ccc7ac5cd219b9fa893b964406bf5772315cadd',
+        answerOriginVerified: false };
+    const result = await h.service.autoAnswerSolarQuizzes();
+    assert.equal(result.count, 1);
+    assert.equal(result.results[0].correct, true);
+    assert.equal(result.results[0].selectedOption, 'A.饺子');
+    assert.equal(result.results[0].answerProvenance, 'user-confirmed-reference-dataset');
+    assert.equal(result.results[0].answerOriginVerified, false);
+    assert.equal(h.writes.length, 1);
+    assert.equal((await h.service.autoAnswerSolarQuizzes()).skipped, true);
+    assert.equal(h.writes.length, 1, '成功答题后下轮不得重提');
+
+    const updated = harness();
+    updated.sources[403] = { kind: 'upstream-live-reference',
+        sha256: 'a470c32cd5f7c6f433619b431ccc7ac5cd219b9fa893b964406bf5772315cadd',
+        answerOriginVerified: false };
+    const skipped = await updated.service.autoAnswerSolarQuizzes();
+    assert.equal(skipped.reason, 'no_verified_or_user_confirmed_answer');
+    assert.equal(updated.writes.length, 0, '变更后的数据源需重新确认，不能沿用旧授权');
+    assert.equal(updated.service.configSources.answerOriginVerified, false);
 });
 
 test('用户明确单次确认仅放行当前账号当前题自动选答，不篡改官方来源或后台开关', async () => {
@@ -445,7 +471,7 @@ test('用户明确单次确认仅放行当前账号当前题自动选答，不�
     assert.equal((await h.service.operateSolarCalendar('auto-answer', referenceInput)).skipped, true);
     assert.equal(h.writes.length, 1, '单次路径再次调用也不能重发');
     const other = harness();
-    assert.equal((await other.service.autoAnswerSolarQuizzes()).reason, 'no_independently_verified_answer');
+    assert.equal((await other.service.autoAnswerSolarQuizzes()).reason, 'no_verified_or_user_confirmed_answer');
     assert.equal(other.writes.length, 0, '此次批准不能污染另一个账号或后台调用');
 });
 test('参考答案授权必须有完整确认/正确账号/题干/选项/窗口，失配一律零写入', async () => {

@@ -2,7 +2,7 @@ import { useStorage } from '@vueuse/core'
 import axios from 'axios'
 import NProgress from 'nprogress'
 import { createRouter, createWebHistory } from 'vue-router'
-import { menuRoutes } from './menu'
+import { allMenuRoutes } from './menu'
 import { cancelContentMotion } from '@/composables/useContentMotion'
 import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import 'nprogress/nprogress.css'
@@ -46,11 +46,16 @@ const router = createRouter({
       path: '/',
       component: () => import('@/layouts/DefaultLayout.vue'),
       children: [
-        ...menuRoutes.map(route => ({
+        ...allMenuRoutes.map(route => ({
           path: route.path,
           name: route.name,
           component: route.component,
+          props: route.props,
+          meta: { gameWorkspace: route.workspace || 'farm', gamePage: route.pageKey || route.name.toLowerCase() },
         })),
+        // Old farm bookmarks lead to their original pages, not a second farm tab.
+        { path: 'farm', name: 'farm', redirect: { name: 'personal' } },
+        { path: 'farm/status', name: 'farm-status', redirect: { name: 'dashboard' } },
         // Preserve bookmarks without mounting a second solar component/read.
         { path: 'solar-calendar', name: 'solar-calendar', redirect: { name: 'activity', query: { section: 'notes' } } },
       ],

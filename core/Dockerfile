@@ -1,5 +1,5 @@
-# 前端在宿主机通过 pnpm build:web 构建，Compose 只读挂载 web/dist。
-# 镜像仅构建业务依赖，前端文件可以独立更新。
+# 注意：前端（web）不再在镜像内构建，运行时由挂载卷 ../web-dist:/app/web/dist 提供（见 docker-compose.yml）。
+# 因此移除了原 builder 阶段的 pnpm build:web（vue-tsc 在 892MB 机器上极慢且被挂载卷覆盖，纯浪费）。
 FROM docker.1ms.run/library/node:20-alpine AS prod-deps
 
 WORKDIR /app

@@ -39,6 +39,7 @@ function createVmHarness() {
         if (name === '../utils/request-priority') return transportUtil;
         if (name === '../services/scheduler') return { createScheduler: () => scheduler };
         if (Object.hasOwn(extra, name)) return extra[name];
+        if (name === '../services/account-maintenance-hold') return { isAccountMaintenanceHeld: () => false };
         throw new Error(`禁止加载模块：${name}`);
       },
     };
@@ -78,8 +79,9 @@ function createRpcHarness(options = {}) {
     '../models/store': { persistInactiveActivityAutomation: () => [] },
     './gateway-routing': { resolveAccountGatewaySocket: () => ({}) },
   }, '', options.managerTransform);
+  const globalLogs = [];
   const manager = createWorkerManager({
-    runtimeMode: 'fork', processRef, workers, globalLogs: [],
+    runtimeMode: 'fork', processRef, workers, globalLogs,
     fork: () => {
       const proc = Object.assign(new EventEmitter(), { connected: true, messages: [], killed: 0, kill() { this.killed += 1; } });
       proc.send = (message, cb) => { proc.messages.push(message); if (cb) cb(null); };
@@ -97,8 +99,48 @@ function createRpcHarness(options = {}) {
   const cancels = () => proc.messages.filter(item => item.type === 'api_cancel');
   const reply = (id, result, error, errorMeta) => proc.emit('message', { type: 'api_response', id, result, error, errorMeta });
   const run = (options, method, ...args) => h.context.run(options, () => manager.callWorkerApi('account-1', method, ...args));
-  return { ...h, manager, workers, proc, calls, cancels, reply, run, logs, processRef };
+  return { ...h, manager, workers, proc, calls, cancels, reply, run, logs, globalLogs, processRef };
 }
+
+test('牧场巡查日志经 worker 缓冲及 /api/logs 按账号和模块返回', () => {
+  const h = createRpcHarness();
+  const logger = { createModuleLogger: () => ({ info() {}, warn() {}, error() {} }), sanitizeMeta: meta => ({ ...meta }) };
+  const { log, logWarn, setLogHook } = h.load('../src/utils/utils.js', { long: {}, '../services/logger': logger });
+  const { createRuntimeState } = h.load('../src/runtime/runtime-state.js', {
+    'node:events': EventEmitter, '../services/logger': logger,
+    '../services/stats': { getTodayKey: () => 'fixture', loadPersistedStats: () => null },
+  });
+  const { filterLogs } = createRuntimeState({ store: {} });
+  const workerSource = fs.readFileSync(path.join(__dirname, '../src/core/worker.js'), 'utf8');
+  vm.runInNewContext(workerSource.slice(workerSource.indexOf('setLogHook(('), workerSource.indexOf('setRecordGoldExpHook((')), {
+    setLogHook, sendToMaster: msg => h.proc.emit('message', msg), formatLocalDateTime24: () => '2026-11-21 12:00:00',
+  });
+  log('牧场', '自动巡查完成：无待执行动作', { event: 'ranch_patrol_complete', result: 'idle' });
+  logWarn('系统', '自动巡查已暂停', { module: 'ranch', event: 'ranch_patrol_paused', result: 'unknown' });
+  log('系统', '其他模块');
+  h.globalLogs.push({ accountId: 'account-2', tag: '牧场', meta: { module: 'ranch' } });
+  const provider = createDataProvider({ globalLogs: h.globalLogs, workers: h.workers, filterLogs,
+    getAccounts: () => ({ accounts: [{ id: 'account-1' }, { id: 'account-2' }] }),
+  });
+  const { registerAdminAccountRoutes } = require('../src/controllers/admin-account-routes');
+  let handler;
+  registerAdminAccountRoutes({
+    app: { get(path, fn) { if (path === '/api/logs') handler = fn; }, post() {}, delete() {}, put() {}, patch() {} },
+    provider, resolveAccountReference: id => id, canAccessAccount: () => true,
+  });
+  const readLogs = module => {
+    let response;
+    handler({ currentUser: {}, query: { accountId: 'account-1', module, limit: '100' } }, { json(body) { response = body; } });
+    assert.equal(response.ok, true);
+    return response.data;
+  };
+  const rows = readLogs('ranch');
+  assert.deepEqual(Array.from(rows, row => [row.tag, row.msg, row.isWarn, row.meta.event, row.meta.result]), [
+    ['牧场', '自动巡查完成：无待执行动作', false, 'ranch_patrol_complete', 'idle'],
+    ['牧场', '自动巡查已暂停', true, 'ranch_patrol_paused', 'unknown'],
+  ]);
+  assert.deepEqual(Array.from(readLogs('system'), row => row.msg), ['其他模块']);
+});
 
 function createProvider(globalLogs, accountLogs) {
   return createDataProvider({
@@ -470,6 +512,46 @@ test('立即终态unknown仍可诊断，但不伪记为等待迟到并结算；�
   } finally { h.manager.shutdown(); }
 });
 
+test('shop catalog getter is a safe top-level read, coalesces without a write slot and never creates unknown-write diagnostics', async () => {
+  const h = createRpcHarness();
+  try {
+    const first = h.run({}, 'getDecorationShop'), second = h.run({}, 'getDecorationShop');
+    assert.equal(h.calls().length, 1); assert.equal(h.calls()[0].readOnly, true);
+    assert.equal(h.manager.getDiagnostics('account-1').writeCount, 0);
+    h.reply(h.calls()[0].id, { items: [{ id: 2129 }] });
+    await Promise.all([first, second]);
+    assert.equal(h.manager.getDiagnostics('account-1').lateResults.length, 0);
+    assert.equal(h.logs.some(args => args[1] === 'Worker 写请求终态结果未知'), false);
+  } finally { h.manager.shutdown(); }
+});
+
+test('shop prior-unknown rejection remains blocked but is not logged as a newly-sent unknown write', async () => {
+  const h = createRpcHarness();
+  try {
+    const result = h.run({}, 'buyDecorationGoods', 2129, 1, {});
+    h.reply(h.calls()[0].id, null, '上次结果待核对，本次没有发送', {
+      errorCode: 'GAME_PRIOR_RESULT_UNKNOWN', sent: false, resultState: 'unknown', outcomeUnknown: false,
+    });
+    await assert.rejects(result, { errorCode: 'GAME_PRIOR_RESULT_UNKNOWN', sent: false, resultState: 'unknown', outcomeUnknown: false });
+    assert.equal(h.manager.getDiagnostics('account-1').lateResults.length, 0);
+    assert.equal(h.logs.some(args => args[1] === 'Worker 写请求终态结果未知'), false);
+    assert.equal(h.calls().length, 1);
+  } finally { h.manager.shutdown(); }
+});
+
+test('shop definitive server rejection keeps failed metadata and never becomes a late or unknown-write result', async () => {
+  const h = createRpcHarness();
+  try {
+    const result = h.run({}, 'buyDecorationGoods', 501, 1, {});
+    h.reply(h.calls()[0].id, null, '服务器明确拒绝', {
+      errorCode: 1001001, stage: 'remote', sent: true, resultState: 'failed', outcomeUnknown: false,
+    });
+    await assert.rejects(result, { errorCode: 1001001, stage: 'remote', resultState: 'failed', outcomeUnknown: false });
+    assert.equal(h.manager.getDiagnostics('account-1').lateResults.length, 0);
+    assert.equal(h.logs.some(args => args[1] === 'Worker 写请求终态结果未知'), false);
+  } finally { h.manager.shutdown(); }
+});
+
 function friendRouteHarness({ lands, error, missingProvider = false, allowed = true, routeTransform } = {}) {
   const h = createVmHarness();
   const { registerAdminFriendRoutes } = h.load('../src/controllers/admin-friend-routes.js', {}, '', routeTransform);
@@ -749,6 +831,44 @@ test('HTTP socket idle 超过 120s，不再 30s 重置；非 API 和健康路径
   assert.equal(socket.destroyed, undefined);
   server.emit('close');
   assert.equal(h.timers.size, 0);
+});
+
+test('worker transport诊断分离IPC代际与真实网关代际，保留来源且不推进访友状态', () => {
+  const workerSource = fs.readFileSync(path.join(__dirname, '../src/core/worker.js'), 'utf8');
+  const match = workerSource.match(/function getTransportDiagnostics\(\) \{[\s\S]*?\n\}/);
+  assert.ok(match, '必须执行实际诊断函数，而不是另写数据模型');
+  const native = { connectionEpoch: 2, remoteGeneration: 26, remoteGenerationSource: 'gateway',
+    connected: true, loggedIn: true, detached: false, pending: 0, pendingWrites: 0,
+    token: 'SENSITIVE_TOKEN', code: 'SENSITIVE_CODE', body: 'SENSITIVE_BODY' };
+  let reads = 0;
+  const diagnostic = vm.runInNewContext(`(${match[0]})`, {
+    getDiagnosticSnapshot: () => native,
+    getUserState: () => ({ gid: 10010 }),
+    gatewayHealthBackoffUntil: 0,
+    gatewayHealthSnapshot: { connectionEpoch: 26 },
+    apiControls: new Map(), MAX_API_CONTROLS: 100,
+    getFriendVisitSessionSnapshot: options => {
+      assert.equal(options.observeTransport, false); reads++;
+      return { resultState: 'unknown', transportEpoch: 26 };
+    },
+  });
+  const result = diagnostic();
+  assert.equal(result.connectionEpoch, 2); assert.equal(result.sessionEpoch, 2);
+  assert.equal(result.remoteGeneration, 26); assert.equal(result.remoteGenerationSource, 'gateway');
+  assert.equal(result.loggedIn, true); assert.equal(result.friendVisit.resultState, 'unknown');
+  assert.equal(reads, 1);
+  assert.doesNotMatch(JSON.stringify(result), /SENSITIVE_|"token"|"code"|"body"/);
+  for (const value of [undefined, null, NaN, Infinity, -1, true, {}, 'bad', '26x', '9007199254740993']) {
+    native.remoteGeneration = value;
+    assert.equal(diagnostic().remoteGeneration, null, String(value));
+  }
+  native.remoteGeneration = '26'; native.remoteGenerationSource = 'process';
+  assert.equal(diagnostic().remoteGeneration, 26);
+  assert.equal(diagnostic().remoteGenerationSource, 'process', '进程来源不能被伪标成gateway');
+  native.remoteGenerationSource = 'SENSITIVE_SOURCE';
+  const unknown = diagnostic();
+  assert.equal(unknown.remoteGenerationSource, 'unknown');
+  assert.doesNotMatch(JSON.stringify(unknown), /SENSITIVE_/);
 });
 
 test('transport 诊断路由必须显式认证及账号授权，provider 不增加第二层单飞', async () => {

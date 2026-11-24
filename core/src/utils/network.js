@@ -16,6 +16,7 @@ const { toLong, toNum, syncServerTime, log, logWarn } = require('./utils');
 const cryptoWasm = require('./crypto-wasm');
 const { createGatewayToken } = require('./gateway-token');
 const { TsdkRuntime } = require('./tsdk-runtime');
+const { assertGameRequestAllowed, isSceneRequestOwned } = require('../services/account-operation-barrier');
 const {
     createRequestGate, runWithRequestPriority, runWithRequestContext, getRequestContext,
     throwIfRequestCancelled, getRequestOptions, requestError, isCriticalRequest,
@@ -91,7 +92,7 @@ function setHealthBackoff(ms, reason) {
 }
 function getDiagnosticSnapshot() {
     return { accountId: String(process.env.FARM_ACCOUNT_ID || ''), connectionEpoch, remoteGeneration: connectionEpoch,
-        connected: isConnected(), loggedIn: !!(isConnected() && Number(userState.gid) > 0), detached: false,
+        remoteGenerationSource: 'process', connected: isConnected(), loggedIn: !!(isConnected() && Number(userState.gid) > 0), detached: false,
         pending: pendingCallbacks.size, quiescing, pendingWrites: getPendingWriteCount(),
         actualSent: [...directRequests.values()].filter(item => item.actualSent).length,
         pendingActualWrites: [...directRequests.values()].filter(item => !item.read && !item.critical && item.actualSent).length,
@@ -351,6 +352,7 @@ async function sendMsg(serviceName, methodName, bodyBytes, callback) {
     if (quiescing && !(isCriticalRequest(serviceName, methodName) && methodName === 'Heartbeat')) throw quiescingError();
     if (callback?.validate) callback.validate();
     if (callback?.isSettled?.()) return false;
+    callback?.assertCanSend?.();
     if (callback) pendingCallbacks.set(seq, callback);
     try {
         if (!isSafeReadRequest(serviceName, methodName)) safeFlights.invalidate();
@@ -375,6 +377,7 @@ async function sendDirectRequest(serviceName, methodName, bodyBytes, options, re
     const accountId = session.accountId ?? String(process.env.FARM_ACCOUNT_ID || '');
     const critical = isCriticalRequest(serviceName, methodName);
     function validate() {
+        assertGameRequestAllowed(serviceName, methodName);
         throwIfRequestCancelled(options);
         if (quiescing && (!critical || methodName !== 'Heartbeat')) throw quiescingError();
         if (options.validateWaiters) options.validateWaiters();
@@ -411,6 +414,7 @@ async function sendDirectRequest(serviceName, methodName, bodyBytes, options, re
             finish.read = read;
             finish.critical = critical;
             finish.validate = validate;
+            finish.assertCanSend = options.assertCanSend;
             finish.isSettled = () => settled;
             function armTimeout(budgetMs) {
                 if (timer) clearTimeout(timer);
@@ -443,12 +447,16 @@ async function sendDirectRequest(serviceName, methodName, bodyBytes, options, re
     }
 }
 async function sendMsgAsync(serviceName, methodName, bodyBytes, meta) {
+    assertGameRequestAllowed(serviceName, methodName);
     const options = getRequestOptions(meta, 20000);
     if (quiescing && !(isCriticalRequest(serviceName, methodName) && methodName === 'Heartbeat')) throw quiescingError();
     const body = Buffer.from(bodyBytes || []);
     if (!isCriticalRequest(serviceName, methodName) && isHealthBackoffActive()) throw healthBackoffError();
     throwIfRequestCancelled(options);
-    if (!isSafeReadRequest(serviceName, methodName)) return sendDirectRequest(serviceName, methodName, body, options, false);
+    if (!isSafeReadRequest(serviceName, methodName)) {
+        return sendDirectRequest(serviceName, methodName, body, { ...options, assertCanSend: meta?.assertCanSend }, false);
+    }
+    if (isSceneRequestOwned()) return sendDirectRequest(serviceName, methodName, body, options, true);
     const session = { socket: ws, epoch: connectionEpoch, accountId: String(process.env.FARM_ACCOUNT_ID || '') };
     return safeFlights.run({ accountId: session.accountId, epoch: connectionEpoch,
         service: serviceName, method: methodName, body, context: options,
@@ -507,12 +515,19 @@ function handleMessage(data) {
     }
 }
 
+const RANCH_CACHE_NOTIFICATIONS = new Set([
+    'gamepb.homesteadpb.CellsNotify', 'gamepb.homesteadpb.FacilitiesNotify',
+    'gamepb.homesteadpb.RegionQuotaNotify', 'gamepb.homesteadpb.BuildingListChangedNotify',
+    'gamepb.itempb.ItemNotify', 'gamepb.userpb.BasicNotify', 'gamepb.shoppb.GoodsUnlockNotify',
+]);
+
 function handleNotify(msg) {
     if (!msg.body || msg.body.length === 0) return;
     try {
         const event = types.EventMessage.decode(msg.body);
         const type = event.message_type || '';
         const eventBody = event.body;
+        if (RANCH_CACHE_NOTIFICATIONS.has(type)) networkEvents.emit('ranchDataChanged', { type });
 
         // 被踢下线
         if (type.includes('Kickout')) {
@@ -601,6 +616,9 @@ function handleNotify(msg) {
             try {
                 const notify = types.BasicNotify.decode(eventBody);
                 if (notify.basic) {
+                    if (Object.keys(notify.basic.share_infos || {}).length) {
+                        networkEvents.emit('ranchDataChanged', { kind: 'share-state' });
+                    }
                     const oldLevel = userState.level;
                     if (hasOwn(notify.basic, 'level')) {
                         const nextLevel = toNum(notify.basic.level);
@@ -673,6 +691,24 @@ function handleNotify(msg) {
                     networkEvents.emit('goodsUnlockNotify', goods);
                 }
             } catch { }
+            return;
+        }
+
+        if (type.includes('ActiviesChangeNotify')) {
+            const notify = types.RanchActiviesChangeNotify?.decode(eventBody);
+            if (notify) networkEvents.emit('ranchDataChanged', { kind: 'activities' });
+            return;
+        }
+
+        // 图鉴通知仅失效缓存，不借农场自动领奖链发送牧场写。
+        if (type.includes('IllustratedChangeNotifyV2')) {
+            const notify = types.RanchIllustratedChangeNotifyV2?.decode(eventBody);
+            if (Number(notify?.type) === 101) networkEvents.emit('ranchDataChanged', { kind: 'illustrated' });
+            return;
+        }
+        if (type.includes('IllustratedRewardRedDotNotifyV2')) {
+            const notify = types.RanchIllustratedRewardRedDotNotifyV2?.decode(eventBody);
+            if (notify) networkEvents.emit('ranchDataChanged', { kind: 'illustrated-reward' });
             return;
         }
 

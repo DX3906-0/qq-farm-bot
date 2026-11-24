@@ -38,7 +38,7 @@ const colorClass = computed(() => colorMap[props.color || 'gray'] || colorMap.gr
 </script>
 
 <template>
-  <div class="ui-subtle-panel flex items-center gap-3 rounded-lg px-4 py-3">
+  <div class="ui-subtle-panel box-border flex w-full max-w-full min-w-0 items-center gap-3 rounded-lg px-4 py-3">
     <div v-if="img" class="h-11 w-11 shrink-0 overflow-hidden rounded-xl bg-gray-100 dark:bg-gray-700">
       <img :src="img" alt="" class="h-full w-full object-cover">
     </div>
@@ -49,8 +49,8 @@ const colorClass = computed(() => colorMap[props.color || 'gray'] || colorMap.gr
     >
       <i :class="icon" />
     </div>
-    <div class="min-w-0 flex-1">
-      <div class="truncate text-sm font-medium text-gray-800 dark:text-gray-100">
+    <div class="min-w-0 flex-1 [overflow-wrap:anywhere]">
+      <div class="text-sm font-medium text-gray-800 dark:text-gray-100">
         {{ label }}
       </div>
       <div v-if="sub" class="text-xs leading-relaxed text-[var(--muted-text)]">
@@ -58,6 +58,7 @@ const colorClass = computed(() => colorMap[props.color || 'gray'] || colorMap.gr
       </div>
     </div>
     <BaseSwitch
+      class="shrink-0"
       :model-value="modelValue ?? false"
       :disabled="disabled"
       :aria-label="label"

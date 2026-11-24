@@ -262,8 +262,8 @@ async function doFriendOperation(gid, opType) {
       }
 
       // ⭐ 2026-10-23：**删掉 CheckCanOperate(0x2714) 预检查**（同自动路径）。
-      // 上游最新版无此预检查，直接打 Harvest；实测该接口会误判（账号甲宠物守护日志证实
-      // 账号乙从未偷到过账号甲，却每次被判"额度已用完"）。真正的拒绝由 Harvest 自身兜底。
+      // 上游最新版无此预检查，直接打 Harvest；实测该接口会误判（罗辑宠物守护日志证实
+      // 希恩斯从未偷到过罗辑，却每次被判"额度已用完"）。真正的拒绝由 Harvest 自身兜底。
       let okCount = 0;
       const failDetails = [];
       const batch = await stealHarvestDetailed(numericGid, analysis.stealable);
@@ -788,7 +788,7 @@ async function visitFriendForSteal(friend, tally, myGid, accountId) {
   if (analysis.stealable.length > 0) {
     // ⭐ 2026-10-23：**删掉 CheckCanOperate(0x2714) 预检查**（与昨天删掉帮忙类预检查同一理由）。
     // 上游最新版（liyangpengs/qq-farm-bot main，TS 重写）的偷取分支**完全没有这个预检查**，
-    // 直接打 Harvest；而实测该预检查会误判——账号甲的宠物守护日志证实账号乙从未偷到过账号甲，
+    // 直接打 Harvest；而实测该预检查会误判——罗辑的宠物守护日志证实希恩斯从未偷到过罗辑，
     // 却每次返回 canOperate=false / canStealNum=0（"额度已用完"），真实好友被 100% 误杀。
     // 现在：批量 Harvest → 未拿全逐块补 → 全失败才打 warn 并汇总真实错误原因。
     if (shouldSkipStealAttempt(gid, analysis.stealableInfo)) {

@@ -15,7 +15,17 @@ const L = {
   couponInsufficient: '\u5F53\u524D\u70B9\u5238\u4E0D\u8DB3\u3002',
   canBuyHint: '\u6761\u4EF6\u6EE1\u8DB3\uFF0C\u53EF\u76F4\u63A5\u8D2D\u4E70\u3002',
   unavailable: '\u5F53\u524D\u4E0D\u5F00\u653E\u8D2D\u4E70\u3002',
-  decorationHint: '\u53EF\u7ACB\u5373\u8D2D\u4E70\u5E76\u751F\u6548\u3002',
+  decorationHint: '购买后可在个人装扮页查看，面板不会自动替换当前穿戴。',
+  notListed: '尚未上架',
+  notListedHint: '服务器当前未将牧草种子列入种子商店；上架后显示实际售价。',
+  unverified: '信息待确认',
+  unverifiedHint: '商品价格、内容或购买状态尚未确认，请刷新核对。',
+  owned: '已拥有',
+  ownedHint: '已拥有该商品，无需重复购买。',
+  expired: '已下架',
+  expiredHint: '商品售卖时间已结束。',
+  unknown: '结果待核对',
+  unknownHint: '上次购买结果未确认，请只刷新核对，不要重复提交。',
   freeHint: '\u53EF\u76F4\u63A5\u514D\u8D39\u9886\u53D6\u3002',
   locked: '\u672A\u89E3\u9501',
   soldOut: '\u5DF2\u552E\u7F44',
@@ -35,13 +45,21 @@ function priceOf(item: any) {
 
 export function createShopAvailability(context: ShopAvailabilityContext) {
   function canAffordGoods(item: any) {
+    if (item?.catalogOnly || item?.priceKnown === false || item?.currencyKnown === false || item?.resultUnknown || item?.price === null || item?.expired) return false
     if (item?.isGoldenBean)
       return context.userGoldBean() >= priceOf(item)
     return context.currentGold() >= priceOf(item)
   }
 
   function canAffordDecoration(item: any) {
-    return context.userGoldBean() >= priceOf(item)
+    if (item?.priceKnown !== true || item?.currencyKnown !== true || item.price == null)
+      return false
+    const price = Number(item.price)
+    if (!Number.isSafeInteger(price) || price < 0) return false
+    if (Number(item.currencyId) === 1001) return context.currentGold() >= price
+    if (Number(item.currencyId) === 1002) return context.currentCoupon() >= price
+    if (Number(item.currencyId) === 1005) return context.userGoldBean() >= price
+    return false
   }
 
   function canAffordMall(item: any) {
@@ -51,6 +69,12 @@ export function createShopAvailability(context: ShopAvailabilityContext) {
   }
 
   function getSeedHint(item: any) {
+    if (item.resultUnknown) return '上次购买结果未确认，请核对背包，不要重复购买。'
+    if (item.catalogOnly || item.availability === 'not_listed') return L.notListedHint
+    if (item.expired) return L.expiredHint
+    if (item.currencyKnown === false) return item.unavailableReason || '种子商品已列出，但扣费币种尚未确认，请暂勿购买。'
+    if (item.priceKnown === false || item.contentKnown === false || item.availability === 'unverified') return L.unverifiedHint
+    if (!item.unlocked) return L.unavailable
     if (item.isSoldOut)
       return L.soldOutSeed
     if (context.currentLevel() < item.requiredLevel)
@@ -71,11 +95,16 @@ export function createShopAvailability(context: ShopAvailabilityContext) {
   }
 
   function getDecorationHint(item: any) {
-    if (!item.canBuy)
-      return L.unavailable
+    if (item.resultUnknown) return L.unknownHint
+    if (item.owned) return L.ownedHint
+    if (item.expired) return L.expiredHint
+    if (item.isSoldOut) return L.soldOutMall
+    if (item.priceKnown !== true || item.currencyKnown !== true || item.contentKnown === false || item.availability === 'unverified') return L.unverifiedHint
+    if (!item.unlocked || !item.canBuy) return item.unavailableReason || L.unavailable
+    if (context.currentLevel() < Number(item.requiredLevel || 0)) return L.levelRequired(item.requiredLevel)
     if (!canAffordDecoration(item))
-      return L.goldBeanInsufficient
-    return L.decorationHint
+      return Number(item.currencyId) === 1001 ? L.goldInsufficient : Number(item.currencyId) === 1002 ? L.couponInsufficient : L.goldBeanInsufficient
+    return item.isFree ? L.freeHint : L.decorationHint
   }
 
   function getMallHint(item: any) {
@@ -89,6 +118,10 @@ export function createShopAvailability(context: ShopAvailabilityContext) {
   }
 
   function getSeedStatusLabel(item: any) {
+    if (item.resultUnknown) return L.unknown
+    if (item.catalogOnly || item.availability === 'not_listed') return L.notListed
+    if (item.expired) return L.expired
+    if (item.priceKnown === false || item.currencyKnown === false || item.contentKnown === false || item.availability === 'unverified') return L.unverified
     if (!item.unlocked)
       return L.locked
     if (item.isSoldOut)
@@ -113,11 +146,17 @@ export function createShopAvailability(context: ShopAvailabilityContext) {
   }
 
   function getDecorationStatusLabel(item: any) {
-    if (!item.canBuy)
-      return L.notOpen
+    if (item.resultUnknown) return L.unknown
+    if (item.owned) return L.owned
+    if (item.expired) return L.expired
+    if (item.isSoldOut) return L.soldOut
+    if (item.priceKnown !== true || item.currencyKnown !== true || item.contentKnown === false || item.availability === 'unverified') return L.unverified
+    if (!item.unlocked) return L.locked
+    if (!item.canBuy) return L.notOpen
+    if (context.currentLevel() < Number(item.requiredLevel || 0)) return L.levelLow
     if (!canAffordDecoration(item))
-      return L.goldBeanLow
-    return L.canBuy
+      return Number(item.currencyId) === 1001 ? L.goldLow : Number(item.currencyId) === 1002 ? L.couponLow : L.goldBeanLow
+    return item.isFree ? L.canClaimFree : L.canBuy
   }
 
   function getMallStatusLabel(item: any) {

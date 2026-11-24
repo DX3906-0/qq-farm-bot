@@ -73,7 +73,7 @@ message BasicInfo {
     string signature = 9;
     int32 gender = 10;
     // repeated AvatarFrame equip_avatar_frames = 11;
-    // map<int64, ShareInfo> share_infos = 12;
+    map<int64, ShareInfo> share_infos = 12;
     int32 authorized_status = 13;
     bool disable_nudge = 14;
 }
@@ -188,9 +188,10 @@ message SceneEffectConfig {
     SceneEffectSelection selection = 2;
 }
 
+// Fixed user schema: count and claim flag, not an enum status/count pair.
 message ShareInfo {
-    int64 status = 1;
-    int64 count = 2;
+    int64 share_count = 1;
+    bool is_claimed = 2;
 }
 
 message BasicExtraInfo {

@@ -12,6 +12,7 @@ import { readAccountUiState, useAccountScroll, writeAccountUiState } from '@/com
 import { useSlidingTabs, vSlidingTabs } from '@/composables/useContentMotion'
 import { useAccountStore } from '@/stores/account'
 
+const uiNamespace = 'personal'
 const { currentAccountId } = storeToRefs(useAccountStore())
 const tabs = [
   { key: 'farm', label: '我的农场', icon: 'i-carbon-sprout', component: FarmPanel },
@@ -24,7 +25,7 @@ const tabs = [
 ] as const
 type PersonalTab = typeof tabs[number]['key']
 function rememberedTab(accountId: string): PersonalTab {
-  const saved = readAccountUiState(accountId, 'personal').tab
+  const saved = readAccountUiState(accountId, uiNamespace).tab
   return tabs.some(tab => tab.key === saved) ? saved as PersonalTab : 'farm'
 }
 const currentTab = ref<PersonalTab>(rememberedTab(String(currentAccountId.value)))
@@ -38,7 +39,7 @@ watch(currentAccountId, id => {
 }, { flush: 'sync' })
 watch(currentTab, tab => {
   if (!restoringTab)
-    writeAccountUiState(String(currentAccountId.value), 'personal', { tab })
+    writeAccountUiState(String(currentAccountId.value), uiNamespace, { tab })
 }, { flush: 'sync' })
 
 const panelId = useId()
@@ -46,7 +47,7 @@ const content = ref<HTMLElement | null>(null)
 const tabNav = ref<HTMLElement | null>(null)
 const panelMotion = useSlidingTabs(currentTab, () => content.value, () => tabs.map(tab => tab.key), () => currentAccountId.value)
 const { select: selectTab, selected: selectedTab } = panelMotion
-const scrollView = computed(() => `personal:${currentTab.value}`)
+const scrollView = computed(() => `${uiNamespace}:${currentTab.value}`)
 const { onUserScroll, cancelRestore } = useAccountScroll(currentAccountId, scrollView, content)
 function moveTabFocus(event: KeyboardEvent, index: number) {
   if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key))

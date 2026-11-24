@@ -3,6 +3,14 @@ const test = require('node:test');
 
 const { DEFAULT_CLIENT_VERSION, resolveClientVersion } = require('../src/config/config');
 let protocol;
+let protocolConfig;
+let protocolTypes;
+const capturedClientVersion = '1.16.1.6_20261028';
+function withCapturedVersion(fn) {
+  const previous = protocolConfig.clientVersion;
+  try { protocolConfig.clientVersion = capturedClientVersion; return fn(); }
+  finally { protocolConfig.clientVersion = previous; }
+}
 const buildHeartbeatBody = (...args) => protocol.buildHeartbeatBody(...args);
 const buildLoginBody = (...args) => protocol.buildLoginBody(...args);
 
@@ -20,13 +28,16 @@ test.before(async () => {
   ], { keepCase: true });
   root.resolveAll();
   const types = Object.fromEntries(['LoginRequest', 'HeartbeatRequest'].map(name => [name, root.lookupType(`gamepb.userpb.${name}`)]));
+  protocolTypes = types;
+  protocolConfig = { ...require('../src/config/config').CONFIG, clientVersion: DEFAULT_CLIENT_VERSION };
   const filename = path.join(__dirname, '../src/utils/network.js');
   const blocked = () => assert.fail('协议夹具禁止传输、IPC、定时调度和后端调用');
   const dependencies = {
     'node:buffer': { Buffer }, 'node:events': require('node:events'),
     'node:process': { env: { FARM_NETWORK_MODE: 'local' }, exit: blocked },
     'node:worker_threads': { workerData: null }, ws: class { constructor() { blocked(); } },
-    '../config/config': { ...require('../src/config/config'), CONFIG: { ...require('../src/config/config').CONFIG } },
+    '../config/config': { ...require('../src/config/config'), CONFIG: protocolConfig },
+    '../services/account-operation-barrier': { assertGameRequestAllowed: blocked, isSceneRequestOwned: blocked },
     '../services/ace-service': { AceService: class { constructor() { blocked(); } } },
     '../services/scheduler': { createScheduler: () => ({ setTimeoutTask: blocked, setIntervalTask: blocked, clear: () => {} }) },
     '../services/status': {}, '../services/stats': {}, './proto': { types },
@@ -49,18 +60,27 @@ test.before(async () => {
 });
 
 test('default client protocol is upgraded without replacing custom versions', () => {
-  assert.equal(DEFAULT_CLIENT_VERSION, '1.16.1.6_20261028');
+  const official = require('./fixtures/official-client-version.json').config;
+  assert.equal(DEFAULT_CLIENT_VERSION, `${official.version}_${official.proto}`);
   assert.equal(resolveClientVersion('1.13.0.5_20260723'), DEFAULT_CLIENT_VERSION);
   assert.equal(resolveClientVersion('1.13.2.9_20260723'), DEFAULT_CLIENT_VERSION);
   // 低于基线的版本会被拉回基线（只升不降）
   assert.equal(resolveClientVersion('1.15.0.1_20261001'), DEFAULT_CLIENT_VERSION);
-  // 高于基线的版本原样保留
-  assert.equal(resolveClientVersion('1.17.0.1_20261101'), '1.17.0.1_20261101');
+  assert.equal(resolveClientVersion(capturedClientVersion), DEFAULT_CLIENT_VERSION);
+  assert.equal(resolveClientVersion('1.17.0.1_20261101'), DEFAULT_CLIENT_VERSION);
+  // 同日期高于基线的自定义版本原样保留（测试值，不表示官方已发布）。
+  assert.equal(resolveClientVersion('1.17.0.7_20261117'), '1.17.0.7_20261117');
   assert.equal(resolveClientVersion('custom-build'), 'custom-build');
 });
 
-test('default login request reproduces the 1.16.1.6 official capture', () => {
-  assert.equal(buildLoginBody().toString('hex'), OFFICIAL_LOGIN_BODY);
+test('default legacy login request uses the verified current client version', () => {
+  const decoded = protocolTypes.LoginRequest.decode(buildLoginBody());
+  assert.equal(decoded.device_info.client_version, DEFAULT_CLIENT_VERSION);
+});
+
+test('historical 1.16.1.6 login capture is reproduced only with its explicit fixture version', () => {
+  withCapturedVersion(() => assert.equal(buildLoginBody().toString('hex'), OFFICIAL_LOGIN_BODY));
+  assert.equal(protocolConfig.clientVersion, DEFAULT_CLIENT_VERSION);
 });
 
 test('custom device protocol keeps its explicit fingerprint fields', () => {
@@ -71,11 +91,17 @@ test('custom device protocol keeps its explicit fingerprint fields', () => {
     deviceModel: 'Xiaomi 14 Ultra',
     deviceId: 'device-14-ultra',
   });
-  assert.notEqual(body.toString('hex'), OFFICIAL_LOGIN_BODY);
+  assert.notEqual(body.toString('hex'), buildLoginBody().toString('hex'));
 });
 
-test('heartbeat request reproduces the official capture', () => {
-  assert.equal(buildHeartbeatBody(1220537209).toString('hex'), OFFICIAL_HEARTBEAT_BODY);
+test('heartbeat request uses the verified current client version', () => {
+  const decoded = protocolTypes.HeartbeatRequest.decode(buildHeartbeatBody(1220537209));
+  assert.equal(decoded.client_version, DEFAULT_CLIENT_VERSION);
+});
+
+test('historical heartbeat capture retains its explicit 1.16 fixture version', () => {
+  withCapturedVersion(() => assert.equal(buildHeartbeatBody(1220537209).toString('hex'), OFFICIAL_HEARTBEAT_BODY));
+  assert.equal(protocolConfig.clientVersion, DEFAULT_CLIENT_VERSION);
 });
 
 test('官方访友HostType：Enter字段3、Leave字段2、GameFriend字段11一致且不改默认REAL', () => {

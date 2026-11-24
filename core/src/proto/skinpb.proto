@@ -52,6 +52,16 @@ message EquipRequest {
 }
 message EquipReply {}
 
+// Official SkinDecoratePartHelper / skinpb.ts: 1=equip non-default parts,
+// 2=remove currently equipped non-default parts. Never mix the operations.
+message EquipSkinPartRequest {
+    repeated int64 ids = 1 [packed = true];
+    int64 operate = 2;
+}
+message EquipSkinPartReply {
+    repeated int64 part_ids = 1 [packed = true]; // Full resulting non-default parts.
+}
+
 message MarkAsViewedRequest {
     repeated int64 skin_ids = 1;
 }

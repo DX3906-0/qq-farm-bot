@@ -58,6 +58,23 @@ function registerAdminSkinRoutes({
     }
   });
 
+  app.post("/api/skins/parts/equip", async (req, res) => {
+    const accountId = requireAccessibleAccount({ req, res, getAccountIdFromRequest, canAccessAccount });
+    if (!accountId) return;
+    const body = req.body || {}, skinId = Number(body.skinId), partId = Number(body.partId);
+    const ids = body.expectedPartIds;
+    if (body.confirmed !== true || typeof body.skinId === 'boolean' || typeof body.partId === 'boolean'
+      || !Number.isSafeInteger(skinId) || skinId <= 0 || !Number.isSafeInteger(partId) || partId <= 0
+      || !Array.isArray(ids) || ids.length > 7 || ids.some(id => typeof id === 'boolean' || !Number.isSafeInteger(Number(id)) || Number(id) <= 0)
+      || new Set(ids.map(Number)).size !== ids.length) {
+      return res.status(400).json({ ok: false, error: '请先刷新并确认小屋、部件和当前搭配', sent: false, resultState: 'not_sent' });
+    }
+    try {
+      const result = await provider.equipSkinPart(accountId, skinId, partId, { confirmed: true, expectedPartIds: ids.map(Number) });
+      res.json({ ok: true, data: result });
+    } catch (error) { sendProviderError(res, error); }
+  });
+
   app.post("/api/skins/equip", async (req, res) => {
     const accountId = requireAccessibleAccount({
       req,

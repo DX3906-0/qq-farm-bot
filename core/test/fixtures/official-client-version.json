@@ -1,0 +1,11 @@
+{
+  "source": {
+    "clientPackage": "1112386029_3_291f2c5166563ff267adf6c3a774102c",
+    "asset": "assets/resources/import/27/270bcfa0-8119-4985-bd68-d25724cd0704.08c5a.json",
+    "sha256": "9a3d20e48bb391933f546aa7c5703ae9a6aebc836b9bccca0de4d45f45f56184"
+  },
+  "config": {
+    "version": "1.17.0.6",
+    "proto": "20261117"
+  }
+}

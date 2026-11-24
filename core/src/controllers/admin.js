@@ -60,6 +60,7 @@ const {
 } = require("./admin-plant-blacklist-routes");
 const { registerAdminProxyRoutes } = require("./admin-proxy-routes");
 const { registerAdminPublicInfoRoutes } = require("./admin-public-info-routes");
+const { registerAdminRanchRoutes } = require("./admin-ranch-routes");
 const { registerAdminQrLoginRoutes } = require("./admin-qr-login-routes");
 const { registerAdminPetRoutes } = require("./admin-pet-routes");
 const { registerAdminWishShareActivityRoutes } = require("./admin-wish-share-activity-routes");
@@ -487,6 +488,13 @@ function startAdminServer(dataProvider) {
   registerLogoutRoute(app, invalidateAdminSessionAndDisconnect);
 
   registerAdminFarmResourceRoutes({
+    app,
+    provider,
+    getAccountIdFromRequest,
+    canAccessAccount,
+    sendProviderError,
+  });
+  registerAdminRanchRoutes({
     app,
     provider,
     getAccountIdFromRequest,

@@ -9,7 +9,7 @@ import { useAccountStore } from '@/stores/account'
 import { useBagStore } from '@/stores/bag'
 import { useStatusStore } from '@/stores/status'
 import { useToastStore } from '@/stores/toast'
-import { actualSaleRewards, resultIsUnknown } from '@/utils/operation-result'
+import { actualSaleRewards, itemUseLimit, resultIsUnknown, validateItemUseQuantity } from '@/utils/operation-result'
 import type { OperationFeedback } from '@/utils/operation-result'
 import { formatCurrencyAmountByLabel } from '@/utils/number-format'
 
@@ -87,6 +87,15 @@ const dialogAction = ref<{
   message: string
 } | null>(null)
 const sending = ref(false)
+const useQuantity = ref<number | string>(1)
+const dialogUseItem = computed(() => dialogAction.value?.action === 'use'
+  ? items.value.find(item => itemKey(item) === itemKey(dialogAction.value!.item)) : null)
+const useValidation = computed(() => validateItemUseQuantity(dialogUseItem.value, useQuantity.value))
+const dialogMessage = computed(() => {
+  const action = dialogAction.value
+  if (action?.action !== 'use') return action?.message || ''
+  return `使用「${action.item.name}」${useValidation.value.count ? ` ×${useValidation.value.count}` : ''}？\n当前实例可用：${useValidation.value.limit} 个\n只使用这个未锁定实例，不包含同名的其他实例。奖励以实际回包为准。`
+})
 const operationState = computed(() => mutationStates.value?.[String(currentAccountId.value)] || 'idle')
 const readableError = computed(() => readError.value || statusError.value)
 const actionsEnabled = computed(() => !!currentAccountId.value && currentStatusReady.value
@@ -103,7 +112,7 @@ const operationTitle = computed(() => dialogAction.value?.action === 'lock' ? '�
   : dialogAction.value?.action === 'unlock' ? '确认解锁' : dialogAction.value?.action === 'use' ? '确认使用' : '确认出售')
 function canSell(item: any) { return [17, 6].includes(Number(item.itemType)) && item.locked !== true }
 function canBatchSell(item: any) { return canSell(item) && Number(item.count) > 0 }
-function canUse(item: any) { return ([11, 33].includes(Number(item.itemType)) || Number(item.id) === 6001) && item.locked !== true && Number(item.count) > 0 }
+function canUse(item: any) { return ([11, 33].includes(Number(item?.itemType)) || Number(item?.id) === 6001) && itemUseLimit(item) > 0 }
 function canLock(item: any) { return [5, 6, 17].includes(Number(item.itemType)) && String(item.uid || '0') !== '0' }
 function dismissDialog() {
   if (!sending.value) dialogAction.value = null
@@ -144,10 +153,11 @@ function handleSellClick(item: any) {
   dialogAction.value = { action: 'sell', accountId: String(currentAccountId.value), epoch: viewEpoch, item: { ...item }, selectedItems: requested,
     title: '确认出售', message: `出售「${item.name}」的当前未锁定实例？\n数量：${item.count || 0}${estimate ? `\n预计收益：${estimate}` : ''}\n预计值仅供参考，实际到账以游戏回包为准。只提交一次。` }
 }
-function handleUseClick(item: any) {
+function handleUseClick(item: any, count = 1) {
   if (!actionsEnabled.value || !canUse(item)) return
+  useQuantity.value = count
   dialogAction.value = { action: 'use', accountId: String(currentAccountId.value), epoch: viewEpoch, item: { ...item }, selectedItems: [],
-    title: '确认使用', message: `使用 1 个「${item.name}」？\n实例 UID：${String(item.uid || 0)}\n只发送一次请求，奖励以实际回包为准；结果未确认不重试。` }
+    title: '确认使用', message: '' }
 }
 function toggleBatchMode() {
   if (!actionsEnabled.value) return
@@ -171,11 +181,13 @@ async function handleConfirm() {
   const action = dialogAction.value
   if (!action || !actionsEnabled.value || sending.value || action.accountId !== String(currentAccountId.value) || action.epoch !== viewEpoch) return
   const current = () => !disposed && action.epoch === viewEpoch && action.accountId === String(currentAccountId.value)
+  const requestedUse = action.action === 'use' ? validateItemUseQuantity(dialogUseItem.value, useQuantity.value) : null
+  if (action.action === 'use' && (!canUse(dialogUseItem.value) || requestedUse?.error)) return
   sending.value = true
-  feedback.value = { state: 'pending', message: `${action.title.replace('确认', '')}处理中，请等待回包。` }
+  feedback.value = { state: 'pending', message: `${action.title.replace('确认', '')}${requestedUse ? ` ×${requestedUse.count}` : ''}处理中，请等待回包。` }
   try {
     let result: any
-    if (action.action === 'use') result = await bagStore.useItem(action.accountId, Number(action.item.id), 1, action.item.uid)
+    if (action.action === 'use') result = await bagStore.useItem(action.accountId, Number(action.item.id), requestedUse!.count, action.item.uid)
     else if (action.action === 'lock' || action.action === 'unlock') result = await bagStore.setItemsLocked(action.accountId, [String(action.item.uid)], action.action === 'lock')
     else result = await bagStore.sellItems(action.accountId, action.selectedItems)
     if (!current() || result?.stale) return
@@ -197,7 +209,8 @@ async function handleConfirm() {
     }
     else if (action.action === 'use') {
       const rewards = result.data?.rewards || []
-      message = rewards.length ? `使用已确认，实际获得：${rewards.map((item: any) => `${item.name || item.id} ×${item.count}`).join('、')}` : '物品使用已确认，未返回额外奖励。'
+      const usedCount = result.data.usedCount
+      message = rewards.length ? `已使用 ${usedCount} 个「${action.item.name}」，实际获得：${rewards.map((item: any) => `${item.name || item.id} ×${item.count}`).join('、')}` : `已确认使用 ${usedCount} 个「${action.item.name}」，未返回额外奖励。`
     }
     else message = result.data?.skipped ? '实例已处于目标锁定状态' : action.action === 'lock' ? '已确认锁定此实例' : '已确认解锁此实例'
     feedback.value = { state: 'success', message }
@@ -233,6 +246,7 @@ watch(currentAccountId, (newId, oldId) => {
     bagLoaded.value = false
     sending.value = false
     dialogAction.value = null
+    useQuantity.value = 1
     selectedForBatch.value.clear()
     batchMode.value = false
     detailItemKey.value = ''
@@ -295,7 +309,10 @@ onBeforeUnmount(() => { disposed = true; viewEpoch++ })
             <template v-if="batchMode && canBatchSell(item)"><label class="bag-select"><input type="checkbox" :checked="selectedForBatch.has(Number(item.id))" :disabled="!actionsEnabled" @change="handleSellClick(item)"><span>选择物品</span></label></template>
             <template v-else>
               <BaseButton v-if="canSell(item)" size="sm" variant="outline" :disabled="!actionsEnabled" @click="handleSellClick(item)">出售</BaseButton>
-              <BaseButton v-if="canUse(item)" size="sm" variant="primary" :disabled="!actionsEnabled" @click="handleUseClick(item)">使用 1 个</BaseButton>
+              <template v-if="canUse(item)">
+                <BaseButton size="sm" variant="primary" :disabled="!actionsEnabled" @click="handleUseClick(item)">{{ itemUseLimit(item) > 1 ? '使用 / 自定义' : '使用 1 个' }}</BaseButton>
+                <BaseButton v-if="itemUseLimit(item) > 1" size="sm" variant="outline" :disabled="!actionsEnabled" @click="handleUseClick(item, itemUseLimit(item))">全部使用</BaseButton>
+              </template>
               <BaseButton v-if="canLock(item)" size="sm" variant="ghost" :disabled="!actionsEnabled" :aria-label="item.locked ? '解锁此实例' : '锁定此实例'" @click="prepareLock(item)">{{ item.locked ? '解锁' : '锁定' }}</BaseButton>
             </template>
             <button type="button" class="bag-detail-button" :aria-label="`查看${item.name}实例详情`" @click="showDetail(item)">详情</button>
@@ -303,7 +320,17 @@ onBeforeUnmount(() => { disposed = true; viewEpoch++ })
         </article>
       </div>
     </template>
-    <ConfirmModal :show="!!dialogAction" :title="dialogAction?.title" :message="dialogAction?.message" :type="dialogAction?.action === 'sell' || dialogAction?.action === 'batchSell' ? 'danger' : 'primary'" :loading="sending" :confirm-text="operationTitle" @confirm="handleConfirm" @cancel="dismissDialog" @close="dismissDialog" />
+    <ConfirmModal :show="!!dialogAction" :title="dialogAction?.title" :message="dialogMessage" :type="dialogAction?.action === 'sell' || dialogAction?.action === 'batchSell' ? 'danger' : 'primary'" :loading="sending" :confirm-disabled="dialogAction?.action === 'use' && !!useValidation.error" :confirm-text="operationTitle" @confirm="handleConfirm" @cancel="dismissDialog" @close="dismissDialog">
+      <div v-if="dialogAction?.action === 'use'" class="bag-use-quantity">
+        <label for="bag-use-quantity">自定义使用数量</label>
+        <div class="bag-use-controls">
+          <input id="bag-use-quantity" v-model="useQuantity" type="number" min="1" :max="useValidation.limit" step="1" :disabled="sending" :aria-invalid="!!useValidation.error" aria-describedby="bag-use-quantity-hint">
+          <BaseButton size="sm" variant="secondary" :disabled="sending || !useValidation.limit" @click="useQuantity = 1">1 个</BaseButton>
+          <BaseButton v-if="useValidation.limit > 1" size="sm" variant="secondary" :disabled="sending" @click="useQuantity = useValidation.limit">全部 ({{ useValidation.limit }})</BaseButton>
+        </div>
+        <p id="bag-use-quantity-hint" :data-error="!!useValidation.error">{{ useValidation.error || (Number(dialogAction.item.id) === 6001 ? '烟花每次只能燃放一枚。' : `可使用 1～${useValidation.limit} 个；确认后只提交一次数量请求。`) }}</p>
+      </div>
+    </ConfirmModal>
     <ConfirmModal :show="!!detailItem" :title="detailItem?.name || '实例详情'" :message="detailItem ? `物品编号：${detailItem.id}\n实例 UID：${String(detailItem.uid || 0)}\n类型编号：${detailItem.itemType || 0}\n数量：${detailItem.count || 0}\n锁定状态：${detailItem.locked ? '已锁定' : '未锁定'}${detailItem.price > 0 ? `\n单价参考：${detailItem.price} ${detailItem.priceUnit || '金币'}` : ''}` : ''" is-alert confirm-text="关闭" @confirm="detailItemKey = ''" @cancel="detailItemKey = ''" @close="detailItemKey = ''" />
   </div>
 </template>
@@ -318,6 +345,13 @@ onBeforeUnmount(() => { disposed = true; viewEpoch++ })
 .bag-feedback[data-state='unknown'] { border-left-color: var(--status-warning); }
 .bag-feedback[data-state='error'] { border-left-color: var(--status-danger); }
 .bag-feedback[data-state='success'] { border-left-color: var(--status-success); }
+.bag-use-quantity { margin-top: 16px; padding: 12px; border: 1px solid var(--surface-border); border-radius: var(--radius-control); background: var(--surface-2); }
+.bag-use-quantity label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
+.bag-use-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.bag-use-controls input { flex: 1; min-width: 90px; width: 100px; min-height: 40px; padding: 0 10px; border: 1px solid var(--surface-border-strong); border-radius: var(--radius-control); background: var(--input-bg); color: var(--theme-text); font: inherit; font-variant-numeric: tabular-nums; }
+.bag-use-controls input:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.bag-use-quantity p { margin: 8px 0 0; color: var(--muted-text); font-size: 12px; line-height: 1.6; }
+.bag-use-quantity p[data-error='true'] { color: var(--status-danger); }
 .bag-toolbar { padding: 12px; background: var(--surface-1); border: 1px solid var(--surface-border); border-radius: var(--radius-card); }
 .bag-categories, .bag-filters, .bag-density, .bag-batch-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .bag-categories button { display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 12px; border: 0; border-radius: var(--radius-control); color: var(--muted-text); background: transparent; font-size: 14px; font-weight: 500; cursor: pointer; }

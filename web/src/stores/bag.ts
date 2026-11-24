@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import api from '@/api'
 import { useAccountStore } from '@/stores/account'
-import { operationFailure, resultIsUnknown, saleConsumptionConfirmed } from '@/utils/operation-result'
+import { integerText, operationFailure, resultIsUnknown, saleConsumptionConfirmed, useConsumptionConfirmed } from '@/utils/operation-result'
 
 export const useBagStore = defineStore('bag', () => {
   const allItems = ref<any[]>([])
@@ -116,7 +116,13 @@ export const useBagStore = defineStore('bag', () => {
     return pending
   }
   function useItem(accountId: string, itemId: number, count = 1, uid?: string | number) {
-    return mutate(accountId, '/api/bag/use', { itemId, count, uid })
+    const amount = integerText(count), instance = uid == null ? '0' : integerText(uid)
+    if (!Number.isSafeInteger(itemId) || itemId <= 0 || amount === null || instance === null
+      || BigInt(amount) <= 0n || BigInt(amount) > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Promise.resolve({ ok: false, sent: false, resultState: 'not_sent', error: '物品编号、实例或使用数量无效' })
+    }
+    const requestedCount = Number(amount)
+    return mutate(accountId, '/api/bag/use', { itemId, count: requestedCount, uid }, reply => useConsumptionConfirmed(reply, itemId, requestedCount))
   }
   function setItemsLocked(accountId: string, itemUids: Array<string | number>, locked: boolean) {
     return mutate(accountId, '/api/bag/lock', { itemUids, locked, confirmed: true }, undefined, 70000)

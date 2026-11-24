@@ -26,6 +26,8 @@ const sourceFiles = {
     friendAnalyzer: 'services/friend-land-analyzer.js',
     friendOrchestrator: 'services/friend-orchestrator.js',
     friendLimits: 'services/friend-operation-limits.js',
+    accountBarrier: 'services/account-operation-barrier.js',
+    accountCoordinator: 'services/account-operation-coordinator.js',
     interact: 'services/interact.js',
 };
 const sources = Object.fromEntries(Object.entries(sourceFiles).map(([name, file]) => [
@@ -144,6 +146,7 @@ function loadSource(name, mocks, { time = fakeClock(), processRef = fakeProcess(
         process: processRef, ...time, __dirname: '/memory/src/runtime',
         fetch: forbidden('fetch'), ...extra,
         require(id) {
+            if (id === '../services/account-maintenance-hold') return { isAccountMaintenanceHeld: () => extra.maintenanceHeld === true };
             if (!Object.hasOwn(mocks, id)) throw new Error(`禁止真实 require: ${id}`);
             return mocks[id];
         },
@@ -175,11 +178,12 @@ function loadClient(env = {}, time = fakeClock()) {
         },
         '../utils/request-priority': priority,
         '../utils/utils': { log: noop, logWarn: noop },
+        '../services/account-operation-barrier': { assertGameRequestAllowed: noop, isSceneRequestOwned: () => false },
     }, { time, processRef: fakeProcess({ FARM_ACCOUNT_ID: '2', ...env }), append: '\n;globalThis.pendingState = { pending, pendingStartedAt };' });
     return { ...h, sockets, frames, priority, pendingState: h.context.pendingState };
 }
 
-function loadGateway(time = fakeClock()) {
+function loadGateway(time = fakeClock(), maintenanceHeld = false) {
     const storage = fakeFs();
     const mocks = {
         net: { createServer: forbidden('net.createServer') }, fs: storage, path: path.posix,
@@ -194,8 +198,8 @@ function loadGateway(time = fakeClock()) {
     };
     for (const id of ['../utils/crypto-wasm', '../utils/proto', '../utils/tsdk-runtime', '../services/ace-service', '../utils/gateway-token']) mocks[id] = {};
     const h = loadSource('gateway', mocks, {
-        time, append: '\n;globalThis.gatewayApi = { createConn, accounts, handleWorkerFrame };',
-        extra: { forbiddenConnect: forbidden('gateway.connect') },
+        time, append: '\n;globalThis.gatewayApi = { createConn, accounts, handleWorkerFrame, gatewayOwnsAccount };',
+        extra: { forbiddenConnect: forbidden('gateway.connect'), maintenanceHeld },
     });
     vm.runInContext('connect = forbiddenConnect;', h.context);
     const api = h.context.gatewayApi;
@@ -213,7 +217,7 @@ function loadGateway(time = fakeClock()) {
 
 const account = (id = '2', code = 'disk-old-code') => ({ id, code, name: `模拟账号${id}`, platform: 'wx', wxid: `memory-wx-${id}` });
 
-function loadManager({ env = { FARM_NETWORK_MODE: 'gateway' }, time = fakeClock(), workers = {}, accounts = [account()], scheduler = fakeScheduler(time), route = null } = {}) {
+function loadManager({ env = { FARM_NETWORK_MODE: 'gateway' }, time = fakeClock(), workers = {}, accounts = [account()], scheduler = fakeScheduler(time), route = null, maintenanceHeld = false } = {}) {
     const children = [];
     function fork(...args) {
         const proc = new EventEmitter();
@@ -227,7 +231,7 @@ function loadManager({ env = { FARM_NETWORK_MODE: 'gateway' }, time = fakeClock(
         '../services/scheduler': { createScheduler: () => scheduler }, '../models/store': store,
         '../utils/request-priority': requestPriority(time),
         './gateway-routing': { resolveAccountGatewaySocket: route || ((_id, environment) => ({ socketPath: environment.FARM_GATEWAY_SOCK, blocked: false, delegated: false })) },
-    }, { time, processRef: fakeProcess(env) });
+    }, { time, processRef: fakeProcess(env), extra: { maintenanceHeld } });
     const deps = {
         fork, runtimeMode: 'fork', processRef: h.processRef,
         mainEntryPath: '/memory/client.js', workerScriptPath: '/memory/worker.js', workers, globalLogs: [],
@@ -237,6 +241,15 @@ function loadManager({ env = { FARM_NETWORK_MODE: 'gateway' }, time = fakeClock(
     };
     return { ...h, api: h.api.createWorkerManager(deps), factory: h.api.createWorkerManager, deps, children, workers, scheduler, store };
 }
+
+test('维护停号标记阻止worker及网关建连/续期，但保留只读诊断所有权', () => {
+    const manager = loadManager({ maintenanceHeld: true });
+    assert.equal(manager.api.startWorker(account()), false);
+    assert.equal(manager.children.length, 0);
+    const gateway = loadGateway(fakeClock(), true);
+    assert.equal(gateway.api.gatewayOwnsAccount('2'), false);
+    assert.equal(gateway.api.gatewayOwnsAccount('2', false), true);
+});
 
 function loadEngine(env, initial = {}) {
     const time = fakeClock();
@@ -352,6 +365,7 @@ function loadNetwork(client, { env = { FARM_NETWORK_MODE: 'gateway', FARM_ACCOUN
         '../services/scheduler': { createScheduler: () => fakeScheduler(time) },
         './request-priority': client.priority, './utils': { log: noop, logWarn: noop },
         '../runtime/gateway-client': client.api,
+        '../services/account-operation-barrier': { assertGameRequestAllowed: noop, isSceneRequestOwned: () => false },
     };
     for (const id of ['../services/ace-service', '../services/status', '../services/stats', './proto', './crypto-wasm', './gateway-token', './tsdk-runtime']) mocks[id] = {};
     mocks['../services/status'] = status;
@@ -376,6 +390,7 @@ function loadWorker(network, time, { mocks = {}, extra: overrides = {}, env = {}
         ...network,
         loadProto: async () => {}, getConfigSnapshot: () => ({}), applyRuntimeConfig: noop,
         initStatusBar: noop, setStatusPlatform: noop, log: noop, syncStatus: noop,
+        ranchAutomation: { getRoutineState: () => ({ enabled: false, running: false, nextCheckAt: 0 }) },
         getFriendVisitSessionSnapshot: () => ({ resultState: 'idle', recoveryRequired: false }),
         onKickout: noop, onReconnectFailed: noop,
         saveStats: () => effects.push('saveStats'),
@@ -396,6 +411,7 @@ function loadWorker(network, time, { mocks = {}, extra: overrides = {}, env = {}
         fetch: forbidden('worker.fetch'),
         require(id) {
             required.push(id);
+            if (id === '../services/account-maintenance-hold') return { isAccountMaintenanceHeld: () => extra.maintenanceHeld === true };
             if (!Object.hasOwn(mocks, id)) throw new Error(`禁止真实 require: ${id}`);
             return mocks[id];
         },
@@ -2056,10 +2072,14 @@ function loadFriendHarness(options = {}) {
         applyConfigSnapshot(patch, options) { commits.push({ patch: plain(patch), options: plain(options) }); if (patch.knownFriendGids) gids = [...patch.knownFriendGids]; },
         removeFriendFromCache: noop, readFriendDogInfoCache: () => null, writeFriendDogInfoCache: forbidden('真实狗缓存落盘'),
     };
+    let barrier = null;
+    let coordinator = null;
+    let fakeCurrentOperation = null;
     const network = {
         getDiagnosticSnapshot: () => options.client ? options.client.api.getDiagnosticSnapshot() : snapshot,
         getUserState: () => ({ gid: 42, accountId: '2' }),
         sendMsgAsync: async (service, method, payload, meta) => {
+            if (barrier) barrier.assertGameRequestAllowed(service, method);
             calls.push({ service, method, payload, meta, context: priority.getRequestContext() });
             if (options.client) {
                 const response = await options.client.api.sendMsgAsync(service, method, Buffer.from(JSON.stringify(payload)), meta);
@@ -2085,15 +2105,37 @@ function loadFriendHarness(options = {}) {
         '../config/config': { CONFIG: { platform: 'qq' }, PlantPhase: { MATURE: 6, DEAD: 7 }, PHASE_NAMES: {} },
         '../config/gameConfig': { getItemById: () => null, getPlantById: () => null, getPlantByFruitId: () => null, getPlantName: () => '', getFruitName: () => '' },
     };
+    if (options.realCoordinator) {
+        barrier = loadSource('accountBarrier', {
+            'node:async_hooks': require('node:async_hooks'),
+        }, { time, processRef }).api;
+        coordinator = loadSource('accountCoordinator', { ...common,
+            'node:crypto': require('node:crypto'), './account-operation-barrier': barrier,
+        }, { time, processRef }).api;
+    }
+    const barrierApi = barrier || { getCurrentOperation: () => fakeCurrentOperation };
+    const visitCoordinator = coordinator || { assertSceneOperationAvailable: noop, validateOperationSession: noop,
+        runAccountOperation: async (name, task) => {
+            const previous = fakeCurrentOperation;
+            fakeCurrentOperation = { descriptor: { name } };
+            try { return await task({ accountId: '2', gid: 42, connectionEpoch: 1,
+                remoteGeneration: '7', remoteGenerationSource: 'gateway' }); }
+            finally { fakeCurrentOperation = previous; }
+        } };
     const visitStorage = options.visitStorage || friendVisitMemory();
     const session = loadSource('friendSession', { ...common,
         'node:fs': visitStorage, 'node:path': path.posix, 'node:crypto': { createHash: require('node:crypto').createHash },
         '../config/runtime-paths': { getDataFile: name => `/memory/data/${name}` },
         './json-db': { writeJsonFileAtomic: (file, value) => visitStorage.write(file, value) },
+        // 默认夹具只测好友锁；并发回归显式加载真实协调器与屏障，不接触真实网络。
+        './account-operation-coordinator': visitCoordinator,
+        './ranch-friend-session': { getRanchFriendSessionSnapshot: () => ({ resultState: 'idle' }) },
     }, { time, processRef }).api;
     const interact = loadSource('interact', common, { time, processRef }).api;
     const api = loadSource('friendApi', { ...common, 'protobufjs/minimal': {}, 'node:worker_threads': { parentPort: { postMessage: message => messages.push(message) } },
         'node:async_hooks': { AsyncLocalStorage: require('node:async_hooks').AsyncLocalStorage }, './friend-visit-session': session,
+        './account-operation-coordinator': visitCoordinator,
+        './account-operation-barrier': barrierApi,
         './interact': interact, './friend-operation-limits': limits,
         './stats': { recordOperation: (...args) => placementStats.push(args) } }, { time, processRef, transform: options.sourceTransform }).api;
     const analyzer = loadSource('friendAnalyzer', { ...common, './friend-api': api,
@@ -2103,13 +2145,89 @@ function loadFriendHarness(options = {}) {
     const visit = loadSource('friendVisit', { ...common, './friend-api': api, './friend-land-analyzer': analyzer,
         './friend-operation-limits': limits, './farm-land-analyzer': {}, './stats': { recordOperation: noop, getOperationCount: () => 0 },
         './friend-alert': { notifyCrossAccountSteal: noop }, './warehouse': { sellAllFruits: async () => {} } }, { time, processRef }).api;
-    return { time, priority, api, session, analyzer, visit, interact, calls, commits, messages, visitStorage, placementStats,
+    return { time, priority, api, session, analyzer, visit, interact, calls, commits, messages, visitStorage, placementStats, barrier, coordinator, network,
         badBudget: () => badBudget,
         setRpc(value) { rpc = value; }, setGids(value) { gids = [...value]; },
         setSnapshot(patch) { snapshot = { ...snapshot, ...patch }; },
         state: () => session.getFriendVisitSessionSnapshot('2'),
     };
 }
+
+test('访友事务必须持有同账号场景租约直到唯一Leave完成，牧场不能抢占', async () => {
+    const h = loadFriendHarness({ realCoordinator: true });
+    h.setSnapshot({ remoteGenerationSource: 'gateway' });
+    const enter = pendingReply(); const leave = pendingReply(); const ranchEnd = pendingReply();
+    const order = [];
+    h.setRpc(async (_service, method) => {
+        if (method === 'Enter') { order.push('Enter'); return enter.promise; }
+        if (method === 'Leave') { order.push('Leave'); return leave.promise; }
+        return { body: {} };
+    });
+    const friend = h.api.withFriendVisitSession(11, reply => { order.push('work'); return reply.lands.length; });
+    const friendResult = friend.then(value => ({ value }), error => ({ error }));
+    let ranch; let ranchResult;
+    try {
+        await flush(); assert.deepEqual(h.calls.map(call => call.method), ['Enter']);
+        ranch = h.coordinator.runAccountOperation('ranch-scene', async () => {
+            order.push('ranch'); await ranchEnd.promise; return 'ranch-confirmed';
+        }, { sceneSensitive: true, priority: 'foreground' });
+        ranchResult = ranch.then(value => ({ value }), error => ({ error }));
+        await flush();
+        assert.equal(h.barrier.getBarrierSnapshot()?.name, 'farm-friend-visit');
+        assert.equal(h.coordinator.getAccountOperationSnapshot().queue.queued, 1);
+        assert.equal(order.includes('ranch'), false);
+        await assert.rejects(h.network.sendMsgAsync('gamepb.plantpb.PlantService', 'GetAll', {}), {
+            errorCode: 'ACCOUNT_SCENE_BUSY', sent: false,
+        });
+        await h.network.sendMsgAsync('gamepb.userpb.UserService', 'Heartbeat', {});
+        enter.resolve({ body: { lands: [{ id: 1 }] } }); await flush();
+        assert.equal(h.calls.filter(call => call.method === 'Leave').length, 1);
+        assert.equal(order.includes('ranch'), false, '已发Leave未确认时仍持有租约');
+        leave.resolve({ body: {} });
+        const result = await friendResult; assert.equal(result.error, undefined); assert.equal(result.value, 1);
+        await flush(); assert.equal(h.state().resultState, 'idle');
+        assert.deepEqual(order, ['Enter', 'work', 'Leave', 'ranch']);
+        ranchEnd.resolve(); assert.equal((await ranchResult).value, 'ranch-confirmed');
+        assert.equal(h.calls.filter(call => call.method === 'Enter').length, 1);
+        assert.equal(h.calls.filter(call => call.method === 'Leave').length, 1);
+    } finally {
+        enter.resolve({ body: { lands: [{ id: 1 }] } }); leave.resolve({ body: {} }); ranchEnd.resolve();
+        await Promise.allSettled([friendResult, ...(ranchResult ? [ranchResult] : [])]);
+    }
+});
+
+test('访友取消不能提前释放协调器，Leave真实终态之后牧场才可开始', async () => {
+    const h = loadFriendHarness({ realCoordinator: true });
+    h.setSnapshot({ remoteGenerationSource: 'gateway' });
+    const leave = pendingReply(); const controller = new AbortController();
+    let ranchStarted = false; let ranch;
+    h.setRpc(async (_service, method) => method === 'Enter' ? { body: { lands: [{ id: 1 }] } }
+        : method === 'Leave' ? leave.promise : { body: {} });
+    const friend = h.priority.runWithRequestContext({ signal: controller.signal,
+        deadline: h.time.Date.now() + 60000 }, () => h.api.withFriendVisitSession(11, () => 'work-confirmed'));
+    const friendResult = friend.then(value => ({ value }), error => ({ error }));
+    try {
+        await flush(); assert.equal(h.calls.filter(call => call.method === 'Leave').length, 1);
+        ranch = h.coordinator.runAccountOperation('ranch-scene', async () => {
+            ranchStarted = true; assert.equal(h.state().resultState, 'idle'); return 'confirmed';
+        }, { sceneSensitive: true });
+        const ranchResult = ranch.then(value => ({ value }), error => ({ error }));
+        controller.abort(new Error('页面已关闭'));
+        const cancelled = await friendResult; assert.match(cancelled.error?.message || '', /页面已关闭/);
+        await flush();
+        assert.equal(ranchStarted, false);
+        assert.equal(h.barrier.getBarrierSnapshot()?.name, 'farm-friend-visit');
+        assert.equal(h.coordinator.getAccountOperationSnapshot().queue.queued, 1);
+        leave.resolve({ body: {} }); await flush();
+        const result = await ranchResult; assert.equal(result.error, undefined); assert.equal(result.value, 'confirmed');
+        assert.equal(h.calls.filter(call => call.method === 'Leave').length, 1);
+        assert.equal(h.state().resultState, 'idle');
+        assert.equal(h.barrier.getBarrierSnapshot(), null);
+    } finally {
+        leave.resolve({ body: {} });
+        await Promise.allSettled([friendResult, ...(ranch ? [ranch] : [])]);
+    }
+});
 
 test('好友土地worker→client：Enter11秒+Leave11秒正常非空回包必须交付，进度unknown不吞终态', async () => {
     const client = loadClient(); client.api.connect('2', '', noop);
@@ -2247,7 +2365,7 @@ test('friend Visit：明确false但stage是decode不能冒充服务端拒绝，�
     assert.deepEqual(h.calls.map(call => call.method), ['Enter', 'Harvest']);
 });
 
-test('部署首次保守迁移：真实隔离文件只创建unknown、不覆盖旧记录、不解除访问锁', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('部署首次保守迁移：真实隔离文件只创建unknown、不覆盖旧记录、不解除访问锁', () => {
     const { execFileSync } = require('node:child_process');
     const tmpRoot = process.env.TMPDIR || path.join(__dirname, '../../.workbuddy/tests-deploy-20261109/tmp');
     assert.ok(fs.statSync(tmpRoot).isDirectory());
@@ -2262,7 +2380,7 @@ constants = {node.targets[0].id: node.value.value for node in tree.body
              and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)}
 root = pathlib.Path(sys.argv[2]) / 'data' / 'friend-visit-state'
 root.parent.mkdir()
-remote_root = '/home/example/data/friend-visit-state'
+remote_root = '/home/azureuser/data/friend-visit-state'
 if not hasattr(os, 'chown'): os.chown = lambda *args: None
 payload = {'accountIds': ['1', '2', '10'], 'gatewayId': 'fixture-gateway', 'gatewayStartedAt': 'fixture-start'}
 def run(name, data=payload):
@@ -2321,7 +2439,8 @@ assert not (root.parent / 'accounts.json').exists() and not (root.parent / 'stor
 print(json.dumps({'ok': True, 'cases': 7, 'createdPhase': 'unknown', 'noGameRpc': True}))
 `;
     const output = execFileSync(python, ['-c', script, path.join(__dirname, '../../cloudbase/.ref/deploy.py'), dir], {
-        encoding: 'utf8', timeout: 15000, windowsHide: true,
+        // 本机现有 Python 的独立进程启动已测得约30秒；仍保留有界超时。
+        encoding: 'utf8', timeout: 90000, windowsHide: true,
     });
     assert.equal(JSON.parse(output).ok, true);
     const time = fakeClock();
@@ -2329,11 +2448,12 @@ print(json.dumps({'ok': True, 'cases': 7, 'createdPhase': 'unknown', 'noGameRpc'
         'node:crypto': { createHash: require('node:crypto').createHash },
         '../config/runtime-paths': { getDataFile: name => path.join(dir, 'data', name) },
         './json-db': require('../src/services/json-db'), '../utils/request-priority': requestPriority(time),
+        './account-operation-coordinator': { assertSceneOperationAvailable: noop },
     }, { time, processRef: fakeProcess({ FARM_ACCOUNT_ID: '1' }) }).api;
     assert.equal(session.getFriendVisitSessionSnapshot('1').recoveryRequired, true);
 });
 
-test('好友运维链路隔离回归：日志归档校验、仅过期未尝试票刷新、SFTP标准输入和no-deps切换', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('好友运维链路隔离回归：日志归档校验、仅过期未尝试票刷新、SFTP标准输入和no-deps切换', () => {
     const { execFileSync } = require('node:child_process');
     const tmpRoot = process.env.TMPDIR || path.join(__dirname, '../../.workbuddy/tests-deploy-20261109/tmp');
     assert.ok(fs.statSync(tmpRoot).isDirectory());
@@ -2356,7 +2476,7 @@ state = {'manifestName': 'business-friend-layout-20261109-v6', 'reloadCount': 1,
          'reloadRequestedAt': 'fixture-until'}
 (stage / 'state.json').write_text(json.dumps(state))
 expected = [('2', '2026-11-09T09:20:06.852Z', 10001, 3), ('1', '2026-11-09T09:20:29.814Z', 10001, 4),
-            ('10', '2026-11-09T12:21:13.100Z', 1000000001, 4)]
+            ('10', '2026-11-09T12:21:13.100Z', 1235385310, 4)]
 logs = '\n'.join(['正在启动账号: {"accountId":"' + aid + '"}' for aid, _, _, _ in expected] +
     [stamp + ' {"event":"visit_state_unknown","friendGid":' + str(gid) + ',"transportEpoch":' + str(epoch)
      + ',"message":"gamepb.plantpb.PlantService.Harvest 错误: code=1001040 果实被人摘走"}' for aid, stamp, gid, epoch in expected]).encode()
@@ -2366,7 +2486,7 @@ for aid, _, _, epoch in expected:
 payload = {'stage': stage.as_posix(), 'accounts': [{'id': aid, 'connected': True} for aid, _, _, _ in expected],
            'ownerGids': {'1': 42, '2': 43, '10': 44}}
 real_sha = hashlib.sha256
-raw_script = constants['FRIEND_VISIT_RECOVERY_EVIDENCE_SCRIPT'].replace('/home/example/qq-farm-bot-main/.workbuddy/releases', releases.as_posix()).replace('/home/example/data', data.as_posix())
+raw_script = constants['FRIEND_VISIT_RECOVERY_EVIDENCE_SCRIPT'].replace('/home/azureuser/qq-farm-bot-main/.workbuddy/releases', releases.as_posix()).replace('/home/azureuser/data', data.as_posix())
 def digest(value=b''):
     return types.SimpleNamespace(hexdigest=lambda: source_sha) if value == b'fixture-old-source' else real_sha(value)
 def run(**kwargs):
@@ -2419,8 +2539,8 @@ def load_functions(names, env):
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), env)
 env = {'pathlib': pathlib, 'io': io, 'json': json, 'shlex': shlex, 'REMOTE': '/fixture/project', 'BASE': str(root),
        'tarfile': tarfile, 'hashlib': hashlib, 'RELEASE_BACKEND_ALLOWLIST': {'core/src/services/friend-api.js', 'core/src/runtime/data-provider.js'},
-       'RELEASE_STATIC_ALLOWLIST': set()}
-load_functions({'app_only_compose_command', 'load_panel_credentials', 'remote_file_json', 'load_release_manifest'}, env)
+       'RELEASE_STATIC_ALLOWLIST': set(), 'RELEASE_COMBINED_MIGRATION': constants['RELEASE_COMBINED_MIGRATION']}
+load_functions({'app_only_compose_command', 'load_panel_credentials', 'remote_file_json', 'registered_release_artwork', 'load_release_manifest'}, env)
 assert "-f /fixture/project/docker-compose.yml build qq-farm-bot" in env['app_only_compose_command']('build', 'qq-farm-bot')
 command = env['app_only_compose_command']('up', '-d', '--no-deps', '--force-recreate', '--no-build', '--pull', 'never', 'qq-farm-bot')
 assert '--no-deps' in command and 'farm-gateway' not in command
@@ -2508,7 +2628,7 @@ assert not simulate('success', enabled=False)[2]
 print(json.dumps({'ok': True, 'cases': 22, 'noGameRpc': True}))
 `;
     const output = execFileSync(python, ['-c', script, path.join(__dirname, '../../cloudbase/.ref/deploy.py'), dir], {
-        encoding: 'utf8', timeout: 20000, windowsHide: true,
+        encoding: 'utf8', timeout: 90000, windowsHide: true,
     });
     assert.equal(JSON.parse(output).ok, true);
 });
@@ -2526,6 +2646,8 @@ test('friend Visit本地隔离实盘：使用真实原子JSON写入，两模块�
         'node:crypto': { createHash: require('node:crypto').createHash },
         '../config/runtime-paths': { getDataFile: name => path.join(dir, name) },
         './json-db': jsonDb, '../utils/request-priority': requestPriority(time),
+        './account-operation-coordinator': { assertSceneOperationAvailable: noop },
+        './ranch-friend-session': { getRanchFriendSessionSnapshot: () => ({ resultState: 'idle' }) },
     }, { time, processRef: fakeProcess({ FARM_ACCOUNT_ID: '2' }) }).api;
     const first = load();
     const token = await first.acquireFriendVisitSession(11, { accountId: '2', epoch: 7 });

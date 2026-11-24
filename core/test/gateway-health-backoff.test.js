@@ -71,6 +71,7 @@ function harness(direct = false) {
     const gc = load('../src/runtime/gateway-client.js', {
         net: { connect: () => new Socket() }, events: { EventEmitter },
         './gateway-protocol': protocol, '../utils/request-priority': priority, '../utils/utils': utils,
+        '../services/account-operation-barrier': { assertGameRequestAllowed() {}, isSceneRequestOwned: () => false },
     });
     let api = gc;
     let encryption = null;
@@ -99,6 +100,7 @@ function harness(direct = false) {
             './utils': utils, './crypto-wasm': { encryptBuffer: bytes => encryption ? encryption(bytes) : bytes, setRuntime() {} },
             './gateway-token': { createGatewayToken: () => 'mock' }, './tsdk-runtime': {},
             './request-priority': priority, 'node:worker_threads': {},
+            '../services/account-operation-barrier': { assertGameRequestAllowed() {}, isSceneRequestOwned: () => false },
         }, '\nmodule.exports.__mock = { login(socket) { ws = socket; userState.gid = 1; }, handleMessage, rejectAllPendingRequests };');
         api.__mock.login(new Socket());
     }
@@ -157,6 +159,28 @@ function harness(direct = false) {
 
 for (const direct of [false, true]) {
     const mode = direct ? 'direct' : 'gateway';
+    test(`${mode}: 等待传输队列时撤销好友写入许可，不发送旧请求`, async () => {
+        const h = harness(direct);
+        const jobs = Array.from({ length: 8 }, (_, i) => capture(h.api.sendMsgAsync(PLANT, 'Harvest', Buffer.from([i]))));
+        await flush();
+        let allowed = true;
+        const write = capture(h.api.sendMsgAsync('gamepb.animalpb.RanchService', 'PutHazard', BAG, {
+            assertCanSend() {
+                if (!allowed) throw h.priority.requestError('名单已变更', { errorCode: 'RANCH_FRIEND_ACTION_DISABLED' });
+            },
+        }));
+        await flush();
+        assert.equal(h.api.getRequestQueueSnapshot().queued, 1);
+        assert.equal(h.requests().length, 8);
+        allowed = false;
+        h.reply(h.requests()[0]);
+        assert.equal((await write).error.resultState, 'not_sent');
+        assert.equal(h.requests().length, 8);
+        for (const request of h.requests().slice(1)) h.reply(request);
+        await Promise.all(jobs);
+        await h.clean();
+    });
+
     test(`${mode}: 真实 gate 8+1、degraded 清业务队列且不误拦 HB/ACE`, async () => {
         const h = harness(direct);
         const jobs = Array.from({ length: 8 }, (_, i) => capture(h.api.sendMsgAsync(PLANT, 'Harvest', Buffer.from([i]))));
@@ -422,6 +446,25 @@ test('direct: 加密中 queued deadline/退避/换 socket 复核，无过期 sen
         assert.equal(h.requests().length, 0);
         await h.clean();
     }
+});
+
+test('direct: 加密期间撤销好友写入许可，套接字不发送', async () => {
+    const h = harness(true);
+    let unlock;
+    let allowed = true;
+    h.deferEncryption(bytes => new Promise(resolve => { unlock = () => resolve(bytes); }));
+    const job = capture(h.api.sendMsgAsync('gamepb.animalpb.RanchService', 'PutHazard', BAG, {
+        assertCanSend() {
+            if (!allowed) throw h.priority.requestError('名单已变更', { errorCode: 'RANCH_FRIEND_ACTION_DISABLED' });
+        },
+    }));
+    await flush();
+    assert.equal(typeof unlock, 'function');
+    allowed = false;
+    unlock();
+    assert.equal((await job).error.resultState, 'not_sent');
+    assert.equal(h.requests().length, 0);
+    await h.clean();
 });
 
 test('ALS: context 与 priority 双向嵌套合并不丢 signal/deadline', async () => {
@@ -1084,11 +1127,31 @@ test('raw 精确白名单可核，不匹配 service 或 Get 前缀绝不共享',
         ['gamepb.shoppb.ShopService', 'ShopInfo'],
         ['gamepb.shoppb.ShopService', 'ShopProfiles'],
         ['gamepb.mallpb.MallService', 'GetMallListBySlotType'],
+        ['gamepb.homesteadpb.HomesteadService', 'AllCells'],
+        ['gamepb.animalpb.AnimalService', 'GetRanchDetail'],
+        ['gamepb.animalpb.RanchService', 'GetRanchOpTimes'],
+        ['gamepb.itempb.ItemService', 'GetBag'],
+        ['gamepb.homesteadpb.HomesteadService', 'GetFacilityDetail'],
+        ['gamepb.paypb.PayService', 'GetRechargeInfo'],
+        ['gamepb.taskpb.TaskService', 'TaskInfo'],
+        ['gamepb.illustratedpb.IllustratedService', 'GetIllustratedListV2'],
+        ['gamepb.illustratedpb.IllustratedService', 'GetIllustratedLevelListV2'],
+        ['gamepb.illustratedpb.IllustratedService', 'GetRanchWeightScoreV2'],
+        ['gamepb.userpb.UserService', 'BatchGetBasicInfo'],
+        ['gamepb.sharepb.ShareService', 'CheckCanShare'],
+        ['gamepb.shoppb.ShopService', 'RotationShopInfo'],
+        ['gamepb.activitypb.ActivityService', 'List'],
     ];
     assert.equal(JSON.stringify(h.priority.SAFE_READ_METHODS), JSON.stringify(expected));
     for (const [service, method] of expected) assert.equal(h.priority.isSafeReadRequest(service, method), true);
     assert.equal(h.priority.isSafeReadRequest(ITEM, 'GetUnknown'), false);
     assert.equal(h.priority.isSafeReadRequest('other', 'Bag'), false);
+    for (const [service, method] of [
+        ['gamepb.taskpb.TaskService', 'BatchClaimTaskReward'],
+        ['gamepb.illustratedpb.IllustratedService', 'ClaimAllRewardsV2'],
+        ['gamepb.illustratedpb.IllustratedService', 'ClaimRanchWeightScoreRewardV2'],
+        ['gamepb.sharepb.ShareService', 'ReportShare'], ['gamepb.sharepb.ShareService', 'ClaimShareReward'],
+    ]) assert.equal(h.priority.isSafeReadRequest(service, method), false, `${service}.${method} must stay a write`);
     assert.equal(h.priority.isCriticalRequest(PLANT, 'Heartbeat'), false);
     await h.clean();
 });

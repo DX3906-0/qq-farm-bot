@@ -405,6 +405,38 @@ export const vFoldMotion: ObjectDirective<HTMLDetailsElement> = (() => {
   }
 })()
 
+// A workspace journey finishes only when both the authorized route has painted
+// and its decorative animation has ended. Late/canceled events cannot release
+// another journey or any account/game operation state.
+export function createWorkspaceTravel(onComplete: () => void = () => {}) {
+  const active = ref<{ id: number, destination: 'farm' | 'ranch', path: string, arrived: boolean, painted: boolean } | null>(null)
+  let disposed = false
+  function finish() {
+    if (!active.value?.arrived || !active.value.painted) return
+    active.value = null
+    onComplete()
+  }
+  return {
+    active,
+    begin(id: number, destination: 'farm' | 'ranch', path: string) {
+      if (disposed || !Number.isSafeInteger(id) || id < 1) return
+      active.value = { id, destination, path, arrived: false, painted: false }
+    },
+    painted(id: number, path: string) {
+      if (active.value?.id !== id || active.value.path !== path) return
+      active.value.painted = true
+      finish()
+    },
+    arrived(id: number) {
+      if (active.value?.id !== id) return
+      active.value.arrived = true
+      finish()
+    },
+    cancel() { active.value = null },
+    dispose() { disposed = true; active.value = null },
+  }
+}
+
 // Optimistic navigation feedback is separate from committed page state.
 // Only the newest request may restore it on a redirect/rejection; a stale
 // completion never steals selection from a newer click or browser navigation.

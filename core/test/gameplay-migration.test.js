@@ -7,7 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const protobuf = require('protobufjs');
 const priority = require('../src/utils/request-priority');
-const root = new protobuf.Root().loadSync(['avatarframepb.proto', 'collectionpb.proto', 'itempb.proto', 'plantpb.proto', 'redpacketpb.proto', 'solartermspb.proto', 'skinpb.proto']
+const root = new protobuf.Root().loadSync(['avatarframepb.proto', 'collectionpb.proto', 'itempb.proto', 'plantpb.proto', 'redpacketpb.proto', 'solartermspb.proto', 'skinpb.proto', 'shoppb.proto']
     .map(name => path.join(__dirname, '../src/proto', name)), { keepCase: true });
 root.resolveAll();
 const type = name => root.lookupType(name);
@@ -33,8 +33,11 @@ const lookup = {
     SkinsOwnedRequest: 'gamepb.skinpb.SkinsOwnedRequest', SkinsOwnedReply: 'gamepb.skinpb.SkinsOwnedReply',
     SkinsEquippedRequest: 'gamepb.skinpb.SkinsEquippedRequest', SkinsEquippedReply: 'gamepb.skinpb.SkinsEquippedReply',
     EquipSkinRequest: 'gamepb.skinpb.EquipRequest', EquipSkinReply: 'gamepb.skinpb.EquipReply',
+    EquipSkinPartRequest: 'gamepb.skinpb.EquipSkinPartRequest', EquipSkinPartReply: 'gamepb.skinpb.EquipSkinPartReply',
     GetSkinEffectTypeParamsRequest: 'gamepb.skinpb.GetSkinEffectTypeParamsRequest', GetSkinEffectTypeParamsReply: 'gamepb.skinpb.GetSkinEffectTypeParamsReply',
     MarkSkinAsViewedRequest: 'gamepb.skinpb.MarkAsViewedRequest', MarkSkinAsViewedReply: 'gamepb.skinpb.MarkAsViewedReply',
+    ShopInfoRequest: 'gamepb.shoppb.ShopInfoRequest', ShopInfoReply: 'gamepb.shoppb.ShopInfoReply',
+    BuyGoodsRequest: 'gamepb.shoppb.BuyGoodsRequest', BuyGoodsReply: 'gamepb.shoppb.BuyGoodsReply',
 };
 const types = Object.fromEntries(Object.entries(lookup).map(([name, full]) => [name, type(full)]));
 const encode = (name, obj) => types[name].encode(types[name].fromObject(obj)).finish();
@@ -45,7 +48,7 @@ function harness() {
     const ledgers = new Map();
     const diagnostic = { accountId: 'fixture', connected: true, loggedIn: true, detached: false, connectionEpoch: 1, remoteGeneration: 1 };
     const user = { gid: 123, level: 125 };
-    const h = { calls, writes, diagnostic, user, ledgers, onRpc: null };
+    const h = { calls, writes, diagnostic, user, ledgers, onRpc: null, serverNow: 1000 };
     const network = {
         getDiagnosticSnapshot: () => ({ ...diagnostic }), getUserState: () => user,
         sendMsgAsync: async (service, method, bytes) => {
@@ -55,7 +58,7 @@ function harness() {
             const requestName = skinRequest || (['AvatarFramesOwned', 'AvatarFramesEquiped'].includes(method) ? `${method}Request` : `${prefix}${method}Request`);
             const request = types[requestName]?.toObject(types[requestName].decode(bytes), { longs: String }) || {};
             calls.push({ service, method, request });
-            if (!['Bag', 'AllLands', 'AvatarFramesOwned', 'AvatarFramesEquiped', 'GetCollections', 'GetTodayClaimStatus', 'SkinsOwned', 'SkinsEquipped', 'GetSkinEffectTypeParams'].includes(method)) writes.push({ method, request });
+            if (!['Bag', 'AllLands', 'AvatarFramesOwned', 'AvatarFramesEquiped', 'GetCollections', 'GetTodayClaimStatus', 'SkinsOwned', 'SkinsEquipped', 'GetSkinEffectTypeParams', 'ShopInfo'].includes(method)) writes.push({ method, request });
             const result = await h.onRpc?.(method, request);
             if (Buffer.isBuffer(result)) return { body: result, resultState: 'completed' };
             const replyName = skinRequest ? skinRequest.replace(/Request$/, 'Reply')
@@ -94,7 +97,7 @@ function harness() {
                 if (dep === './game-command') return h.commands;
                 if (dep === './status') return { updateStatusGold() {} };
                 if (dep === '../models/store') return { isAutomationOn: () => false };
-                if (dep === '../utils/utils') return { toNum: value => Number(value) || 0, toLong: value => String(value), log() {}, logWarn() {}, sleep: async () => {} };
+                if (dep === '../utils/utils') return { toNum: value => Number(value) || 0, toLong: value => String(value), getServerTimeSec: () => h.serverNow, log() {}, logWarn() {}, sleep: async () => {} };
                 if (dep === '../config/runtime-paths') return { getResourcePath: (...parts) => path.join(__dirname, '../src', ...parts) };
                 if (dep === '../config/gameConfig') return { getItemById: info, getItemImageById: () => '', getPlantBySeedId: id => Number(id) === 20001 ? { name: '种子', size: 1 } : null,
                     getPlantByFruitId: () => null, isSeedItem: id => Number(id) === 20001, getSeedImageBySeedId: () => '', getSeedLevel: () => 1 };
@@ -105,8 +108,331 @@ function harness() {
         return module.exports;
     }
     h.load = load;
+    h.reload = name => { delete cache[name]; return load(name); };
     return h;
 }
+
+function decorationHarness(goods = [{ id: 501, item_id: 2130, item_count: 1, price: 30, unlocked: true }]) {
+    const h = harness();
+    h.goods = goods;
+    h.onRpc = (method, request) => {
+        if (method === 'ShopInfo') return { goods_list: h.goods };
+        if (method === 'Bag') return { item_bag: { items: [{ id: 1005, count: 100, uid: 1 }] } };
+        if (method === 'BuyGoods') {
+            const entry = h.goods.find(row => row.id === Number(request.goods_id));
+            return { goods: entry, get_items: [{ id: entry.item_id, count: entry.item_count * Number(request.num) }],
+                cost_items: Number(request.price) > 0 ? [{ id: 1005, count: Number(request.price) * Number(request.num) }] : [] };
+        }
+        throw new Error('Unexpected shop RPC ' + method);
+    };
+    h.service = h.load('decoration-shop');
+    return h;
+}
+const decorationOffer = row => ({ itemId: row.itemId, itemCount: row.itemCount, currencyId: row.currencyId, price: row.price });
+
+function seedRoutesHarness(reply = { goods_list: [{ id: 15, item_id: 20002, item_count: 1, price: 50, unlocked: true }] }) {
+    const routes = new Map(), calls = [];
+    const filename = path.join(__dirname, '../src/controllers/admin-seed-shop-routes.js');
+    const module = { exports: {} };
+    vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module, console,
+        require(name) {
+            if (name === '../config/gameConfig') return require('../src/config/gameConfig');
+            if (name === '../utils/utils') return { toNum: value => Number(value) || 0, getServerTimeSec: () => 1000 };
+            throw new Error('Unexpected seed route dependency ' + name);
+        },
+    }, { filename });
+    const provider = {
+        getStatus: () => ({ connection: { connected: true }, status: { level: 109 } }),
+        getShopInfo: async (id, shop) => { calls.push({ id, shop }); return reply; },
+        getSeeds: async () => [],
+    };
+    module.exports.registerAdminSeedShopRoutes({ app: { get: (key, handler) => routes.set(key, handler) }, provider,
+        adminLogger: { error() {} }, getAccountIdFromRequest: req => req.accountId,
+        canAccessAccount: req => req.allowed !== false,
+        sendProviderError: (res, error) => res.json({ ok: false, error: error.message }),
+    });
+    return { provider, calls, module: module.exports, async run(req = { accountId: 'fixture' }) {
+        let body, status = 200;
+        const res = { json(value) { body = value; return this; }, status(value) { status = value; return this; } };
+        await routes.get('/api/shop/seed')(req, res);
+        return { status, body: clone(body) };
+    } };
+}
+
+test('shop protocol preserves all official decoration/scene/discount fields and never confuses item and goods IDs', () => {
+    const fields = type('gamepb.shoppb.GoodsInfo').fields;
+    for (const [name, id] of [['is_display_countdown', 9], ['end_time', 10], ['discount_price', 11], ['discount_start_time', 12], ['discount_end_time', 13], ['show_conds', 14], ['owned', 15]]) assert.equal(fields[name].id, id);
+    assert.equal(type('gamepb.shoppb.ShopProfilesRequest').fields.global_scene_id.id, 1);
+    assert.equal(type('gamepb.shoppb.ShopProfile').fields.global_scene_ids.id, 4);
+    assert.equal(type('gamepb.shoppb.BuyGoodsRequest').fields.auto_add.id, 4);
+    const decoded = types.ShopInfoReply.decode(encode('ShopInfoReply', { goods_list: [{ id: 501, item_id: 2130, item_count: 1, owned: true, show_conds: [{ type: 'activity', params: 'x' }] }] }));
+    assert.equal(Number(decoded.goods_list[0].id), 501); assert.equal(Number(decoded.goods_list[0].item_id), 2130);
+    assert.equal(decoded.goods_list[0].owned, true); assert.equal(decoded.goods_list[0].show_conds[0].type, 'activity');
+});
+
+test('decoration shop reads full ShopInfo(4) catalog without hardcoded frame IDs or any purchase/extra bag read', async () => {
+    const h = decorationHarness([{ id: 501, item_id: 2130, item_count: 1, price: 30, unlocked: true },
+        { id: 502, item_id: 2131, item_count: 1, price: 40, unlocked: true, owned: true },
+        { id: 503, item_id: 201012, item_count: 1, price: 50, unlocked: false }]);
+    const result = await h.service.getDecorationShop();
+    assert.equal(result.items.length, 3); assert.equal(result.shopId, 4); assert.equal(result.currencyId, 1005);
+    assert.deepEqual(clone(h.calls), [{ service: 'gamepb.shoppb.ShopService', method: 'ShopInfo', request: { shop_id: '4' } }]);
+    assert.equal(result.items[0].price, 30); assert.equal(result.items[1].availability, 'owned');
+    assert.equal(result.items[2].availability, 'locked'); assert.equal(h.writes.length, 0);
+});
+
+test('decoration free promotion requires active positive dates; prototype default prices are not fabricated free offers', async () => {
+    const h = decorationHarness();
+    const Type = type('gamepb.shoppb.GoodsInfo');
+    const missing = Type.decode(Type.encode(Type.fromObject({ id: 501, item_id: 2130, item_count: 1, unlocked: true })).finish());
+    assert.equal(h.service.buildDecorationGoods(missing).price, null);
+    assert.equal(h.service.buildDecorationGoods(missing).canBuy, false);
+    const free = Type.decode(Type.encode(Type.fromObject({ id: 501, item_id: 2130, item_count: 1, price: 30, unlocked: true, discount_start_time: 900, discount_end_time: 1100 })).finish());
+    assert.equal(Object.hasOwn(free, 'discount_price'), false);
+    const active = h.service.buildDecorationGoods(free);
+    assert.equal(active.price, 0); assert.equal(active.originalPrice, 30); assert.equal(active.isFree, true); assert.equal(active.canBuy, true);
+    h.serverNow = 1100;
+    assert.equal(h.service.buildDecorationGoods(free).price, 30); assert.equal(h.service.buildDecorationGoods(free).isFree, false);
+    const future = { ...free, discount_start_time: 1200, discount_end_time: 1300 };
+    assert.equal(h.service.buildDecorationGoods(future).price, 30);
+    assert.equal(h.service.buildDecorationGoods({ ...free, price: 'not-a-price', discount_start_time: 0 }).canBuy, false);
+});
+
+test('decoration owned/sold-out/expired/unverified countdown stay visible and unavailable', () => {
+    const h = decorationHarness();
+    for (const [extra, expected] of [[{ owned: true }, 'owned'], [{ limit_count: 1, bought_num: 1 }, 'sold_out'],
+        [{ end_time: 999 }, 'expired'], [{ is_display_countdown: true }, 'unverified'], [{ unlocked: false }, 'locked']]) {
+        const item = h.service.buildDecorationGoods({ ...h.goods[0], ...extra });
+        assert.equal(item.availability, expected); assert.equal(item.canBuy, false);
+    }
+});
+
+test('decoration HTTP routes bind account, return the complete provider catalog, and reject unconfirmed purchase receipts', async () => {
+    const filename = path.join(__dirname, '../src/controllers/admin-decoration-shop-routes.js'), module = { exports: {} }, routes = new Map(), calls = [];
+    vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module });
+    let catalog = { accountId: 'fixture', stateKnown: true, shopId: 4, currencyId: 1005, serverTime: 1000,
+        items: [{ id: 501, itemId: 2130 }, { id: 502, itemId: 2131 }, { id: 503, itemId: 201012 }] };
+    const provider = { getStatus: () => ({ connection: { connected: true }, status: { goldBean: 100 } }),
+        getDecorationShop: async id => { calls.push(id); return catalog; },
+        buyDecorationGoods: async () => ({ accountId: 'fixture', outcome: 'completed', getItems: [] }) };
+    module.exports.registerAdminDecorationShopRoutes({ app: { get: (key, handler) => routes.set(key, handler), post: (key, handler) => routes.set(key, handler) },
+        provider, adminLogger: { error() {} }, getAccountIdFromRequest: req => req.accountId,
+        canAccessAccount: req => req.allowed !== false, sendProviderError: (res, error) => res.json({ ok: false, error: error.message, outcomeUnknown: error.outcomeUnknown }) });
+    async function run(route, req = { accountId: 'fixture', body: {} }) {
+        let body, status = 200;
+        const res = { json(value) { body = value; return this; }, status(value) { status = value; return this; } };
+        await routes.get(route)(req, res); return { body: clone(body), status };
+    }
+    assert.equal((await run('/api/shop/decoration')).body.data.length, 3); assert.deepEqual(calls, ['fixture']);
+    assert.equal((await run('/api/shop/decoration', { accountId: 'fixture', allowed: false })).status, 403); assert.equal(calls.length, 1);
+    catalog = { ...catalog, accountId: 'another' };
+    assert.equal((await run('/api/shop/decoration')).body.ok, false);
+    const missing = await run('/api/shop/decoration/buy');
+    assert.equal(missing.body.ok, false); assert.equal(missing.body.outcomeUnknown, true);
+});
+
+test('decoration purchase validates one live offer, uses 1005 and one BuyGoods, confirms actual rewards/costs', async () => {
+    const h = decorationHarness();
+    const offer = (await h.service.getDecorationShop()).items[0];
+    const result = await h.service.buyDecorationGoods(501, 1, decorationOffer(offer));
+    assert.equal(result.outcome, 'completed'); assert.equal(result.accountId, 'fixture');
+    assert.deepEqual(clone(result.getItems), [{ id: 2130, count: 1 }]);
+    assert.deepEqual(clone(result.costItems), [{ id: 1005, count: 30 }]);
+    assert.deepEqual(clone(h.writes), [{ method: 'BuyGoods', request: { goods_id: '501', num: '1', price: '30' } }]);
+    assert.ok([...h.ledgers.values()].every(ledger => Object.keys(ledger).length === 0));
+});
+
+test('decoration zero-price promotion purchases once without a paid wallet check or wardrobe equip', async () => {
+    const h = decorationHarness([{ id: 501, item_id: 2130, item_count: 1, price: 30, unlocked: true, discount_start_time: 900, discount_end_time: 1100 }]);
+    const offer = (await h.service.getDecorationShop()).items[0];
+    const result = await h.service.buyDecorationGoods(501, 1, decorationOffer(offer));
+    assert.equal(result.costItems.length, 0); assert.equal(h.calls.some(row => row.method === 'Bag'), false);
+    assert.equal(h.writes.length, 1); assert.equal(h.writes[0].request.price, '0');
+});
+
+test('decoration changed price/content, over-limit and locked currency reject before purchase', async () => {
+    for (const mode of ['price', 'content', 'limit', 'currency']) {
+        const h = decorationHarness(); const offer = (await h.service.getDecorationShop()).items[0];
+        if (mode === 'price') h.goods[0].price++;
+        if (mode === 'content') h.goods[0].item_id = 2131;
+        if (mode === 'limit') { h.goods[0].limit_count = 1; h.goods[0].bought_num = 1; }
+        if (mode === 'currency') {
+            const original = h.onRpc; h.onRpc = (method, request) => method === 'Bag'
+                ? { item_bag: { items: [{ id: 1005, count: 100, uid: 1, locked: true }] } } : original(method, request);
+        }
+        await assert.rejects(h.service.buyDecorationGoods(501, 1, decorationOffer(offer)));
+        assert.equal(h.writes.length, 0, mode);
+    }
+});
+
+test('decoration timeout and inconsistent success response remain durably blocked across service reload', async () => {
+    for (const mode of ['timeout', 'empty', 'currency']) {
+        const h = decorationHarness(); const offer = (await h.service.getDecorationShop()).items[0];
+        const original = h.onRpc;
+        h.onRpc = (method, request) => {
+            if (method !== 'BuyGoods') return original(method, request);
+            if (mode === 'timeout') throw new Error('timeout');
+            return { goods: h.goods[0], get_items: mode === 'empty' ? [] : [{ id: 2130, count: 1 }], cost_items: [{ id: mode === 'currency' ? 1002 : 1005, count: 30 }] };
+        };
+        await assert.rejects(h.service.buyDecorationGoods(501, 1, decorationOffer(offer)), error => error.resultState === 'unknown');
+        const restarted = h.reload('decoration-shop');
+        assert.equal((await restarted.getDecorationShop()).items[0].resultUnknown, true);
+        await assert.rejects(restarted.buyDecorationGoods(501, 1, decorationOffer(offer)), /未确认|重放/);
+        assert.equal(h.writes.length, 1, mode);
+    }
+});
+
+test('shop4 forage is a seed offer with its real SKU/price; currency is not guessed from the wardrobe or sell price', async () => {
+    const h = decorationHarness([{ id: 2129, item_id: 20040, item_count: 1, price: 20, unlocked: true }]);
+    const item = (await h.service.getDecorationShop()).items[0];
+    assert.equal(item.id, 2129); assert.equal(item.itemId, 20040); assert.equal(item.itemType, 5);
+    assert.equal(item.category, 'seed'); assert.equal(item.isForage, true); assert.equal(item.price, 20);
+    assert.equal(item.currencyId, null); assert.equal(item.currencyKnown, false); assert.equal(item.canBuy, false);
+    assert.equal(item.availability, 'unverified');
+    await assert.rejects(h.service.buyDecorationGoods(2129, 1, decorationOffer(item)), error => error.sent === false && error.resultState === 'not_sent');
+    assert.equal(h.writes.length, 0); assert.equal(h.ledgers.size, 0);
+});
+
+test('old forage unknown survives classification and service reload; blocking it does not pretend to send a new write', async () => {
+    const h = decorationHarness([{ id: 2129, item_id: 20040, item_count: 1, price: 20, unlocked: true }]);
+    const crypto = require('node:crypto');
+    const file = path.join('game-command-state', 'decoration-shop', `${crypto.createHash('sha256').update('fixture').digest('hex').slice(0, 24)}.json`);
+    const key = crypto.createHash('sha256').update('BuyGoods:2129').digest('hex');
+    h.ledgers.set(file, { [key]: { phase: 'pending', at: Date.now() } });
+    const before = clone(h.ledgers.get(file));
+    const item = (await h.service.getDecorationShop()).items[0];
+    assert.equal(item.category, 'seed'); assert.equal(item.resultUnknown, true); assert.equal(item.canBuy, false);
+    assert.equal(item.availability, 'unknown');
+    const service = h.reload('decoration-shop');
+    await assert.rejects(service.buyDecorationGoods(2129, 1, {}), error => error.sent === false
+        && error.resultState === 'unknown' && error.outcomeUnknown === false && error.priorOutcomeUnknown === true);
+    assert.deepEqual(clone(h.ledgers.get(file)), before); assert.equal(h.writes.length, 0);
+});
+
+test('one SKU unknown cannot turn another SKU pre-write validation or a catalog read into a newly-sent unknown', async () => {
+    const h = decorationHarness([{ id: 501, item_id: 2130, item_count: 1, price: 30, unlocked: true },
+        { id: 502, item_id: 2131, item_count: 1, price: 40, unlocked: true }]);
+    const original = h.onRpc;
+    h.onRpc = (method, request) => method === 'BuyGoods' && Number(request.goods_id) === 501
+        ? Promise.reject(new Error('timeout')) : original(method, request);
+    await assert.rejects(h.service.buyDecorationGoods(501, 1, { itemId: 2130, itemCount: 1, price: 30, currencyId: 1005 }), { outcomeUnknown: true });
+    const before = [...h.ledgers.values()].map(clone);
+    await assert.rejects(h.service.buyDecorationGoods(502, 1, { itemId: 2131, itemCount: 1, price: 41, currencyId: 1005 }),
+        error => error.sent === false && error.resultState === 'not_sent' && error.errorCode === 'SHOP_OFFER_CHANGED');
+    h.onRpc = () => { throw h.commands.validation('catalog temporarily unavailable', 'SHOP_CATALOG_UNAVAILABLE'); };
+    await assert.rejects(h.service.getDecorationShop(), error => error.sent === false && error.resultState === 'not_sent');
+    assert.deepEqual([...h.ledgers.values()].map(clone), before); assert.equal(h.writes.length, 1);
+});
+
+test('current-operation write followed by an unsent read/validation failure must remain durably unknown', async () => {
+    const h = decorationHarness();
+    const scope = h.commands.createGameCommandScope('receipt-probe');
+    await assert.rejects(scope.execute(async session => {
+        await scope.rpc(session, 'gamepb.shoppb.ShopService', 'BuyGoods', 'BuyGoodsRequest', 'BuyGoodsReply',
+            { goods_id: 501, num: 1, price: 30 }, { write: true, key: 'one-purchase' });
+        throw h.commands.validation('post-write verification was cancelled');
+    }), error => error.sent === true && error.resultState === 'unknown' && error.outcomeUnknown === true);
+    assert.equal(h.writes.length, 1); assert.ok([...h.ledgers.values()].some(ledger => Object.values(ledger).some(x => x.phase === 'pending')));
+});
+
+test('purchase receipt may omit optional goods update, but exact rewards and costs are still mandatory', async () => {
+    const h = decorationHarness();
+    const original = h.onRpc;
+    h.onRpc = (method, request) => {
+        const result = original(method, request);
+        if (method === 'BuyGoods') delete result.goods;
+        return result;
+    };
+    const item = (await h.service.getDecorationShop()).items[0];
+    const result = await h.service.buyDecorationGoods(501, 1, decorationOffer(item));
+    assert.equal(result.outcome, 'completed'); assert.equal(result.getItems[0].count, 1);
+    assert.equal(result.costItems[0].id, 1005); assert.equal(result.costItems[0].count, 30);
+    assert.equal(h.writes.length, 1); assert.ok([...h.ledgers.values()].every(ledger => Object.keys(ledger).length === 0));
+    const bad = decorationHarness(); const normal = bad.onRpc;
+    bad.onRpc = (method, request) => method === 'BuyGoods' ? { ...normal(method, request), goods: { id: 999 } } : normal(method, request);
+    await assert.rejects(bad.service.buyDecorationGoods(501, 1, decorationOffer((await bad.service.getDecorationShop()).items[0])), { outcomeUnknown: true });
+    assert.equal(bad.writes.length, 1);
+});
+
+test('definitive remote rejection is not changed to unknown and removes only this newly-reserved operation', async () => {
+    const h = decorationHarness(); const original = h.onRpc;
+    h.onRpc = (method, request) => {
+        if (method === 'BuyGoods') throw priority.requestError('remote rejection', {
+            errorCode: 1001001, stage: 'remote', sent: true, resultState: 'failed', outcomeUnknown: false,
+        });
+        return original(method, request);
+    };
+    const item = (await h.service.getDecorationShop()).items[0];
+    await assert.rejects(h.service.buyDecorationGoods(501, 1, decorationOffer(item)),
+        error => error.resultState === 'failed' && error.outcomeUnknown === false && error.errorCode === 1001001);
+    assert.equal(h.writes.length, 1); assert.ok([...h.ledgers.values()].every(ledger => Object.keys(ledger).length === 0));
+});
+
+test('legacy generic purchase cannot bypass forage SKU2129 durable protection, while other goods still use their existing route', async () => {
+    const filename = path.join(__dirname, '../src/controllers/admin-shop-purchase-routes.js'), module = { exports: {} }, routes = new Map(), calls = [];
+    vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module, require: name => {
+        if (name === '../utils/utils') return { toNum: value => Number(value) || 0 };
+        throw new Error('unexpected purchase route dependency');
+    } }, { filename });
+    module.exports.registerAdminShopPurchaseRoutes({ app: { post: (url, handler) => routes.set(url, handler) },
+        provider: { buyGoods: async (...args) => { calls.push(args); return { get_items: [], cost_items: [] }; } },
+        getAccountIdFromRequest: () => 'fixture', canAccessAccount: () => true,
+        sendProviderError: (res, error) => res.json({ ok: false, error: error.message }) });
+    let result, status;
+    const res = { json(value) { result = value; return this; }, status(value) { status = value; return this; } };
+    await routes.get('/api/shop/buy')({ body: { goodsId: 2129, num: 1, price: 20 } }, res);
+    assert.equal(status, 409); assert.equal(result.sent, false); assert.equal(result.outcomeUnknown, false);
+    assert.equal(calls.length, 0);
+    await routes.get('/api/shop/buy')({ body: { goodsId: 501, num: 1, price: 30 } }, res);
+    assert.equal(calls.length, 1); assert.equal(result.ok, true);
+});
+
+test('decoration session changes after a read cannot issue a mutation', async () => {
+    const h = decorationHarness(); const offer = (await h.service.getDecorationShop()).items[0];
+    const original = h.onRpc;
+    h.onRpc = (method, request) => { const result = original(method, request); if (method === 'ShopInfo') h.diagnostic.connectionEpoch++; return result; };
+    await assert.rejects(h.service.buyDecorationGoods(501, 1, decorationOffer(offer)), /切换/);
+    assert.equal(h.writes.length, 0);
+});
+
+test('decoration invalid quantities and duplicate/empty catalog replies never purchase', async () => {
+    const h = decorationHarness();
+    for (const amount of [0, -1, 1.5, true, 10000]) await assert.rejects(h.service.buyDecorationGoods(501, amount, {}));
+    assert.equal(h.writes.length, 0);
+    h.goods = []; await assert.rejects(h.service.getDecorationShop(), /空|未返回|响应/);
+    h.goods = [{ id: 501, item_id: 2130, item_count: 1, price: 30 }, { id: 501, item_id: 2131, item_count: 1, price: 40 }];
+    await assert.rejects(h.service.getDecorationShop(), /重复/); assert.equal(h.writes.length, 0);
+});
+
+test('seed shop shows existing crops plus a non-purchasable forage catalog entry, not a fake ten-gold offer', async () => {
+    const h = seedRoutesHarness(); const { body } = await h.run();
+    assert.equal(body.ok, true); assert.equal(body.debug.goodsCount, 1); assert.equal(body.debug.catalogOnlyCount, 1);
+    const forage = body.data.find(row => row.itemId === 20040);
+    assert.equal(forage.name, '牧草种子'); assert.equal(forage.id, null); assert.equal(forage.price, null);
+    assert.equal(forage.requiredLevel, null); assert.equal(forage.canBuy, false); assert.equal(forage.availability, 'not_listed');
+    assert.equal(forage.seasons, null); assert.equal(forage.expPerSeason, null); assert.equal(forage.harvestKnown, false);
+    assert.match(forage.image, /20040/); assert.equal(body.data.find(row => row.itemId === 20002).price, 50);
+    assert.deepEqual(h.calls, [{ id: 'fixture', shop: 2 }]);
+});
+
+test('forage live listing replaces the hint exactly once and uses only the returned goods ID/price/conditions', async () => {
+    const h = seedRoutesHarness({ goods_list: [{ id: 991, item_id: 20040, item_count: 1, price: 1234, unlocked: true, conds: [{ type: 1, param: 25 }] }] });
+    const { body } = await h.run(); const rows = body.data.filter(row => row.itemId === 20040);
+    assert.equal(rows.length, 1); assert.equal(rows[0].id, 991); assert.equal(rows[0].price, 1234);
+    assert.equal(rows[0].requiredLevel, 25); assert.equal(rows[0].catalogOnly, false); assert.equal(rows[0].canBuy, true);
+    assert.equal(rows[0].harvestKnown, false); assert.equal(rows[0].incomePerSeason, null);
+});
+
+test('failed/empty seed shop does not fabricate an available catalog, and access rejection issues no RPC', async () => {
+    for (const reply of [null, {}, { goods_list: [] }]) {
+        const h = seedRoutesHarness(reply); const { body } = await h.run();
+        assert.equal(body.ok, false); assert.equal(body.data, undefined);
+    }
+    const h = seedRoutesHarness(); const forbidden = await h.run({ accountId: 'fixture', allowed: false });
+    assert.equal(forbidden.status, 403); assert.equal(h.calls.length, 0);
+    h.provider.getStatus = () => ({ connection: { connected: false } });
+    assert.equal((await h.run()).body.ok, false); assert.equal(h.calls.length, 0);
+});
 
 test('real protocol includes instance locks and nested Use/actual reward fields', () => {
     const raw = encode('UseRequest', { item: { id: '101619', count: '1', uid: '9007199254740993' }, target: { host_gid: '123' } });
@@ -197,7 +523,7 @@ test('PushPlus WeChat channel migration keeps mail evidence, failure backoff, pe
         assert.equal(JSON.parse(io.get(stateFile))[newKey].resultState, 'pending', '发送前先持久占位');
         return { ok: false, resultState: 'failed', code: 400, message: '平台拒绝' };
     };
-    const params = { accountId: '10', accountName: '账号乙', events: [event] };
+    const params = { accountId: '10', accountName: '希恩斯', events: [event] };
     const result = await module.exports.notifySolarQuiz(params, { send });
     assert.equal(result.resultState, 'failed');
     assert.deepEqual(JSON.parse(io.get(stateFile))[oldKey], old, '旧mail未知证据不删不覆盖');
@@ -294,6 +620,8 @@ function sceneSkinHarness({ readback = 'target', equipError = null } = {}) {
                 if (name === '../utils/utils') return { log() {}, logWarn() {} };
                 if (name === '../config/gameConfig') return { getItemById: id => ({ name: `装扮${id}` }), getItemImageById: () => '' };
                 if (name === 'protobufjs') return protobuf;
+                if (name === 'node:fs') return fs;
+                if (name === '../config/runtime-paths') return { getResourcePath: (...parts) => path.join(__dirname, '../src', ...parts) };
                 throw new Error('Unexpected skin dependency: ' + name);
             },
         }, { filename });
@@ -577,6 +905,33 @@ test('warehouse Use selects requested UID and shows real rewards once', async ()
     assert.equal(result.resultState, 'completed'); assert.equal(result.rewards[0].id, 700001);
     assert.equal(h.writes.length, 1); assert.equal(h.writes[0].request.item.uid, '9007199254740993');
 });
+test('warehouse custom/all quantity uses one nested request for the selected stack and confirms the exact amount', async () => {
+    for (const amount of [3, 7]) {
+        const h = harness();
+        h.onRpc = (method, request) => method === 'Bag' ? { item_bag: { items: [
+            { id: 101619, count: 7, uid: '9007199254740993' },
+            { id: 101619, count: 99, uid: '9007199254740994', locked: true },
+        ] } } : { used_items: [request.item], items: [{ id: 700001, count: amount }] };
+        const result = await h.load('warehouse').useItem(101619, amount, [], '9007199254740993');
+        assert.equal(result.usedCount, amount); assert.equal(result.resultState, 'completed');
+        assert.equal(result.rewards[0].count, amount); assert.equal(h.writes.length, 1);
+        assert.equal(h.writes[0].request.item.count, String(amount));
+        assert.equal(h.writes[0].request.item.uid, '9007199254740993');
+    }
+});
+test('warehouse custom quantity cannot spend other stacks or accept a partial consumption reply', async () => {
+    const h = harness();
+    h.onRpc = method => method === 'Bag' ? { item_bag: { items: [
+        { id: 101619, count: 2, uid: '11' }, { id: 101619, count: 99, uid: '12' },
+    ] } } : { used_items: [{ id: 101619, count: 1 }], items: [{ id: 700001, count: 1 }] };
+    const service = h.load('warehouse');
+    await assert.rejects(service.useItem(101619, 3, [], '11'), error => error.sent === false);
+    assert.equal(h.writes.length, 0);
+    await assert.rejects(service.useItem(101619, 2, [], '11'), error => error.outcomeUnknown === true);
+    await assert.rejects(service.useItem(101619, 1, [], '11'), error => error.sent === false
+        && error.resultState === 'unknown' && error.outcomeUnknown === false && error.priorOutcomeUnknown === true);
+    assert.equal(h.writes.length, 1, 'partial or unknown quantity never retries with a smaller count');
+});
 test('warehouse locked pack and unsafe UID sends no mutation', async () => {
     const h = harness(); h.onRpc = () => ({ item_bag: { items: [{ id: 101619, count: 2, uid: 11, locked: true }] } });
     await assert.rejects(h.load('warehouse').useItem(101619, 1));
@@ -587,6 +942,43 @@ test('warehouse Use timeout no alternative encoding or replay even after count c
     h.onRpc = method => { if (method === 'Bag') return { item_bag: { items: [{ id: 101619, count, uid: 11 }] } }; throw new Error('timeout'); };
     const service = h.load('warehouse'); await assert.rejects(service.useItem(101619, 1)); count = 1;
     await assert.rejects(service.useItem(101619, 1)); assert.equal(h.writes.length, 1);
+});
+function bagUseRouteHarness(replyFor) {
+    const routes = new Map(), calls = [], module = { exports: {} };
+    const filename = path.join(__dirname, '../src/controllers/admin-bag-routes.js');
+    vm.runInNewContext(fs.readFileSync(filename, 'utf8'), { module, Date, setTimeout,
+        require: name => name === '../config/gameConfig' ? { getItemById: id => ({ name: `礼包${id}` }) }
+            : name === '../utils/utils' ? { toNum: Number } : assert.fail(`Unexpected bag-route dependency ${name}`),
+    }, { filename });
+    module.exports.registerAdminBagRoutes({
+        app: { get: (name, fn) => routes.set(name, fn), post: (name, fn) => routes.set(name, fn) },
+        provider: { useItem: async (...args) => { calls.push(args); return replyFor(...args); } },
+        getAccountIdFromRequest: req => req.accountId, canAccessAccount: () => true, emitRealtimeLog() {},
+        sendProviderError: (res, error) => res.status(500).json({ ok: false, error: error.message,
+            resultState: error.resultState, outcomeUnknown: error.outcomeUnknown, sent: error.sent }),
+    });
+    return { calls, async request(body) {
+        const res = { statusCode: 200, payload: null, status(value) { this.statusCode = value; return this; }, json(value) { this.payload = value; return this; } };
+        await routes.get('/api/bag/use')({ body, accountId: 'fixture' }, res); return res;
+    } };
+}
+test('bag-use route rejects invalid quantities rather than silently spending one item, preserving count and UID for a valid request', async () => {
+    const h = bagUseRouteHarness((accountId, itemId, count) => ({ resultState: 'completed', usedItemId: itemId, usedCount: count, rewards: [{ id: 700001, count }] }));
+    for (const count of [0, -1, 1.5, '', null, true, '1e2', Number.MAX_SAFE_INTEGER + 1]) {
+        const res = await h.request({ itemId: 101619, count, uid: '9007199254740993' });
+        assert.equal(res.statusCode, 400); assert.equal(res.payload.sent, false);
+    }
+    assert.equal(h.calls.length, 0);
+    const used = await h.request({ itemId: 101619, count: 6, uid: '9007199254740993' });
+    assert.equal(used.payload.ok, true); assert.equal(used.payload.data.usedCount, 6);
+    assert.equal(h.calls.length, 1); assert.deepEqual(h.calls[0], ['fixture', 101619, 6, '9007199254740993']);
+    const single = await h.request({ itemId: 101619, uid: '11' });
+    assert.equal(single.payload.data.usedCount, 1, 'legacy omitted count remains one, invalid counts do not');
+});
+test('bag-use route reports partial-count proof as unknown instead of claiming the requested quantity succeeded', async () => {
+    const h = bagUseRouteHarness(() => ({ resultState: 'completed', usedCount: 1, rewards: [{ id: 700001, count: 1 }] }));
+    const res = await h.request({ itemId: 101619, count: 5, uid: '11' });
+    assert.equal(res.payload.ok, false); assert.equal(res.payload.outcomeUnknown, true); assert.equal(h.calls.length, 1);
 });
 test('locks are UID scoped and require exact reply or readback proof', async () => {
     const h = harness(); h.onRpc = method => method === 'Bag' ? { item_bag: { items: [{ id: 20001, count: 3, uid: 11 }, { id: 20001, count: 2, uid: 12, locked: true }] } }
@@ -603,6 +995,68 @@ test('bag keeps locked and unlocked same-ID instances separate; locked seeds exc
     const warehouse = h.load('warehouse'); const bag = await warehouse.getBagDetail();
     assert.equal(bag.items.length, 2); assert.equal(bag.items[1].locked, true);
     const seeds = await warehouse.getBagSeeds(); assert.equal(seeds[0].count, 3);
+});
+test('official custom-house config has seven distinct part slots, defaults and verified parent identities', () => {
+    const config = JSON.parse(fs.readFileSync(path.join(__dirname, '../src/gameConfig/skin-customization.json'), 'utf8'));
+    assert.equal(config.parts.length, 36); assert.equal(new Set(config.parts.map(part => part.partId)).size, 36);
+    assert.deepEqual(config.houses[0].slotTypes, [1, 2, 3, 4, 5, 6, 7]);
+    assert.equal(config.parts.find(part => part.partId === 210022).slotType, 2);
+    assert.equal(config.parts.find(part => part.partId === 210033).slotType, 3);
+    const request = types.EquipSkinPartRequest.decode(encode('EquipSkinPartRequest', { ids: ['210022'], operate: '1' }));
+    assert.deepEqual(request.ids.map(String), ['210022']); assert.equal(request.operate.toString(), '1');
+});
+test('custom-house overview preserves the separate owned parts library and saved inactive layout without a write', async () => {
+    const h = harness();
+    h.onRpc = method => method === 'SkinsOwned' ? { skins: [{ id: 201012, skin_type: 1, part_ids: [210022, 210033] }], parts: [{ id: 210012, is_new: true }] }
+        : method === 'SkinsEquipped' ? { skins: [{ id: 201009, skin_type: 1 }] } : {};
+    const view = await h.load('skin').getSkinOverview(), house = view.customizations[0];
+    assert.equal(house.equipped, false); assert.equal(house.groups.length, 7);
+    assert.equal(house.groups[1].selectedPartId, 210022);
+    assert.equal(house.groups[1].parts.find(part => part.partId === 210012).owned, true);
+    assert.equal(house.groups[1].parts.find(part => part.partId === 210032).owned, false);
+    assert.equal(h.writes.length, 0);
+});
+test('custom part equip uses its own official method once, replaces one component and confirms full part list by fresh equipment read', async () => {
+    const h = harness(); let parts = [210022, 210033];
+    h.onRpc = (method, request) => {
+        if (method === 'SkinsOwned') return { skins: [{ id: 201012, skin_type: 1, part_ids: parts }], parts: [{ id: 210012 }] };
+        if (method === 'SkinsEquipped') return { skins: [{ id: 201012, skin_type: 1, part_ids: parts }] };
+        if (method === 'EquipSkinPart') { assert.equal(request.operate, '1'); assert.deepEqual(request.ids, ['210012']); parts = [210012, 210033]; return { part_ids: parts }; }
+        return {};
+    };
+    const result = await h.load('skin').equipSkinPart(201012, 210012, { confirmed: true, expectedPartIds: [210022, 210033] });
+    assert.equal(result.resultState, 'completed'); assert.equal(result.confirmation, 'SkinsEquipped');
+    assert.deepEqual(result.partIds, [210012, 210033]); assert.equal(h.writes.length, 1); assert.equal(h.writes[0].method, 'EquipSkinPart');
+});
+test('default restoration sends the old non-default ID with operate2, not the default item or ordinary Equip', async () => {
+    const h = harness(); let parts = [210022, 210033];
+    h.onRpc = (method, request) => {
+        if (method === 'SkinsOwned') return { skins: [{ id: 201012, skin_type: 1, part_ids: parts }] };
+        if (method === 'SkinsEquipped') return { skins: [{ id: 201012, skin_type: 1, part_ids: parts }] };
+        if (method === 'EquipSkinPart') { assert.equal(request.operate, '2'); assert.deepEqual(request.ids, ['210022']); parts = [210033]; return { part_ids: parts }; }
+        return {};
+    };
+    assert.equal((await h.load('skin').equipSkinPart(201012, 210002, { confirmed: true, expectedPartIds: [210022, 210033] })).resultState, 'completed');
+    assert.equal(h.writes.length, 1); assert.equal(h.writes[0].method, 'EquipSkinPart');
+});
+test('inactive house, unowned parts and stale layout all reject without a mutation', async () => {
+    for (const kind of ['inactive', 'unowned', 'stale']) {
+        const h = harness();
+        h.onRpc = method => method === 'SkinsOwned' ? { skins: [{ id: 201012, skin_type: 1, part_ids: [210022] }] }
+            : { skins: [{ id: kind === 'inactive' ? 201009 : 201012, skin_type: 1, part_ids: kind === 'inactive' ? [] : [210022] }] };
+        await assert.rejects(h.load('skin').equipSkinPart(201012, kind === 'stale' ? 210022 : 210012,
+            { confirmed: true, expectedPartIds: kind === 'stale' ? [] : [210022] }));
+        assert.equal(h.writes.length, 0, kind);
+    }
+});
+test('custom-part wrong or missing confirmation blocks the house slot durably, with no fallback or replay', async () => {
+    const h = harness();
+    h.onRpc = method => method === 'SkinsOwned' ? { skins: [{ id: 201012, skin_type: 1, part_ids: [210022] }], parts: [{ id: 210012 }] }
+        : method === 'SkinsEquipped' ? { skins: [{ id: 201012, skin_type: 1, part_ids: [210022] }] } : { part_ids: [210012] };
+    const service = h.load('skin');
+    await assert.rejects(service.equipSkinPart(201012, 210012, { confirmed: true, expectedPartIds: [210022] }), error => error.outcomeUnknown === true);
+    await assert.rejects(service.equipSkinPart(201012, 210012, { confirmed: true, expectedPartIds: [210022] }), error => error.outcomeUnknown === true);
+    assert.equal(h.writes.length, 1); assert.equal((await service.getSkinOverview()).customizations[0].resultUnknown, true);
 });
 test('rules allow one-copy first activation, variable next-star costs and explicit rules', () => {
     const h = harness(); const rules = h.load('collection-rules');
@@ -734,7 +1188,7 @@ test('节令题目GET与已确认暂停恢复POST均隔离账号，未确认不�
     assert.equal(resume.body.data.budgetReset, false); assert.deepEqual(calls[1], ['resume', 'fixture']);
 });
 
-test('11-14修复发布精确覆盖装扮/题目/虫草接线且不扩大网关权限', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('11-14修复发布精确覆盖装扮/题目/虫草接线且不扩大网关权限', () => {
     const { execFileSync } = require('node:child_process');
     const script = String.raw`
 import ast,pathlib,sys
@@ -758,7 +1212,7 @@ assert not any('wx-login' in x or 'friend-visit-session' in x for x in files)
     execFileSync('C:/Program Files/Python310/python.exe', ['-c', script, path.join(root, 'cloudbase/.ref/deploy.py')], { encoding: 'utf8' });
 });
 
-test('暂停同步补丁只改一个挂载模块，PID/TCP或在途写门禁失败不得重载', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('暂停同步补丁只改一个挂载模块，PID/TCP或在途写门禁失败不得重载', () => {
     const { execFileSync } = require('node:child_process');
     const script = String.raw`
 import ast,pathlib,json,sys,io,contextlib,subprocess,urllib.request,copy
@@ -844,7 +1298,7 @@ print(json.dumps({'ok':True,'guardFailuresVerified':True,'originalTcpNotReconnec
     assert.equal(JSON.parse(result).guardFailuresVerified, true);
 });
 
-test('虫草部署精确六文件，已上线接线和前端不变且禁止网关/镜像/旧恢复入口', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('虫草部署精确六文件，已上线接线和前端不变且禁止网关/镜像/旧恢复入口', () => {
     const { execFileSync } = require('node:child_process');
     const script = String.raw`
 import ast,pathlib,json,sys,contextlib,io
@@ -879,7 +1333,7 @@ except RuntimeError as e:assert str(e)=='offline-ssh-stop'
 else:raise AssertionError('fixture must stop before real operations')
 env['ssh_connect']=lambda:Client()
 env['load_panel_credentials']=lambda:{'username':'fixture'}
-main={'mounts':{'/app/core/src':'/fixture/project/core/src','/app/web/dist':'/home/example/web-dist'}}
+main={'mounts':{'/app/core/src':'/fixture/project/core/src','/app/web/dist':'/home/azureuser/web-dist'}}
 gateway={'health':'healthy','running':True}
 for member in deps:
  env['remote_file_json']=lambda *a,**k:{'containers':{'qq-farm-bot':main,'farm-gateway':gateway},'differences':[member]}
@@ -894,7 +1348,440 @@ print(json.dumps({'ok':True,'exactSixFiles':True,'noGatewayOrRecovery':True,'imm
     assert.equal(JSON.parse(result).exactSixFiles, true);
 });
 
-test('gameplay release entry uses exact dependencies, static-only acceptance and never old Leave recovery', { skip: !require('node:fs').existsSync(require('node:path').join(__dirname, '../../cloudbase/.ref/deploy.py')) }, () => {
+test('牧场离线审核报告精确候选，不扩大旧发布权限且不冒充上传就绪', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = String.raw`
+import ast,pathlib,json,sys,io,hashlib,tarfile,tempfile,copy
+from unittest.mock import patch
+root=pathlib.Path(sys.argv[1]);source=root/'cloudbase/.ref/deploy.py';tree=ast.parse(source.read_text(encoding='utf-8'))
+env={'pathlib':pathlib,'json':json,'io':io,'hashlib':hashlib,'tarfile':tarfile}
+keys={'RELEASE_BACKEND_ALLOWLIST','RELEASE_STATIC_ALLOWLIST','RELEASE_SESSION_FILES','RELEASE_COMBINED_MIGRATION',
+      'RANCH_AUDIT_MIGRATION','RANCH_AUDIT_BACKEND_FILES','RANCH_AUDIT_FRONTEND_FILES'}
+for node in tree.body:
+ if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id in keys for t in node.targets):
+  exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),env)
+functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in {'ranch_audit_read','audit_ranch_release','load_release_manifest'}]
+exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),env)
+def blocked(*a,**k):raise AssertionError('禁止联网或发布')
+env.update({'ssh_connect':blocked,'ssh_run':blocked,'remote_file_json':blocked,'load_panel_credentials':blocked})
+backend=env['RANCH_AUDIT_BACKEND_FILES'];frontend=env['RANCH_AUDIT_FRONTEND_FILES']
+assert {'core/src/services/ranch-automation.js','core/src/services/ranch-market.js','core/src/services/ranch-progression.js',
+        'core/src/services/ranch-friend-session.js','core/src/services/scene-session.js','core/src/services/account-operation-barrier.js',
+        'core/src/services/account-operation-coordinator.js','core/src/controllers/admin-ranch-routes.js',
+        'core/src/controllers/admin.js','core/src/models/store.js','core/src/services/task.js',
+        'core/src/proto/globalscenepb.proto','core/src/proto/ranchpb.proto','core/src/proto/homesteadpb.proto',
+        'core/src/proto/animalpb.proto','core/src/gameConfig/ranch/OpeningActivity.json'} <= backend
+assert {'web/src/views/Ranch.vue','web/src/stores/ranch.ts','web/src/router/menu.ts',
+        'web/src/components/RanchMarketPanel.vue','web/src/components/RanchProgressPanel.vue'} <= frontend
+assert 'core/src/runtime/gateway-process.js' not in backend
+assert 'core/src/services/ranch-manual.js' not in env['RELEASE_BACKEND_ALLOWLIST']
+assert 'core/src/gameConfig/ranch/Goods.json' not in env['RELEASE_BACKEND_ALLOWLIST']
+assert not any('*' in name for name in backend|frontend)
+with tempfile.TemporaryDirectory(prefix='ranch-audit-') as directory:
+ fake=pathlib.Path(directory);work=fake/'.workbuddy';work.mkdir();build=work/'frontend-ranch-audit';build.mkdir()
+ def put(name,raw=b'// local fixture'):
+  file=fake/name;file.parent.mkdir(parents=True,exist_ok=True);file.write_bytes(raw)
+ for name in backend|frontend:put(name)
+ image=b'local image fixture';digest=hashlib.sha256(image).hexdigest()
+ manifest={'sourceCommit':'6ac7a3d7930018058d201af86beea8de6a9f8507','gameRpcSent':False,'items':{},'facilities':{}}
+ for group,folder,identity in [('items','item-icons','1001'),('items','deco_icons','7002'),('facilities','facility-icons','6001001')]:
+  relative=('' if folder=='deco_icons' else 'ranch/')+folder+'/'+identity+'.png'
+  manifest[group][identity]={'url':'/game-config/'+relative,'sha256':digest,'officialOriginVerified':True}
+  for prefix in ['core/src/gameConfig/','web/public/game-config/',build.relative_to(fake).as_posix()+'/game-config/']:
+   put(prefix+relative,image)
+ art='core/src/gameConfig/ranch/image-manifest.json'
+ for prefix in ['core/src/gameConfig/','web/public/game-config/',build.relative_to(fake).as_posix()+'/game-config/']:
+  put(prefix+'ranch/image-manifest.json',json.dumps(manifest).encode())
+  put(prefix+'art-resource-sources.json',b'{"manifests":[]}')
+ put(build.relative_to(fake).as_posix()+'/index.html',b'<html></html>')
+ env['BASE']=str(fake);before=set(fake.rglob('*'));report=env['audit_ranch_release'](str(build))
+ assert set(fake.rglob('*'))==before and report['auditOnly'] is True and report['localChecksPassed'] is True
+ assert report['closureVerified'] is False and report['deploymentSupported'] is False and report['blockers']
+ assert not report['gameRpcSent'] and not report['gatewayIncluded']
+ assert set(report['backendFiles'])==backend and set(report['frontendSourceFiles'])==frontend
+ # 新依赖仅报告，不自动读取或放行，未知相对路径同样不能形成发布闭包。
+ put('core/src/services/ranch-manual.js',b"require('./unreviewed'); require('../runtime/gateway-process'); require('../../../../outside')")
+ report=env['audit_ranch_release'](str(build))
+ assert len(report['unscopedDependencies'])==3 and report['closureVerified'] is False
+ assert not any(item['path'].endswith('unreviewed.js') for item in report['files'])
+ put('core/src/services/ranch-manual.js')
+ missing='core/src/services/ranch-readonly.js';(fake/missing).unlink()
+ assert any(missing in error for error in env['audit_ranch_release'](str(build))['errors'])
+ put(missing)
+ put('web/public/game-config/ranch/item-icons/1001.png',b'wrong')
+ assert any('摘要不符' in error for error in env['audit_ranch_release'](str(build))['errors'])
+ put('web/public/game-config/ranch/item-icons/1001.png',image)
+ put(build.relative_to(fake).as_posix()+'/game-config/ranch/item-icons/1001.png',b'wrong')
+ assert any('摘要不符' in error for error in env['audit_ranch_release'](str(build))['errors'])
+ put(build.relative_to(fake).as_posix()+'/game-config/ranch/item-icons/1001.png',image)
+ for prefix,relative,original in [
+  ('web/public/game-config/','ranch/image-manifest.json',json.dumps(manifest).encode()),
+  (build.relative_to(fake).as_posix()+'/game-config/','ranch/image-manifest.json',json.dumps(manifest).encode()),
+  (build.relative_to(fake).as_posix()+'/game-config/','art-resource-sources.json',b'{"manifests":[]}'),
+ ]:
+  put(prefix+relative,b'{}')
+  stale=env['audit_ranch_release'](str(build))
+  assert not stale['localChecksPassed'] and any(prefix+relative in error and '摘要不符' in error for error in stale['errors'])
+  put(prefix+relative,original)
+ put(build.relative_to(fake).as_posix()+'/fixtures/account.json',b'never read')
+ assert any('未授权文件' in error for error in env['audit_ranch_release'](str(build))['errors'])
+ assert env['audit_ranch_release'](str(fake))['localChecksPassed'] is False
+ assert env['audit_ranch_release']()['localChecksPassed'] is False
+ for name in ['../outside','x/../outside','/outside','C:/outside','x\\outside','x//outside']:
+  try:env['ranch_audit_read'](fake,name)
+  except RuntimeError:pass
+  else:raise AssertionError('越界路径被读取: '+name)
+ original=pathlib.Path.is_symlink
+ with patch.object(pathlib.Path,'is_symlink',lambda file:file==fake/'core' or original(file)):
+  try:env['ranch_audit_read'](fake,'core/src/core/worker.js')
+  except RuntimeError as error:assert '符号链接' in str(error)
+  else:raise AssertionError('目录链接未拒绝')
+ bad=copy.deepcopy(manifest);bad['items']['1001']['url']='/game-config/other.png';put(art,json.dumps(bad).encode())
+ assert env['audit_ranch_release'](str(build))['localChecksPassed'] is False
+ # 所有现有发布/检查/重载入口都先调用此loader；牧场未知迁移也必须本地拒绝。
+ for migration in [env['RANCH_AUDIT_MIGRATION'],'ranch-full-20261119','ranch-unknown-version']:
+  archive=work/(migration+'.tar.gz')
+  with tarfile.open(archive,'w:gz') as package:
+   raw=json.dumps({'migration':migration,'files':[]}).encode();member=tarfile.TarInfo('release-manifest.json');member.size=len(raw)
+   package.addfile(member,io.BytesIO(raw))
+  try:env['load_release_manifest'](archive)
+  except RuntimeError as error:assert '禁止进入远端发布入口' in str(error)
+  else:raise AssertionError('牧场审核包被接受为发布包')
+ print(json.dumps({'ok':True,'auditOnly':True,'noNetwork':True,'noWhitelistExpansion':True}))
+`;
+    const result = execFileSync('C:/Program Files/Python310/python.exe', ['-c', script, path.resolve(__dirname, '../..')],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    assert.equal(JSON.parse(result).noWhitelistExpansion, true);
+});
+
+test('牧场候选SHA绑定精确源文件依赖图片与构建；pack在基线闭包未核准时失败关闭', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = String.raw`
+import ast,pathlib,json,sys,io,hashlib,tarfile,tempfile,copy
+from unittest.mock import patch
+root=pathlib.Path(sys.argv[1]);source=root/'cloudbase/.ref/deploy.py';tree=ast.parse(source.read_text(encoding='utf-8'))
+env={'pathlib':pathlib,'json':json,'io':io,'hashlib':hashlib,'tarfile':tarfile}
+for node in tree.body:
+ if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and (t.id.startswith('RANCH_') or t.id=='RELEASE_SESSION_FILES') for t in node.targets):
+  exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),env)
+functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in {
+ 'ranch_audit_read','audit_ranch_release','ranch_release_candidate','check_ranch_candidate','package_ranch_release'}]
+exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),env)
+def blocked(*a,**k):raise AssertionError('候选/pack门禁不得联网或发布')
+env.update({'ssh_connect':blocked,'ssh_run':blocked,'remote_file_json':blocked,'load_panel_credentials':blocked})
+backend=env['RANCH_AUDIT_BACKEND_FILES'];frontend=env['RANCH_AUDIT_FRONTEND_FILES']
+assert len(backend)==53 and len(frontend)==24 and len(env['RANCH_RELEASE_PRESERVED_SESSION'])==5
+assert {'core/src/services/friend-api.js', *('core/src/proto/'+name+'.proto' for name in ['friendpb','taskpb','sharepb','mallpb','paypb','illustratedpb'])} <= backend
+with tempfile.TemporaryDirectory(prefix='ranch-pinned-candidate-') as directory:
+ fake=pathlib.Path(directory);work=fake/'.workbuddy';work.mkdir();build=work/env['RANCH_RELEASE_FRONTEND_BUILD'];build.mkdir()
+ def put(name,raw=b'// local fixture'):
+  file=fake/name;file.parent.mkdir(parents=True,exist_ok=True);file.write_bytes(raw)
+ for name in backend|frontend:put(name)
+ dependency='core/src/services/json-db.js';put(dependency,b'module.exports = {}')
+ put('core/src/services/ranch-manual.js',b"require('./json-db')")
+ image=b'local image fixture';digest=hashlib.sha256(image).hexdigest();relative='ranch/item-icons/1001.png'
+ manifest={'sourceCommit':'6ac7a3d7930018058d201af86beea8de6a9f8507','gameRpcSent':False,'items':{
+  '1001':{'url':'/game-config/'+relative,'sha256':digest,'officialOriginVerified':True}},'facilities':{}}
+ art='core/src/gameConfig/ranch/image-manifest.json'
+ for prefix in ['core/src/gameConfig/','web/public/game-config/',build.relative_to(fake).as_posix()+'/game-config/']:
+  put(prefix+relative,image)
+  put(prefix+'ranch/image-manifest.json',json.dumps(manifest).encode())
+  put(prefix+'art-resource-sources.json',b'{"manifests":[]}')
+ index=build.relative_to(fake).as_posix()+'/index.html';put(index,b'production-index')
+ env['BASE']=str(fake);before=set(fake.rglob('*'));candidate=env['check_ranch_candidate'](str(build));pin=candidate['candidateSha256']
+ assert set(fake.rglob('*'))==before and candidate['kind']=='blocked-release-candidate'
+ assert len(candidate['changedCandidateFiles'])==48 and candidate['preservedSessionFiles']==sorted(env['RANCH_RELEASE_PRESERVED_SESSION'])
+ assert candidate['directDependencyEdgeCount']==1 and candidate['directDependencies'][0]['resolvedPath']==dependency
+ assert candidate['localChecksPassed'] is True and candidate['closureVerified'] is False and candidate['deploymentSupported'] is False
+ assert candidate['gatewayRestartAllowed'] is False and candidate['gameRpcSent'] is False and len(candidate['deploymentBlockers'])==3
+ assert env['check_ranch_candidate'](str(build),pin)['candidateSha256']==pin
+ def reject(call,expected):
+  try:call()
+  except RuntimeError as error:assert expected in str(error),str(error)
+  else:raise AssertionError('未拒绝: '+expected)
+ for invalid in ['', 'unknown', 'A'*64, '0'*63, True, 'g'*64]:
+  reject(lambda:env['check_ranch_candidate'](str(build),invalid),'64位')
+ reject(lambda:env['check_ranch_candidate'](str(build),'0'*64),'SHA不匹配')
+ # 任一候选源文件、依赖、前端产物或图片来源变化均让旧pin失效。
+ for name in ['core/src/services/ranch-manual.js','web/src/views/Ranch.vue',dependency,index,art]:
+  file=fake/name;old=file.read_bytes();file.write_bytes(old+b' ')
+  reject(lambda:env['check_ranch_candidate'](str(build),pin),'SHA不匹配')
+  file.write_bytes(old)
+ for name in ['core/src/gameConfig/'+relative,'web/public/game-config/'+relative,build.relative_to(fake).as_posix()+'/game-config/'+relative]:
+  file=fake/name;file.write_bytes(b'wrong')
+  reject(lambda:env['check_ranch_candidate'](str(build),pin),'SHA不匹配');file.write_bytes(image)
+ missing=fake/dependency;old=missing.read_bytes();missing.unlink()
+ reject(lambda:env['check_ranch_candidate'](str(build)),'依赖缺失');missing.write_bytes(old)
+ for spec in ['./unreviewed','../runtime/gateway-process','../../../../outside']:
+  put('core/src/services/ranch-manual.js',('require('+json.dumps(spec)+')').encode())
+  reject(lambda:env['check_ranch_candidate'](str(build)),'本地校验失败')
+ put('core/src/services/ranch-manual.js',b"require('./json-db')")
+ original=pathlib.Path.is_symlink
+ with patch.object(pathlib.Path,'is_symlink',lambda file:file==fake/dependency or original(file)):
+  reject(lambda:env['check_ranch_candidate'](str(build)),'符号链接')
+ extra=build.relative_to(fake).as_posix()+'/fixtures/private.json';put(extra,b'never package')
+ reject(lambda:env['check_ranch_candidate'](str(build)),'未授权文件');(fake/extra).unlink();(fake/extra).parent.rmdir()
+ reject(lambda:env['ranch_release_candidate'](str(work/'unapproved-build')),'指定独立生产构建')
+ # pack必须明确SHA绑定，但即使pin一致也不能靠修改审核标记伪造正式发布闭包。
+ target=work/'ranch.tar.gz'
+ reject(lambda:env['package_ranch_release'](str(build),str(target),None),'显式绑定')
+ reject(lambda:env['package_ranch_release'](str(build),str(target),'0'*64),'SHA不匹配')
+ reject(lambda:env['package_ranch_release'](str(build),str(target),pin),'发布明确阻断')
+ assert not target.exists() and set(fake.rglob('*'))==before
+ for target in [fake/'outside.tar.gz',work/'candidate.json',work/'x/../ranch.tar.gz']:
+  reject(lambda:env['package_ranch_release'](str(build),str(target),pin),'只能为')
+ existing=work/'existing.tar.gz';existing.write_bytes(b'original')
+ reject(lambda:env['package_ranch_release'](str(build),str(existing),pin),'只能为')
+ assert existing.read_bytes()==b'original'
+ print(json.dumps({'ok':True,'shaPinned':True,'noNetwork':True,'noArchiveWritten':True,'releaseStillBlocked':True}))
+`;
+    const python = process.platform === 'win32' ? 'C:/Program Files/Python310/python.exe' : 'python3';
+    const result = execFileSync(python, ['-c', script, path.resolve(__dirname, '../..')],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    assert.equal(JSON.parse(result).releaseStillBlocked, true);
+});
+
+test('牧场 stopped-account 前后置只接受明确停号、网关不变和主业务单次重载证据', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = String.raw`
+import ast, copy, json, pathlib, sys
+source = pathlib.Path(sys.argv[1]) / 'cloudbase/.ref/deploy.py'
+tree = ast.parse(source.read_text(encoding='utf-8'))
+names = {'_ranch_stopped_snapshot', 'check_ranch_stopped_preflight', 'check_ranch_stopped_postflight'}
+functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+env = {}
+# 只执行纯判定函数，不加载发布脚本入口、联网模块或读取真实运行数据。
+exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), env)
+pre, post = env['check_ranch_stopped_preflight'], env['check_ranch_stopped_postflight']
+main, gateway = 'qq-farm-bot', 'farm-gateway'
+before = {
+ 'mode': 'stopped-account', 'networkMode': 'gateway', 'externalGateway': '1',
+ 'accounts': [{'id': aid, 'running': False, 'connected': False} for aid in (10, '1', 2)],
+ 'pendingCount': 0, 'workerCount': 0, 'startupSettled': True,
+ 'startupGuard': dict.fromkeys(('bootstrapAutoStartAccountsFalse', 'delayedResumePathAudited',
+     'environmentAutoStartEmpty', 'resumeFileAbsent', 'gatewayAccountsCoverAll',
+     'codeRefreshDisabledByGatewayOwnership'), True),
+ 'autoStartEnabled': False, 'resumePending': False, 'codeGuardRunning': False, 'gameSockets': [],
+ 'activity': {'id': 'a'*32, 'seq': 3, 'complete': True, 'mainReloadRequests': 0, 'mainReloads': 0,
+              'gatewayRestarts': 0, 'accountStarts': 0, 'codeGuardStarts': 0, 'gameTcpConnections': 0},
+ 'containers': {main: {'id': 'b'*64, 'pid': 101, 'starttime': 203, 'running': True},
+                gateway: {'id': 'c'*64, 'pid': 102, 'starttime': 204, 'running': True, 'health': 'healthy'}},
+}
+after = copy.deepcopy(before)
+after['activity'].update(seq=5, mainReloadRequests=1, mainReloads=1)
+after['containers'][main].update(pid=103, starttime=211)
+after['accounts'].reverse()
+original = copy.deepcopy((before, after))
+pre(before)
+post(before, after)
+assert (before, after) == original
+
+missing = object()
+def rejects(base, probe, path, value, message):
+    evidence = copy.deepcopy(base)
+    node = evidence
+    for key in path[:-1]: node = node[key]
+    if value is missing: del node[path[-1]]
+    else: node[path[-1]] = value
+    try: probe(evidence)
+    except RuntimeError as error:
+        assert message in str(error), (path, value, str(error))
+    else: raise AssertionError(('未拒绝', path, value))
+
+# 两个阶段都不能把缺字段、空清单、假值或未知当成已停号或零活动。
+common = [
+ (('mode',), (missing, 'online', None), 'stopped-account'),
+ (('accounts',), (missing, None, [], before['accounts'][:-1], before['accounts'] + [before['accounts'][0]]), '三账号'),
+ (('accounts', 0, 'id'), (missing, '99', '01', True, None), '三账号'),
+ (('accounts', 0, 'running'), (missing, None, True, 0, 'false'), '停号且断开'),
+ (('accounts', 0, 'connected'), (missing, None, True, 0, 'false'), '停号且断开'),
+ (('gameSockets',), (missing, None, {}, [{'state': 'SYN_SENT'}]), '游戏 TCP'),
+ (('networkMode',), (missing, 'direct'), '外部网关'),
+ (('externalGateway',), (missing, True), '外部网关'),
+ (('startupSettled',), (missing, False, 1), '启动流程'),
+ (('activity', 'complete'), (missing, False, 1), '连续观察'),
+ (('activity', 'id'), (missing, 'unknown'), '窗口标识'),
+ (('activity', 'seq'), (missing, -1, True, '5'), '快照序号'),
+ (('containers', gateway, 'id'), (missing, 'unknown'), '容器标识'),
+ (('containers', gateway, 'pid'), (missing, 0, '102', True), '进程标识'),
+ (('containers', gateway, 'starttime'), (missing, None, 0, '204'), '进程标识'),
+ (('containers', gateway, 'health'), (missing, 'unknown', 'unhealthy'), '网关未明确健康'),
+ (('containers', main, 'running'), (missing, False, 1), '容器未明确运行'),
+]
+for field in ('pendingCount', 'workerCount'):
+    common.append(((field,), (missing, None, False, 1, '0'), field))
+for field in ('autoStartEnabled', 'resumePending', 'codeGuardRunning'):
+    common.append(((field,), (missing, None, True, 0, 'false'), field))
+for field in ('gatewayRestarts', 'accountStarts', 'codeGuardStarts', 'gameTcpConnections'):
+    common.append((('activity', field), (missing, None, False, 1, '0'), field))
+accept_after = lambda candidate: post(before, candidate)
+for path, values, message in common:
+    for value in values:
+        rejects(before, pre, path, value, message)
+        rejects(after, accept_after, path, value, message)
+rejects(before, pre, ('accounts', 0, 'id'), 1, '重复')
+rejects(after, accept_after, ('accounts', 0, 'id'), '10', '重复')
+
+# 即便观察前后都已停号且没有游戏 TCP，也要拒绝中间发生的操作或未绑定的后置证据。
+for field in ('mainReloadRequests', 'mainReloads'):
+    for value in (missing, True, 1, 2): rejects(before, pre, ('activity', field), value, field)
+    for value in (missing, True, 0, 2, '1'): rejects(after, accept_after, ('activity', field), value, field)
+for field, value in (('id', 'd'*64), ('pid', 108), ('starttime', 205)):
+    rejects(after, accept_after, ('containers', gateway, field), value, '原网关')
+for field, value in (('id', 'd'*64), ('starttime', 203), ('starttime', 199)):
+    rejects(after, accept_after, ('containers', main, field), value, '原主业务容器')
+for field, value in (('id', 'd'*32), ('seq', 3), ('seq', 2)):
+    rejects(after, accept_after, ('activity', field), value, '同一观察窗口')
+rejects(before, lambda candidate: post(candidate, after), ('workerCount',), missing, 'workerCount')
+print(json.dumps({'ok': True}))
+`;
+    const python = process.platform === 'win32' ? 'C:/Program Files/Python310/python.exe' : 'python3';
+    const result = execFileSync(python, ['-c', script, path.resolve(__dirname, '../..')],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    assert.equal(JSON.parse(result).ok, true);
+});
+
+test('shop release packages only six changes and five live session files; gateway and image routes stay forbidden', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = String.raw`
+import ast,pathlib,json,sys,io,hashlib,tarfile,tempfile,contextlib,copy
+root=pathlib.Path(sys.argv[1]);source=root/'cloudbase/.ref/deploy.py';tree=ast.parse(source.read_text(encoding='utf-8'))
+env={'pathlib':pathlib,'json':json,'io':io,'hashlib':hashlib,'tarfile':tarfile,'REMOTE':'/fixture/project'}
+keys={'RELEASE_BACKEND_ALLOWLIST','RELEASE_STATIC_ALLOWLIST','RELEASE_SESSION_FILES','RELEASE_COMBINED_MIGRATION',
+      'RELEASE_SHOP_MIGRATION','RELEASE_SHOP_CHANGED_FILES','RELEASE_SHOP_PRESERVED_SESSION','RELEASE_SHOP_FILES'}
+for node in tree.body:
+ if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id in keys for t in node.targets):
+  exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),env)
+functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in {
+ 'validate_shop_release_manifest','registered_release_artwork','load_release_manifest','package_shop_release','deploy_release'}]
+exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),env)
+changed=env['RELEASE_SHOP_CHANGED_FILES'];preserved=env['RELEASE_SHOP_PRESERVED_SESSION'];files=env['RELEASE_SHOP_FILES']
+assert changed=={'core/src/proto/shoppb.proto','core/src/services/decoration-shop.js','core/src/controllers/admin-decoration-shop-routes.js',
+                 'core/src/controllers/admin-seed-shop-routes.js','core/src/runtime/data-provider.js','core/src/core/worker.js'}
+assert len(preserved)==5 and preserved==env['RELEASE_SESSION_FILES']-{'core/src/core/worker.js'}
+assert len(files)==11 and files<=env['RELEASE_BACKEND_ALLOWLIST']
+assert not any('gateway-process' in f or 'wx-login' in f for f in files)
+remote_reads=[];ssh_calls=[]
+class Sftp:
+ def open(self,name,mode):
+  assert mode=='rb' and name.removeprefix('/fixture/project/') in preserved
+  remote_reads.append(name);return io.BytesIO(('LIVE:'+name).encode())
+ def close(self):pass
+class Client:
+ def open_sftp(self):return Sftp()
+ def close(self):pass
+ def exec_command(self,*a,**k):raise AssertionError('packaging cannot execute commands')
+def connect():ssh_calls.append(True);return Client()
+env['ssh_connect']=connect
+with tempfile.TemporaryDirectory(prefix='shop-release-',dir=root/'.workbuddy') as directory:
+ fake=pathlib.Path(directory);work=fake/'.workbuddy';work.mkdir();build=work/'frontend-20261116-shop-v1';build.mkdir()
+ (build/'index.html').write_bytes(b'production-index')
+ for name in files:
+  file=fake/name;file.parent.mkdir(parents=True,exist_ok=True);file.write_bytes(('LOCAL:'+name).encode())
+ env['BASE']=str(fake);archive=work/'shop.tar.gz'
+ with contextlib.redirect_stdout(io.StringIO()):env['package_shop_release'](str(build),str(archive))
+ assert len(ssh_calls)==1 and len(remote_reads)==5
+ manifest=env['load_release_manifest'](archive)
+ with tarfile.open(archive,'r:gz') as package:
+  assert len(package.getmembers())==13
+  for name in preserved:assert package.extractfile(name).read()==('LIVE:/fixture/project/'+name).encode()
+  for name in changed:assert package.extractfile(name).read()==('LOCAL:'+name).encode()
+ assert manifest['gatewayRestartAllowed'] is False and manifest['noGameRpcAcceptance'] is True
+ assert set(manifest['backendFiles'])==files
+ for field,value in [('gatewayRestartAllowed',True),('noGameRpcAcceptance',False),('frontendBuild','readonly'),('unchangedSessionFiles',[])]:
+  bad=copy.deepcopy(manifest);bad[field]=value
+  try:env['validate_shop_release_manifest'](bad)
+  except RuntimeError:pass
+  else:raise AssertionError('invalid manifest accepted: '+field)
+ for name in ['core/src/runtime/gateway-process.js','core/src/services/wx-login/service.js','web-dist/fixtures/account.json','web-dist/assets/app.js.map']:
+  bad=copy.deepcopy(manifest);bad['files'].append({'path':name,'size':1,'sha256':'fixture'})
+  if name.startswith('core/'):bad['backendFiles'].append(name)
+  try:env['validate_shop_release_manifest'](bad)
+  except RuntimeError:pass
+  else:raise AssertionError('extra source accepted: '+name)
+ try:env['package_shop_release'](str(build),str(archive))
+ except RuntimeError:pass
+ else:raise AssertionError('existing archive overwritten')
+ assert len(ssh_calls)==1
+ env['load_release_manifest']=lambda _:manifest
+ def blocked():raise RuntimeError('offline-ssh-stop')
+ env['ssh_connect']=blocked
+ for flags in [{'allow_gateway_change':True},{'build_app_only':True},{'preserve_friend_unknown':True},{'friend_history_stage':'spent'},{'frontend_only':True}]:
+  try:env['deploy_release']('fixture',allow_main_reload=True,**flags)
+  except RuntimeError as error:assert '禁止网关' in str(error)
+  else:raise AssertionError('forbidden activation accepted')
+ try:env['deploy_release']('fixture',allow_main_reload=True)
+ except RuntimeError as error:assert str(error)=='offline-ssh-stop'
+ else:raise AssertionError('expected fake SSH stop')
+ env['ssh_connect']=lambda:Client();env['load_panel_credentials']=lambda:{'username':'fixture'};env['RELEASE_INSPECT_SCRIPT']='fixture'
+ main={'mounts':{'/app/core/src':'/fixture/project/core/src','/app/web/dist':'/home/azureuser/web-dist'}}
+ gateway={'health':'healthy','running':True}
+ for member in preserved:
+  env['remote_file_json']=lambda *a,**k:{'containers':{'qq-farm-bot':main,'farm-gateway':gateway},'differences':[member]}
+  try:env['deploy_release']('fixture',allow_main_reload=True)
+  except RuntimeError as error:assert '原会话依赖变化' in str(error)
+  else:raise AssertionError('live session drift accepted: '+member)
+ assert source.read_text(encoding='utf-8').count('check_shop_release_preflight(cli, baseline)')==2
+ assert source.read_text(encoding='utf-8').count('check_shop_release_preflight(cli, current)')==1
+ print(json.dumps({'ok':True,'sixChanges':True,'fiveLiveSessionFiles':True,'noGatewayOrImage':True}))
+`;
+    const result = execFileSync('C:/Program Files/Python310/python.exe', ['-c', script, path.resolve(__dirname, '../..')],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    assert.equal(JSON.parse(result).fiveLiveSessionFiles, true);
+});
+
+test('shop idle gate is local-read-only and rejects in-flight writes, unknown visits and short stop grace', () => {
+    const { execFileSync } = require('node:child_process');
+    const script = String.raw`
+import ast,pathlib,json,sys,io,contextlib,subprocess,urllib.request
+from unittest.mock import patch
+source=pathlib.Path(sys.argv[1])/'cloudbase/.ref/deploy.py';tree=ast.parse(source.read_text(encoding='utf-8'))
+code=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SHOP_IDLE_PREFLIGHT_SCRIPT' for t in n.targets))
+worker={'connected':True,'detached':False,'quiescing':False,'pendingWrites':0,'queue':{'queued':0},'healthBackoff':{'active':False},
+        'friendVisit':{'processing':False,'activeGid':0,'holdUntilTransportEpochChanged':False,'recoveryRequired':False}}
+manager={'writeCount':0};record={'accountId':'1','phase':'left','proof':'leave_confirmed'};grace=[170];requests=[]
+class Response:
+ def __init__(self,data):self.data=data
+ def __enter__(self):return self
+ def __exit__(self,*a):pass
+ def read(self):return json.dumps({'ok':True,'data':self.data}).encode()
+class Opener:
+ def open(self,request,timeout):
+  route=request.full_url.removeprefix('http://127.0.0.1:3007');requests.append(route)
+  if route=='/api/login':return Response({'token':'fixture'})
+  if route=='/api/runtime/transport':return Response({'worker':worker,'manager':manager})
+  raise AssertionError('no config or game routes permitted: '+route)
+class File:
+ def __truediv__(self,name):return self
+ def is_symlink(self):return False
+ def is_file(self):return True
+ def read_text(self):return json.dumps(record)
+def check(fails=False):
+ requests.clear()
+ with patch.object(urllib.request,'build_opener',return_value=Opener()),patch.object(pathlib,'Path',return_value=File()),\
+      patch.object(subprocess,'check_output',return_value=json.dumps([{'Config':{'StopTimeout':grace[0]}}]).encode()),\
+      patch.object(sys,'stdin',io.StringIO(json.dumps({'credentials':{'username':'fixture'},'accountIds':['1']}))),\
+      contextlib.redirect_stdout(io.StringIO()) as out:
+  try:exec(compile(code,'fixture-idle-gate','exec'),{})
+  except RuntimeError:assert fails;return
+  assert not fails;result=json.loads(out.getvalue());assert result['ok'] and not result['gameRpcSent']
+  assert requests==['/api/login','/api/runtime/transport']
+check()
+for obj,key,value in [(worker,'connected',False),(worker,'pendingWrites',1),(worker,'quiescing',True),(manager,'writeCount',1),
+                      (worker['friendVisit'],'processing',True),(worker['friendVisit'],'recoveryRequired',True),
+                      (worker['friendVisit'],'holdUntilTransportEpochChanged',True),(worker['queue'],'queued',1),
+                      (worker['healthBackoff'],'active',True),(record,'phase','unknown'),(record,'proof','fabricated')]:
+ old=obj[key];obj[key]=value;check(True);obj[key]=old
+value=worker.pop('pendingWrites');check(True);worker['pendingWrites']=value
+grace[0]=10;check(True)
+print(json.dumps({'ok':True,'noGameRpc':True,'noConfigChanges':True,'guardFailuresVerified':True}))
+`;
+    const result = execFileSync('C:/Program Files/Python310/python.exe', ['-c', script, path.resolve(__dirname, '../..')],
+        { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    assert.equal(JSON.parse(result).guardFailuresVerified, true);
+});
+
+test('gameplay release entry uses exact dependencies, static-only acceptance and never old Leave recovery', () => {
     const { execFileSync } = require('node:child_process');
     const script = String.raw`
 import ast, pathlib, io, json, contextlib, sys
@@ -905,7 +1792,7 @@ env={'json':json,'pathlib':pathlib,'REMOTE':'/fixture/project'}
 for node in tree.body:
     if isinstance(node,ast.Assign):
         for target in node.targets:
-            if isinstance(target,ast.Name) and target.id in {'RELEASE_BACKEND_ALLOWLIST','RELEASE_STATIC_ALLOWLIST','RELEASE_SESSION_FILES','RELEASE_INSPECT_SCRIPT'}:
+            if isinstance(target,ast.Name) and target.id in {'RELEASE_BACKEND_ALLOWLIST','RELEASE_STATIC_ALLOWLIST','RELEASE_SESSION_FILES','RELEASE_INSPECT_SCRIPT','RELEASE_COMBINED_MIGRATION'}:
                 env[target.id]=ast.literal_eval(node.value)
 functions=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in {'inspect_release','deploy_release','package_gameplay_release'}]
 exec(compile(ast.Module(body=functions,type_ignores=[]),str(source),'exec'),env)

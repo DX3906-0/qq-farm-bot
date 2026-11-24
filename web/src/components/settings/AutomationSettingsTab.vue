@@ -100,6 +100,28 @@ interface AutomationSettings {
     milk_tea_share_rewards: boolean
     milk_tea_fund_rewards: boolean
     mall_coupon_gift_buy: boolean
+    ranch: boolean
+    ranch_harvest: boolean
+    ranch_produce: boolean
+    ranch_clean: boolean
+    ranch_sell: boolean
+    ranch_grass: boolean
+    ranch_grass_buy: boolean
+    ranch_feed_normal: boolean
+    ranch_feed_organic: boolean
+    ranch_fill_cans: boolean
+    ranch_complete_upgrade: boolean
+    ranch_place: boolean
+    ranch_cub_buy: boolean
+    ranch_daily_tasks_claim: boolean
+    ranch_growth_tasks_claim: boolean
+    ranch_daily_share_claim: boolean
+    ranch_activity_claim: boolean
+    ranch_friend_steal: boolean
+    ranch_friend_clean: boolean
+    ranch_friend_stroke: boolean
+    ranch_friend_mosquito: boolean
+    ranch_check_minutes: number
   }
   autoAcceptFriendMinLevel: number
   fertilizerBuyOrganicCount: number
@@ -224,12 +246,15 @@ function isBadSelected(gid: number) {
 
 function ensureFriends() {
   const id = props.currentAccountId
-  if (id && friendStore.friends.length === 0)
+  if (id && friendStore.friends.length === 0 && !friendStore.loading)
     friendStore.fetchFriends(String(id))
 }
 
+watch([qixiPickerVisible, badPickerVisible, stealPickerVisible], visible => {
+  if (visible.some(Boolean)) ensureFriends()
+}, { flush: 'sync' })
+
 onMounted(() => {
-  ensureFriends()
   nowTimer = window.setInterval(() => { nowMs.value = Date.now() }, 60_000)
 })
 onUnmounted(() => {
@@ -237,10 +262,16 @@ onUnmounted(() => {
   nowTimer = null
   overlayMotion.dispose()
 })
-watch(() => props.currentAccountId, ensureFriends)
-
 const activeCategory = ref<string | null>(null)
 const displayedCategory = ref<string | null>(null)
+watch(() => props.currentAccountId, () => {
+  activeCategory.value = null
+  displayedCategory.value = null
+  qixiPickerVisible.value = false
+  badPickerVisible.value = false
+  stealPickerVisible.value = false
+  friendSearch.value = ''
+}, { flush: 'sync' })
 function openCategory(key: string) {
   if (props.saving) return
   displayedCategory.value = key
@@ -267,6 +298,7 @@ const activityControlDesc = computed(() => {
 
 const categories = computed(() => [
   { key: 'core', label: '核心自动化', icon: 'i-carbon-settings-adjust', iconBg: 'bg-indigo-50 dark:bg-indigo-900/30', iconText: 'text-indigo-600 dark:text-indigo-300', desc: '种植收获·卖果实·升级土地·填化肥·清黄金虫' },
+  { key: 'ranch', label: '牧场自动化', icon: 'i-carbon-sprout', iconBg: 'bg-emerald-50 dark:bg-emerald-900/30', iconText: 'text-emerald-600 dark:text-emerald-300', desc: '日常照料·任务奖励·好友互动' },
   { key: 'activity', label: '活动控制', icon: 'i-carbon-star', iconBg: 'bg-indigo-50 dark:bg-indigo-900/30', iconText: 'text-indigo-600 dark:text-indigo-300', desc: activityControlDesc.value },
   { key: 'friend', label: '好友互动', icon: 'i-carbon-group', iconBg: 'bg-indigo-50 dark:bg-indigo-900/30', iconText: 'text-indigo-600 dark:text-indigo-300', desc: '偷菜·帮忙·放虫·捣乱·好友任务' },
   { key: 'fertilizer', label: '化肥策略', icon: 'i-carbon-chemistry', iconBg: 'bg-green-50 dark:bg-green-900/30', iconText: 'text-green-600 dark:text-green-300', desc: '有机/无机购买·施肥范围·多季补肥' },
@@ -288,6 +320,48 @@ const coreToggles = [
   { key: 'skip_own_weed_bug_when_exp_full', label: '经验满不除自己草虫', icon: 'i-carbon-close', color: 'gray' },
   { key: 'golden_bug_clear', label: '自动清除黄金虫', icon: 'i-carbon-bee', color: 'orange' },
 ]
+
+const ranchToggles = [
+  { key: 'ranch_harvest', label: '自动收获牧场产物', icon: 'i-carbon-sprout', color: 'green' },
+  { key: 'ranch_produce', label: '自动催产', icon: 'i-carbon-time', color: 'teal' },
+  { key: 'ranch_clean', label: '自动清理自家牧场', icon: 'i-carbon-clean', color: 'cyan' },
+  { key: 'ranch_sell', label: '自动出售牧场产物', icon: 'i-carbon-currency', color: 'amber' },
+  { key: 'ranch_grass', label: '自动补充牧草', icon: 'i-carbon-sprout', color: 'lime' },
+  { key: 'ranch_grass_buy', label: '牧草不足时用金券补购 1 个', icon: 'i-carbon-shopping-cart', color: 'amber' },
+  { key: 'ranch_feed_normal', label: '自动使用普通罐头桶喂养', icon: 'i-carbon-cube', color: 'blue' },
+  { key: 'ranch_feed_organic', label: '自动使用有机罐头桶喂养', icon: 'i-carbon-cube', color: 'violet' },
+  { key: 'ranch_fill_cans', label: '空桶时自动添加 1 个最小罐头（每桶每轮一次）', icon: 'i-carbon-cube', color: 'cyan' },
+  { key: 'ranch_complete_upgrade', label: '自动升级并完成到期设施（按核实费用扣款；同时仅一个）', icon: 'i-carbon-upgrade', color: 'slate' },
+  { key: 'ranch_place', label: '普通幼崽库存补栏（按物品编号顺序，不购买/不消耗巨大幼崽）', icon: 'i-carbon-add-alt', color: 'slate' },
+  { key: 'ranch_cub_buy', label: '库存不足时用金券购买普通幼崽', icon: 'i-carbon-shopping-cart', color: 'amber' },
+  { key: 'ranch_daily_tasks_claim', label: '自动领取已确认完成的牧场每日任务', icon: 'i-carbon-task', color: 'green' },
+  { key: 'ranch_growth_tasks_claim', label: '自动领取已确认完成的牧场成长任务（普通奖励）', icon: 'i-carbon-task', color: 'teal' },
+  { key: 'ranch_daily_share_claim', label: '自动领取每日分享礼包（登记奖励状态，不会通知好友）', icon: 'i-carbon-gift', color: 'amber' },
+  { key: 'ranch_activity_claim', label: '自动领取牧场活动可领奖励（不答题/分享）', icon: 'i-carbon-gift', color: 'violet' },
+  { key: 'ranch_friend_steal', label: '自动偷取好友牧场产物', icon: 'i-carbon-download', color: 'amber' },
+  { key: 'ranch_friend_clean', label: '自动清理好友牧场', icon: 'i-carbon-clean', color: 'cyan' },
+  { key: 'ranch_friend_stroke', label: '自动抚摸好友动物', icon: 'i-carbon-favorite', color: 'rose' },
+  { key: 'ranch_friend_mosquito', label: '自动向好友牧场放蚊子', icon: 'i-carbon-campsite', color: 'orange' },
+]
+
+const ranchFriendToggles = ranchToggles.filter(toggle => ['ranch_friend_steal', 'ranch_friend_clean', 'ranch_friend_stroke', 'ranch_friend_mosquito'].includes(toggle.key))
+const ranchQuickGroups = [
+  { key: 'ranch_group_care', label: '日常照料', icon: 'i-carbon-sprout', color: 'green', keys: ['ranch_harvest', 'ranch_produce', 'ranch_clean', 'ranch_sell', 'ranch_grass'] },
+  { key: 'ranch_group_feed', label: '用现有罐头喂养', icon: 'i-carbon-cube', color: 'blue', keys: ['ranch_feed_normal', 'ranch_feed_organic'] },
+  { key: 'ranch_group_rewards', label: '自动领取任务和分享奖励', icon: 'i-carbon-gift', color: 'teal', keys: ['ranch_daily_tasks_claim', 'ranch_growth_tasks_claim', 'ranch_daily_share_claim', 'ranch_activity_claim'] },
+  { key: 'ranch_group_friends', label: '好友牧场互动', icon: 'i-carbon-user-multiple', color: 'violet', keys: ranchFriendToggles.map(toggle => toggle.key) },
+]
+const ranchOptionalToggles = ranchToggles.filter(toggle => ['ranch_grass_buy', 'ranch_fill_cans', 'ranch_cub_buy'].includes(toggle.key))
+function ranchGroupEnabled(group: typeof ranchQuickGroups[number]) {
+  return group.keys.every(key => (settings.value.automation as any)[key] === true)
+}
+function ranchGroupLabel(group: typeof ranchQuickGroups[number]) {
+  const enabledCount = group.keys.filter(key => (settings.value.automation as any)[key] === true).length
+  return `${group.label}${enabledCount > 0 && enabledCount < group.keys.length ? `（部分开启 ${enabledCount}/${group.keys.length}）` : ''}`
+}
+function setRanchGroup(group: typeof ranchQuickGroups[number], enabled: boolean) {
+  for (const key of group.keys) (settings.value.automation as any)[key] = enabled
+}
 
 const rainPoemToggles = [
   { key: 'rain_poem_bottle_buy', label: '雨落成诗·购买天气采集瓶', icon: 'i-carbon-windy', color: 'sky' },
@@ -327,7 +401,7 @@ const milkTeaClaimToggles = [
 const activityToggles = [
   { key: 'solar_terms_claim', label: '自动领取节令小礼（基础奖励）', icon: 'i-carbon-calendar', color: 'rose' },
   { key: 'solar_terms_quiz_notify', label: '节令答题微信订阅提醒（同农场日报）', icon: 'i-carbon-notification', color: 'rose' },
-  { key: 'solar_terms_auto_answer', label: '自动答题（仅已核验题库，无可靠答案则跳过）', icon: 'i-carbon-help', color: 'rose' },
+  { key: 'solar_terms_auto_answer', label: '自动答题（使用你已确认的题库答案；题库更新后跳过）', icon: 'i-carbon-help', color: 'rose' },
   { key: 'star_passport_claim', label: '自动领取千星游记', icon: 'i-carbon-star', color: 'violet' },
   { key: 'star_record_claim', label: '自动领取观星礼录', icon: 'i-carbon-trophy', color: 'amber' },
   { key: 'qixi_bridge_build', label: '七夕自动建鹊桥', icon: 'i-carbon-link', color: 'pink' },
@@ -406,6 +480,7 @@ const friendToggles = [
 // 各分类开关键列表，用于卡片「种子行」逐颗渲染
 const categoryToggleKeys: Record<string, () => string[]> = {
   core: () => [...coreToggles.map(t => t.key), 'friend'],
+  ranch: () => ['ranch', ...ranchQuickGroups.map(group => group.key), 'ranch_complete_upgrade', 'ranch_place', ...ranchOptionalToggles.map(toggle => toggle.key)],
   activity: () => [
     ...visibleActivityToggles.value.map(t => t.key),
     ...(isActivityHidden('qingmei') ? [] : ['qingmei_seed_claim', 'qingmei_wine_brew']),
@@ -421,9 +496,20 @@ function categoryToggleList(key: string): string[] {
 }
 function isToggleOn(k: string): boolean {
   if (k === 'autoCodeRefresh.enabled') return autoCodeRefresh.value.enabled
+  if (k.startsWith('ranch_group_')) {
+    const group = ranchQuickGroups.find(item => item.key === k)
+    return !!group && ranchGroupEnabled(group)
+  }
   return !!(settings.value.automation as any)[k]
 }
 function categoryEnabledCount(key: string) {
+  if (key === 'ranch') {
+    return Number(settings.value.automation.ranch === true)
+      + ranchQuickGroups.filter(group => ranchGroupEnabled(group)).length
+      + Number(settings.value.automation.ranch_complete_upgrade === true)
+      + Number(settings.value.automation.ranch_place === true)
+      + ranchOptionalToggles.filter(toggle => (settings.value.automation as any)[toggle.key] === true).length
+  }
   return categoryToggleList(key).filter(isToggleOn).length
 }
 </script>
@@ -478,12 +564,13 @@ function categoryEnabledCount(key: string) {
           class="relative mt-auto flex items-center gap-1.5 pt-1"
           :title="categoryEnabledCount(cat.key) + ' / ' + categoryToggleList(cat.key).length + ' 已开启'"
         >
-          <span
-            v-for="tk in categoryToggleList(cat.key)"
-            :key="tk"
-            class="seed h-2.5 w-2.5 rounded-full transition-all duration-300"
-            :data-enabled="isToggleOn(tk)"
-          />
+          <template v-if="cat.key === 'ranch'">
+            <span v-for="group in ranchQuickGroups" :key="group.key" class="seed h-2.5 w-2.5 rounded-full transition-all duration-300" :data-enabled="ranchGroupEnabled(group)" />
+            <span v-for="toggle in ranchOptionalToggles" :key="toggle.key" class="seed h-2.5 w-2.5 rounded-full transition-all duration-300" :data-enabled="(settings.automation as any)[toggle.key] === true" />
+          </template>
+          <template v-else>
+            <span v-for="tk in categoryToggleList(cat.key)" :key="tk" class="seed h-2.5 w-2.5 rounded-full transition-all duration-300" :data-enabled="isToggleOn(tk)" />
+          </template>
           <span class="ml-1 text-xs tabular-nums text-[var(--muted-text)]">{{ categoryEnabledCount(cat.key) }}/{{ categoryToggleList(cat.key).length }}</span>
         </div>
       </button>
@@ -501,8 +588,8 @@ function categoryEnabledCount(key: string) {
     <Transition :css="false" @enter="overlayMotion.enter" @leave="overlayMotion.leave" @after-leave="finishCategoryExit" @enter-cancelled="overlayMotion.cancelled" @leave-cancelled="overlayMotion.cancelled">
       <div v-if="activeCategory" class="fixed inset-0 z-50 flex items-end justify-center sm:items-center" :data-leaving="!activeCategory">
         <div class="absolute inset-0 bg-gray-950/45 backdrop-blur-[2px]" @click="closeCategory" />
-        <div data-overlay-panel class="modal-card relative flex max-h-[88vh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800 sm:rounded-3xl">
-          <div class="flex items-center justify-between border-b border-gray-100 px-6 py-5 dark:border-gray-700">
+        <div data-overlay-panel class="modal-card category-dialog relative min-w-0 w-full max-w-lg flex flex-col overflow-hidden rounded-t-3xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-gray-800 sm:rounded-3xl">
+          <div class="flex shrink-0 items-center justify-between border-b border-gray-100 px-4 py-5 dark:border-gray-700 sm:px-6">
             <div class="flex items-center gap-3">
               <span class="h-10 w-10 inline-grid place-items-center rounded-full" :class="[activeCat?.iconBg || '', activeCat?.iconText || '']">
                 <i :class="activeCat?.icon" class="text-xl" />
@@ -512,10 +599,43 @@ function categoryEnabledCount(key: string) {
             <button class="h-8 w-8 inline-grid shrink-0 place-items-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200" type="button" aria-label="关闭" @click="closeCategory"><span class="i-carbon-close text-xl" /></button>
           </div>
 
-          <fieldset class="flex-1 space-y-3 overflow-auto px-6 py-5 border-0 m-0" :disabled="saving || !activeCategory">
+          <div class="category-dialog__body min-h-0 min-w-0 w-full max-w-full flex-auto overflow-x-hidden overflow-y-auto overscroll-contain">
+          <fieldset class="m-0 min-h-0 min-w-0 w-full max-w-full box-border space-y-3 border-0 px-4 py-5 sm:px-6" :disabled="saving || !activeCategory">
             <template v-if="displayedCategory === 'core'">
               <SettingToggle v-for="t in coreToggles" :key="t.key" :model-value="(settings.automation as any)[t.key]" :label="t.label" :icon="t.icon" :color="t.color" @update:model-value="(v: boolean) => (settings.automation as any)[t.key] = v" />
               <SettingToggle :model-value="settings.automation.friend" label="自动好友互动" :img="friendIcon" color="indigo" @update:model-value="settings.automation.friend = $event" />
+            </template>
+
+            <template v-else-if="displayedCategory === 'ranch'">
+              <SettingToggle v-model="settings.automation.ranch" label="启用牧场自动化" icon="i-carbon-sprout" color="emerald" />
+              <div :class="{ 'pointer-events-none opacity-50': !settings.automation.ranch }" class="space-y-3">
+                <p class="category-dialog__note box-border w-full min-w-0 max-w-full break-words rounded-xl bg-gray-50 p-3 text-sm text-gray-600 [overflow-wrap:anywhere] dark:bg-gray-900/30 dark:text-gray-300">像农场一样，先开总开关，再选几项常用自动化。购买默认关闭且需单独开启；分享奖励仅登记游戏内奖励状态，不会向好友发送消息。未知操作只阻止相关目标和余额，不会重复提交。</p>
+                <SettingToggle v-for="group in ranchQuickGroups" :key="group.key" :model-value="ranchGroupEnabled(group)" :label="ranchGroupLabel(group)" :icon="group.icon" :color="group.color" :disabled="!settings.automation.ranch" @update:model-value="(value: boolean) => setRanchGroup(group, value)" />
+                <SettingToggle v-model="settings.automation.ranch_complete_upgrade" label="自动升级并完成设施" icon="i-carbon-upgrade" color="slate" :disabled="!settings.automation.ranch" />
+                <SettingToggle v-model="settings.automation.ranch_place" label="用背包里的普通幼崽补空栏" icon="i-carbon-add-alt" color="slate" :disabled="!settings.automation.ranch" />
+                <details class="rounded-xl border border-gray-200 p-3 dark:border-gray-700">
+                  <summary class="cursor-pointer text-sm font-medium">购买与补给设置</summary>
+                  <div class="mt-3 space-y-3">
+                    <SettingToggle v-for="toggle in ranchOptionalToggles" :key="toggle.key" :model-value="(settings.automation as any)[toggle.key]" :label="toggle.key === 'ranch_grass_buy' ? '牧草不够时用金券购买' : toggle.key === 'ranch_fill_cans' ? '空桶时购买并添加一个罐头' : '缺幼崽时用金券购买普通幼崽'" :icon="toggle.icon" :color="toggle.color" :disabled="!settings.automation.ranch" @update:model-value="(value: boolean) => (settings.automation as any)[toggle.key] = value" />
+                    <p class="text-xs text-gray-600 dark:text-gray-300">自动补栏不会自动购买；要购买幼崽还需同时开启库存补栏。幼崽购买最多每轮3只、单价不超过1080金券，并保留10000金券；不买巨大幼崽。罐头购买可能消耗金券。</p>
+                  </div>
+                </details>
+                <details class="rounded-xl border border-gray-200 p-3 dark:border-gray-700">
+                  <summary class="cursor-pointer text-sm font-medium">好友牧场互动（可选）</summary>
+                  <div class="mt-3 space-y-2">
+                    <SettingToggle v-for="toggle in ranchFriendToggles" :key="toggle.key" :model-value="(settings.automation as any)[toggle.key]" :label="toggle.label" :icon="toggle.icon" :color="toggle.color" :disabled="!settings.automation.ranch" @update:model-value="(value: boolean) => (settings.automation as any)[toggle.key] = value" />
+                    <div class="category-dialog__friend-setting box-border flex w-full min-w-0 max-w-full flex-wrap items-center justify-between gap-2 rounded-xl border border-gray-200 p-3 dark:border-gray-700">
+                      <span class="min-w-0 flex-1 break-words text-sm [overflow-wrap:anywhere]">仅偷取指定好友（与农场共用）</span>
+                      <button type="button" class="rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700" :disabled="!settings.automation.ranch" @click="stealPickerVisible = true">选择好友</button>
+                    </div>
+                    <div class="category-dialog__friend-setting box-border flex w-full min-w-0 max-w-full flex-wrap items-center justify-between gap-2 rounded-xl border border-gray-200 p-3 dark:border-gray-700">
+                      <span class="min-w-0 flex-1 break-words text-sm [overflow-wrap:anywhere]">仅向指定好友放蚊（与农场捣乱共用）</span>
+                      <button type="button" class="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700" :disabled="!settings.automation.ranch" @click="badPickerVisible = true">选择好友</button>
+                    </div>
+                    <p class="text-xs text-gray-600 dark:text-gray-300">黑名单、免打扰和好友互动次数限制仍然生效。巡查间隔跟随农场设置。</p>
+                  </div>
+                </details>
+              </div>
             </template>
 
             <template v-else-if="displayedCategory === 'activity'">
@@ -718,8 +838,9 @@ function categoryEnabledCount(key: string) {
               </div>
             </template>
           </fieldset>
+          </div>
 
-          <div class="flex justify-end border-t border-gray-100 bg-gray-50/70 px-6 py-4 dark:border-gray-700 dark:bg-gray-900/20">
+          <div class="flex shrink-0 justify-end border-t border-gray-100 bg-gray-50/70 px-4 py-4 dark:border-gray-700 dark:bg-gray-900/20 sm:px-6">
             <BaseButton class="min-w-24" size="sm" @click="closeCategory">完成</BaseButton>
           </div>
         </div>
@@ -857,6 +978,12 @@ function categoryEnabledCount(key: string) {
 }
 
 /* Entry/exit uses the shared presentation-only overlay controller. */
+
+/* 正文在标题和底栏之间独立滚动，移动端高度跟随可见视口。 */
+.category-dialog {
+  max-height: 88vh;
+  max-height: 88dvh;
+}
 
 /* 弹窗顶部鼠尾草色条 */
 .modal-card::before {

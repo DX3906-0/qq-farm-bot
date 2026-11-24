@@ -228,7 +228,7 @@ function loadGateway({ initial = record(), Service, time = clock(), env = {}, de
     const apiNames = ['wxTokenDue', 'wxLayerCooling', 'refreshWxTokenSingleFlight', 'withWxCredentialContext', 'wxCredentialFlights', 'wxSessionBinding', 'wxFailureState', 'stopNetwork', 'createConn', 'accounts', 'issueWxCodeFromBuffer', 'refreshWxBufferSingleFlight', 'persistRefreshedWxBuffer', 'persistRotatedCredentialsOnError', 'keepWxCredentialAlive', 'startWxKeepalive', 'classifyWxCodeError', 'handleWxCodeFailure', 'onAccountLogin', 'reconnect', 'handleWorkerFrame', 'withTimeout', 'WX_KEEPALIVE_INTERVAL_MS', 'WX_KEEPALIVE_MIN_AGE_MS', 'handleMessage', 'decodeLoginReply', 'sendLogin', 'connect', 'connectWxSingleFlight', 'armWxReconnectAt', 'sendMsg'];
     const context = vm.createContext({
         module, exports: module.exports, Buffer, Error, AbortController, Date: time.Date,
-        process: { env, pid: 123 },
+        process: { env: { FARM_LOGIN_PROFILE: 'legacy', ...env }, pid: 123 },
         setTimeout: time.setTimeout, clearTimeout: time.clearTimeout,
         setInterval: time.setInterval, clearInterval: time.clearInterval,
         require(name) {
@@ -252,6 +252,8 @@ function loadGateway({ initial = record(), Service, time = clock(), env = {}, de
             if (name === '../utils/tsdk-runtime') return { TsdkRuntime: FakeTsdkRuntime };
             if (name === '../services/ace-service') return { AceService: FakeAceService };
             if (name === '../utils/gateway-token') return { createGatewayToken: () => 'synthetic-gateway-token' };
+            if (name === '../services/account-maintenance-hold') return { isAccountMaintenanceHeld: () => false };
+            if (name === '../services/player-login-protocol') return require('../src/services/player-login-protocol');
             throw new Error(`禁止真实 require: ${name}`);
         },
     });
@@ -262,6 +264,67 @@ function loadGateway({ initial = record(), Service, time = clock(), env = {}, de
     const sock = { write(text) { frames.push(JSON.parse(text)); } };
     return { api: context.api, context, storage, storageApi, logs, frames, account, sock, time, storeAccounts, wsSockets, types };
 }
+
+test('官方player登录先验证新Reply并确认HOME，之前不发布gid或loggedin', async () => {
+    const protobuf = require('protobufjs');
+    const root = new protobuf.Root();
+    root.loadSync(path.join(__dirname, '../src/proto/player-login.proto'), { keepCase: true });
+    root.loadSync(path.join(__dirname, '../src/proto/globalscenepb.proto'), { keepCase: true });
+    for (const failure of [null, 'remote', 'gid', 'home', 'epoch']) {
+        const h = loadGateway({ env: { FARM_LOGIN_PROFILE: failure === null ? '' : 'player' } });
+        for (const [name, full] of Object.entries({
+            PlayerLoginRequest: 'gamepb.userpb.PlayerLoginRequest', PlayerLoginReply: 'gamepb.userpb.PlayerLoginReply',
+            PlayerSceneLoginRequest: 'gamepb.globalscenepb.PlayerSceneLoginRequest', PlayerSceneLoginReply: 'gamepb.globalscenepb.PlayerSceneLoginReply',
+        })) h.types[name] = root.lookupType(full);
+        h.account.ws = { OPEN: 1, readyState: 1 };
+        h.account.userState.gid = 0;
+        const methods = [];
+        let homeCallback, published = 0;
+        h.context.__sendPlayerTest = async (_account, service, method, bytes, callback) => {
+            methods.push(method);
+            if (method === 'PlayerLogin') {
+                assert.equal(service, 'gamepb.userpb.UserService');
+                const request = h.types.PlayerLoginRequest.decode(bytes);
+                assert.equal(request.game_scene_id, 1);
+                assert.equal(request.device_info.client_version, '1.17.0.6_20261117');
+                if (failure === 'remote') { callback.reject(new Error('server refused')); return; }
+                callback.resolve({ body: h.types.PlayerLoginReply.encode({ basic: { gid: failure === 'gid' ? 0 : 321, name: 'fixture' },
+                    version_info: {}, global_scene_id: 2, unlocked_scene_ids: [1, 2] }).finish() });
+            } else {
+                assert.equal(method, 'PlayerSceneLogin');
+                assert.equal(callback.loginScene, true);
+                assert.equal(h.types.PlayerSceneLoginRequest.decode(bytes).global_scene_id, 1);
+                homeCallback = callback;
+            }
+        };
+        vm.runInContext("CONFIG.clientVersion='1.17.0.6_20261117'; sendMsg=__sendPlayerTest;", h.context);
+        assert.equal(vm.runInContext("requestKind('gamepb.userpb.UserService','PlayerLogin')", h.context), 'login');
+        const pending = h.api.sendLogin(h.account, () => { published++; });
+        // Attach rejection handler immediately, before draining microtasks.
+        const settled = pending.then(() => ({ ok: true }), error => ({ error }));
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        assert.equal(h.account.userState.gid, 0);
+        assert.equal(published, 0);
+        if (homeCallback) {
+            if (failure === 'epoch') h.account.connectionEpoch++;
+            homeCallback.resolve({ body: h.types.PlayerSceneLoginReply.encode({ global_scene_id: failure === 'home' ? 2 : 1 }).finish() });
+        }
+        const result = await settled;
+        if (failure) {
+            assert.ok(result.error, failure);
+            assert.equal(published, 0);
+            assert.equal(h.account.userState.gid, 0);
+        } else {
+            assert.equal(result.ok, true);
+            assert.equal(published, 1);
+            assert.equal(h.account.userState.gid, 321);
+            assert.equal(h.account.loginProfile, 'player');
+            assert.deepEqual([...h.account.unlockedSceneIds], [1, 2]);
+        }
+        assert.equal(methods.filter(method => method === 'PlayerLogin').length, 1);
+        assert.equal(methods.includes('Login'), false, 'player失败不可回退legacy');
+    }
+});
 
 function successfulService(counter = { calls: 0 }, time = clock()) {
     const native = loadNative(time);

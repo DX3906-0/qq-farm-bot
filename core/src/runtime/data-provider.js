@@ -141,12 +141,33 @@ function createDataProvider(deps) {
 
         // ========== Farm API ==========
         getLands: (ref) => callWorkerApi(resolveAccountId(ref), 'getLands'),
+        // 牧场一期只读包含保守场景切换/恢复，给完整场景事务留出结算时间。
+        getRanchSceneAccessInfo: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchSceneAccessInfo', { _timeoutMs: 15000 }),
+        upgradeRanchGlobalLogin: (ref, expected) => callWorkerApi(resolveAccountId(ref), 'upgradeRanchGlobalLogin', expected, { _timeoutMs: 90000 }),
+        getRanchOverview: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchOverview', { _timeoutMs: 160000 }),
+        getRanchFriends: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchFriends', { _timeoutMs: 160000 }),
+        getRanchFriend: (ref, gid) => callWorkerApi(resolveAccountId(ref), 'getRanchFriend', gid, { _timeoutMs: 160000 }),
+        // 牧场二期/三期手动写：报价与确认各含一次场景事务；pending 列表为本地文件读。
+        getRanchPendingOperations: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchPendingOperations'),
+        getRanchCatalog: (ref, shopId) => callWorkerApi(resolveAccountId(ref), 'getRanchCatalog', shopId, { _timeoutMs: 160000 }),
+        getRanchBag: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchBag', { _timeoutMs: 160000 }),
+        getRanchCanCatalog: (ref, slotType) => callWorkerApi(resolveAccountId(ref), 'getRanchCanCatalog', slotType, { _timeoutMs: 160000 }),
+        getRanchTasks: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchTasks', { _timeoutMs: 160000 }),
+        getRanchBook: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchBook', { _timeoutMs: 160000 }),
+        getRanchShare: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchShare', { _timeoutMs: 160000 }),
+        getRanchMarket: (ref) => callWorkerApi(resolveAccountId(ref), 'getRanchMarket', { _timeoutMs: 160000 }),
+        getRanchActivities: (ref, groupId = '') => callWorkerApi(resolveAccountId(ref), 'getRanchActivities', groupId, { _timeoutMs: 160000 }),
+        operateRanchMugeActivity: (ref, action, input = {}) => callWorkerApi(resolveAccountId(ref), 'operateRanchMugeActivity', action, input, { _timeoutMs: 180000 }),
+        prepareRanchAction: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'prepareRanchAction', action, input, { _timeoutMs: 160000 }),
+        operateRanch: (ref, action, input, expected) => callWorkerApi(resolveAccountId(ref), 'operateRanch', action, input, expected, { _timeoutMs: 160000 }),
+        acknowledgeRanchOperation: (ref, id) => callWorkerApi(resolveAccountId(ref), 'acknowledgeRanchOperation', id),
         getSeeds: (ref) => callWorkerApi(resolveAccountId(ref), 'getSeeds'),
         getBag: (ref) => callWorkerApi(resolveAccountId(ref), 'getBag'),
         // 装扮/皮肤：读概览 + 手动换装
         getSkins: (ref) => callWorkerApi(resolveAccountId(ref), 'getSkins', { _timeoutMs: 65000 }),
         // 多阶段确认的游戏scope上限60s；IPC/HTTP留余量，不提前误判在途结果。
         equipSkin: (ref, skinId, slotType, expected) => callWorkerApi(resolveAccountId(ref), 'equipSkin', skinId, slotType, expected, { _timeoutMs: 65000 }),
+        equipSkinPart: (ref, skinId, partId, expected) => callWorkerApi(resolveAccountId(ref), 'equipSkinPart', skinId, partId, expected, { _timeoutMs: 65000 }),
         getAvatarFrames: (ref) => callWorkerApi(resolveAccountId(ref), 'getAvatarFrames', { _timeoutMs: 65000 }),
         operateAvatarFrame: (ref, action, input) => callWorkerApi(resolveAccountId(ref), 'operateAvatarFrame', action, input, { _timeoutMs: 65000 }),
         getSolarTermsInfo: (ref) => callWorkerApi(resolveAccountId(ref), 'getSolarTermsInfo', { _timeoutMs: 65000 }),
@@ -183,6 +204,8 @@ function createDataProvider(deps) {
         removeAllPlants: (ref) => callWorkerApi(resolveAccountId(ref), 'removeAllPlants'),
         getShopInfo: (ref, shopId) => callWorkerApi(resolveAccountId(ref), 'getShopInfo', shopId),
         buyGoods: (ref, shopId, goodsId, count) => callWorkerApi(resolveAccountId(ref), 'buyGoods', shopId, goodsId, count),
+        getDecorationShop: (ref) => callWorkerApi(resolveAccountId(ref), 'getDecorationShop', { _timeoutMs: 65000 }),
+        buyDecorationGoods: (ref, goodsId, count, expectedOffer) => callWorkerApi(resolveAccountId(ref), 'buyDecorationGoods', goodsId, count, expectedOffer, { _timeoutMs: 65000 }),
         doAnalytics: (ref, days) => callWorkerApi(resolveAccountId(ref), 'getAnalytics', days),
 
         // ========== Friend API ==========
@@ -284,6 +307,16 @@ function createDataProvider(deps) {
             const id = resolveAccountId(ref);
             if (!id) throw new Error('Missing x-account-id');
             store.setAutomation(key, value, id);
+            const rev = nextConfigRevision();
+            broadcastConfigToWorkers(id);
+            return { automation: store.getAutomation(id), configRevision: rev };
+        },
+        setAutomationBatch: async (ref, values) => {
+            const id = resolveAccountId(ref);
+            if (!id) throw new Error('Missing x-account-id');
+            if (!values || typeof values !== 'object' || Array.isArray(values)) throw new Error('自动化配置无效');
+            // 单次normalize/落盘/广播，避免多字段保存期间worker看到半套新配置。
+            store.applyConfigSnapshot({ automation: values }, { accountId: id });
             const rev = nextConfigRevision();
             broadcastConfigToWorkers(id);
             return { automation: store.getAutomation(id), configRevision: rev };

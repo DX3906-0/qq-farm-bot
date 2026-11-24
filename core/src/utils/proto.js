@@ -29,6 +29,13 @@ async function loadProto() {
         getResourcePath('proto', 'userpb.proto'),
         // 2026-11-02 同步上游：登录协议独立成文件（含 version_info 版本校准字段）
         getResourcePath('proto', 'player-login.proto'),
+        // 牧场按固定1.17.0.3子集加载；读写权限由精确路由、场景租约和终态核验控制。
+        // 只读GET不调用写方法，所有开放写动作仍走报价确认与持久账本。
+        getResourcePath('proto', 'globalscenepb.proto'),
+        getResourcePath('proto', 'animalpb.proto'),
+        getResourcePath('proto', 'homesteadpb.proto'),
+        // 牧场场景2背包/出售/使用独立命名空间（物品为 is_locked + show.sells 结构）。
+        getResourcePath('proto', 'ranchpb.proto'),
         getResourcePath('proto', 'plantpb.proto'),
         getResourcePath('proto', 'corepb.proto'),
         getResourcePath('proto', 'shoppb.proto'),
@@ -40,6 +47,7 @@ async function loadProto() {
         getResourcePath('proto', 'itempb.proto'),
         getResourcePath('proto', 'emailpb.proto'),
         getResourcePath('proto', 'mallpb.proto'),
+        getResourcePath('proto', 'paypb.proto'),
         getResourcePath('proto', 'redpacketpb.proto'),
         getResourcePath('proto', 'qqvippb.proto'),
         getResourcePath('proto', 'sharepb.proto'),
@@ -47,6 +55,8 @@ async function loadProto() {
         getResourcePath('proto', 'interactpb.proto'),
         getResourcePath('proto', 'dogpb.proto'),
         getResourcePath('proto', 'activitypb.proto'),
+        // 牧歌初启的 ActivityService 专属 Muge* 消息与普通活动目录 payload 不同。
+        getResourcePath('proto', 'muge.proto'),
         // 2026-11-02 同步上游：activitypb 被拆成多个同命名空间(gamepb.activitypb)的文件，
         // ActivityData 的 oneof 引用了这里的 ActivityBodyWishSign 等类型，
         // 不加载会报「no such Type or Enum 'ActivityBodyWishSign'」。
@@ -92,6 +102,9 @@ async function loadProto() {
     // 用户
     types.LoginRequest = _lookup('gamepb.userpb.LoginRequest');
     types.LoginReply = _lookup('gamepb.userpb.LoginReply');
+    // Register the official global-login schema without changing live login mode.
+    types.PlayerLoginRequest = _lookup('gamepb.userpb.PlayerLoginRequest');
+    types.PlayerLoginReply = _lookup('gamepb.userpb.PlayerLoginReply');
     types.HeartbeatRequest = _lookup('gamepb.userpb.HeartbeatRequest');
     types.HeartbeatReply = _lookup('gamepb.userpb.HeartbeatReply');
     types.ReportArkClickRequest = _lookup('gamepb.userpb.ReportArkClickRequest');
@@ -100,6 +113,81 @@ async function loadProto() {
     types.AntiDataReply = _lookup('gamepb.acepb.AntiDataReply');
     types.CareerInfoGetRequest = _lookup('gamepb.careerpb.CareerInfoGetRequest');
     types.CareerInfoGetReply = _lookup('gamepb.careerpb.CareerInfoGetReply');
+
+    // 牧场一期只读：PlayerSceneLogin 是场景会话事务；AllCells/GetRanchDetail 才是安全读。
+    types.GetPlayerSceneInfoRequest = _lookup('gamepb.globalscenepb.GetPlayerSceneInfoRequest');
+    types.GetPlayerSceneInfoReply = _lookup('gamepb.globalscenepb.GetPlayerSceneInfoReply');
+    types.PlayerSceneLoginRequest = _lookup('gamepb.globalscenepb.PlayerSceneLoginRequest');
+    types.PlayerSceneLoginReply = _lookup('gamepb.globalscenepb.PlayerSceneLoginReply');
+    types.RanchAllCellsRequest = _lookup('gamepb.homesteadpb.AllCellsRequest');
+    types.RanchAllCellsReply = _lookup('gamepb.homesteadpb.AllCellsReply');
+    types.RanchGetRanchDetailRequest = _lookup('gamepb.animalpb.GetRanchDetailRequest');
+    types.RanchGetRanchDetailReply = _lookup('gamepb.animalpb.GetRanchDetailReply');
+
+    // 牧场二期自家写操作（手动确认后才允许调用；服务层不含好友向消息）。
+    types.RanchPlaceAnimalRequest = _lookup('gamepb.animalpb.PlaceAnimalRequest');
+    types.RanchPlaceAnimalReply = _lookup('gamepb.animalpb.PlaceAnimalReply');
+    types.RanchTriggerProduceRequest = _lookup('gamepb.animalpb.TriggerProduceRequest');
+    types.RanchTriggerProduceReply = _lookup('gamepb.animalpb.TriggerProduceReply');
+    types.RanchFeedAnimalRequest = _lookup('gamepb.animalpb.FeedAnimalRequest');
+    types.RanchFeedAnimalReply = _lookup('gamepb.animalpb.FeedAnimalReply');
+    types.RanchHarvestRanchRequest = _lookup('gamepb.animalpb.HarvestRanchRequest');
+    types.RanchHarvestRanchReply = _lookup('gamepb.animalpb.HarvestRanchReply');
+    types.RanchDonateAnimalRequest = _lookup('gamepb.animalpb.DonateAnimalRequest');
+    types.RanchDonateAnimalReply = _lookup('gamepb.animalpb.DonateAnimalReply');
+    types.RanchCleanAllRanchRequest = _lookup('gamepb.animalpb.CleanAllRanchRequest');
+    types.RanchCleanAllRanchReply = _lookup('gamepb.animalpb.CleanAllRanchReply');
+    types.RanchUpgradeBuildingRequest = _lookup('gamepb.homesteadpb.UpgradeBuildingRequest');
+    types.RanchUpgradeBuildingReply = _lookup('gamepb.homesteadpb.UpgradeBuildingReply');
+    types.RanchCompleteBuildingUpgradeRequest = _lookup('gamepb.homesteadpb.CompleteBuildingUpgradeRequest');
+    types.RanchCompleteBuildingUpgradeReply = _lookup('gamepb.homesteadpb.CompleteBuildingUpgradeReply');
+    types.RanchAddFeedRequest = _lookup('gamepb.homesteadpb.AddFeedRequest');
+    types.RanchAddFeedReply = _lookup('gamepb.homesteadpb.AddFeedReply');
+    types.RanchGetFacilityDetailRequest = _lookup('gamepb.homesteadpb.GetFacilityDetailRequest');
+    types.RanchGetFacilityDetailReply = _lookup('gamepb.homesteadpb.GetFacilityDetailReply');
+
+    // 牧场三期3B好友互动：独立EnterHomestead/LeaveHomestead会话，不复用农场Visit Enter/Leave。
+    types.RanchEnterHomesteadRequest = _lookup('gamepb.ranchpb.EnterHomesteadRequest');
+    types.RanchEnterHomesteadReply = _lookup('gamepb.ranchpb.EnterHomesteadReply');
+    types.RanchLeaveHomesteadRequest = _lookup('gamepb.ranchpb.LeaveHomesteadRequest');
+    types.RanchLeaveHomesteadReply = _lookup('gamepb.ranchpb.LeaveHomesteadReply');
+    types.RanchStealProduceRequest = _lookup('gamepb.animalpb.StealProduceRequest');
+    types.RanchStealProduceReply = _lookup('gamepb.ranchpb.StealProduceReply');
+    types.RanchPutHazardRequest = _lookup('gamepb.animalpb.PutHazardRequest');
+    types.RanchPutHazardReply = _lookup('gamepb.animalpb.PutHazardReply');
+    types.RanchGetRanchOpTimesRequest = _lookup('gamepb.animalpb.GetRanchOpTimesRequest');
+    types.RanchGetRanchOpTimesReply = _lookup('gamepb.animalpb.GetRanchOpTimesReply');
+    types.RanchStrokeAnimalRequest = _lookup('gamepb.animalpb.StrokeAnimalRequest');
+    types.RanchStrokeAnimalReply = _lookup('gamepb.animalpb.StrokeAnimalReply');
+
+    // 牧场场景2背包/出售/使用（ranchpb 命名空间，service 仍为 itempb.ItemService）。
+    types.RanchGetBagRequest = _lookup('gamepb.ranchpb.GetBagRequest');
+    types.RanchGetBagReply = _lookup('gamepb.ranchpb.GetBagReply');
+    types.RanchIllustratedChangeNotifyV2 = _lookup('gamepb.illustratedpb.IllustratedChangeNotifyV2');
+    types.RanchIllustratedRewardRedDotNotifyV2 = _lookup('gamepb.illustratedpb.IllustratedRewardRedDotNotifyV2');
+    // 4B keeps ranch book/share wire shapes separate from farm aliases.
+    for (const name of [
+        'GetIllustratedListV2Request', 'GetIllustratedListV2Reply',
+        'GetRanchWeightScoreV2Request', 'GetRanchWeightScoreV2Reply',
+        'ClaimRanchWeightScoreRewardV2Request', 'ClaimRanchWeightScoreRewardV2Reply',
+        'ClaimAllRewardsV2Request', 'ClaimAllRewardsV2Reply',
+        'BatchGetBasicInfoRequest', 'BatchGetBasicInfoReply',
+        'ReportShareRequest', 'ReportShareReply', 'ClaimShareRewardRequest', 'ClaimShareRewardReply',
+        'RotationShopInfoRequest', 'RotationShopInfoReply', 'RotationBuyGoodsRequest', 'RotationBuyGoodsReply',
+        'ActivityListRequest', 'ActivityListReply', 'GetActivityGroupRequest', 'GetActivityGroupReply', 'ActiviesChangeNotify',
+    ]) types[`Ranch${name}`] = _lookup(`gamepb.ranchpb.${name}`);
+    for (const name of ['TaskInfoRequest', 'TaskInfoReply', 'BatchClaimTaskRewardRequest', 'BatchClaimTaskRewardReply']) {
+        types[`Ranch${name}`] = _lookup(`gamepb.taskpb.${name}`);
+    }
+    for (const name of ['GetIllustratedLevelListV2Request', 'GetIllustratedLevelListV2Reply']) {
+        types[`Ranch${name}`] = _lookup(`gamepb.illustratedpb.${name}`);
+    }
+    types.RanchUseRequest = _lookup('gamepb.ranchpb.UseRequest');
+    types.RanchUseReply = _lookup('gamepb.ranchpb.UseReply');
+    types.GetRechargeInfoRequest = _lookup('gamepb.paypb.GetRechargeInfoRequest');
+    types.GetRechargeInfoReply = _lookup('gamepb.paypb.GetRechargeInfoReply');
+    types.RanchSellRequest = _lookup('gamepb.ranchpb.SellRequest');
+    types.RanchSellReply = _lookup('gamepb.ranchpb.SellReply');
 
     // 农场
     types.AllLandsRequest = _lookup('gamepb.plantpb.AllLandsRequest');
@@ -178,6 +266,8 @@ async function loadProto() {
     types.GetSkinEffectTypeParamsReply = _lookup('gamepb.skinpb.GetSkinEffectTypeParamsReply');
     types.EquipSkinRequest = _lookup('gamepb.skinpb.EquipRequest');
     types.EquipSkinReply = _lookup('gamepb.skinpb.EquipReply');
+    types.EquipSkinPartRequest = _lookup('gamepb.skinpb.EquipSkinPartRequest');
+    types.EquipSkinPartReply = _lookup('gamepb.skinpb.EquipSkinPartReply');
     types.MarkSkinAsViewedRequest = _lookup('gamepb.skinpb.MarkAsViewedRequest');
     types.MarkSkinAsViewedReply = _lookup('gamepb.skinpb.MarkAsViewedReply');
     for (const name of ['AvatarFramesOwnedRequest', 'AvatarFramesOwnedReply', 'AvatarFramesEquipedRequest', 'AvatarFramesEquipedReply']) {
@@ -260,6 +350,9 @@ async function loadProto() {
     types.ActivityActivityInfo = _lookup('gamepb.activitypb.ActivityInfo');
     types.ActivityListRequest = _lookup('gamepb.activitypb.ListRequest');
     types.ActivityListReply = _lookup('gamepb.activitypb.ListReply');
+    for (const name of ['MugeListReply', 'MugeOperateRequest', 'MugeOperateReply']) {
+        types[name] = _lookup(`gamepb.activitypb.${name}`);
+    }
     types.ActivityStarRecordInfo = _lookup('gamepb.activitypb.StarRecordInfo');
     types.ActivityStarRecordClaimResult = _lookup('gamepb.activitypb.StarRecordClaimResult');
     types.ActivityQixiGiftParams = _lookup('gamepb.activitypb.QixiGiftParams');

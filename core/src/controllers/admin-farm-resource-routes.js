@@ -66,10 +66,10 @@ function registerAdminFarmResourceRoutes({
       return;
 
     try {
-      let result = null;
-      for (const [key, value] of Object.entries(req.body)) {
-        result = await provider.setAutomation(accountId, key, value);
-      }
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
+      if (!body)
+        return res.status(400).json({ ok: false, error: "自动化配置无效" });
+      const result = await provider.setAutomationBatch(accountId, body);
       res.json({ ok: true, data: result || {} });
     }
     catch (error) {

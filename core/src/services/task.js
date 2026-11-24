@@ -14,6 +14,18 @@ const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
 const { createScheduler } = require('./scheduler');
 const { recordOperation } = require('./stats');
 const { getItemById } = require('../config/gameConfig');
+const { getRanchTask } = require('./ranch-config');
+
+function isUnconfirmedFarmTask(task) {
+  const id = String(task?.id || '');
+  // The pinned farm table ends below 300000; unknown higher IDs must not enter
+  // a legacy auto-claim chain simply because a new ranch config is not installed.
+  return !!getRanchTask(id) || /^\d+$/.test(id) && BigInt(id) >= 300000n;
+}
+function containsRanchTasks(info) {
+  return [...(info?.daily_tasks || []), ...(info?.growth_tasks || []), ...(info?.tasks || [])]
+    .some(isUnconfirmedFarmTask);
+}
 
 // ---- 状态 ----
 
@@ -61,7 +73,7 @@ function isTransientError(err) {
 
 async function getTaskInfo() {
   const request = types.TaskInfoRequest.encode(
-    types.TaskInfoRequest.create({})
+    types.TaskInfoRequest.create({ global_scene_id: 1 })
   ).finish();
   const { body } = await sendMsgAsync('gamepb.taskpb.TaskService', 'TaskInfo', request);
   return types.TaskInfoReply.decode(body);
@@ -318,6 +330,7 @@ async function checkAndClaimIllustratedRewards() {
  * 领取单个任务
  */
 async function doClaim(task) {
+  if (isUnconfirmedFarmTask(task)) return false;
   try {
     const doShare = task.shareMultiple > 1;
     const shareLabel = doShare ? ` (${task.shareMultiple}倍)` : '';
@@ -366,6 +379,12 @@ async function checkAndClaimTasks() {
     }
 
     const taskInfo = reply.task_info;
+    if (containsRanchTasks(taskInfo)) {
+      logWarn('任务', '农场任务读取返回牧场任务，未自动领取或触发其他奖励', {
+        module: 'task', event: '扫描任务', result: 'skipped',
+      });
+      return;
+    }
 
     // 收集可领取任务
     const dailyTasks = buildDailyTasksForDebug(taskInfo);
@@ -418,7 +437,7 @@ async function checkAndClaimTasks() {
  * 响应服务端推送的任务信息通知
  */
 function onTaskInfoNotify(payload) {
-  if (!payload) return;
+  if (!payload || containsRanchTasks(payload)) return;
   if (!isAutomationOn('task')) return;
 
   const claimable = [

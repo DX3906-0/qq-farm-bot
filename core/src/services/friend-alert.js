@@ -1,7 +1,7 @@
 /**
  * 跨账号偷菜告警推送
  *
- * 当指定账号（示例账号乙）偷取了指定目标（示例账号甲）的菜时，推送提醒。
+ * 当指定账号（面壁者比尔·希恩斯）偷取了指定目标（面壁者罗辑）的菜时，推送提醒。
  * 其他账号/组合的偷菜行为不推送。
  * 推送通道读取 ALERT_WEBHOOK 环境变量（与 botMonitor 云函数同一配置）：
  * - PushPlus：URL 形如 http://www.pushplus.plus/send/{token}
@@ -47,14 +47,11 @@ function setLastCodeExpiredAlertAt(accountId, ts) {
 
 /**
  * 指定偷菜告警规则：仅列出的「小偷 gid → 被偷 gid」组合才推送。
- * 目前仅：示例账号乙 偷 示例账号甲。
+ * 目前仅：面壁者比尔·希恩斯 偷 面壁者罗辑。
  */
-const STEAL_ALERT_PAIRS = (() => {
-    try {
-        const rows = JSON.parse(process.env.FARM_STEAL_ALERT_PAIRS || '[]');
-        return Array.isArray(rows) ? rows.filter(row => Number(row.thiefGid) > 0 && Number(row.victimGid) > 0) : [];
-    } catch { return []; }
-})();
+const STEAL_ALERT_PAIRS = [
+  { thiefGid: 1263761675, victimGid: 1235385310 },
+];
 
 async function pushAlertMessage(title, content, options = {}) {
   const hook = String(process.env.ALERT_WEBHOOK || '').trim();

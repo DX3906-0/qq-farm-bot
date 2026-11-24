@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import process from 'node:process'
 import { fileURLToPath, URL } from 'node:url'
 import vue from '@vitejs/plugin-vue'
 import { visualizer } from 'rollup-plugin-visualizer'
@@ -14,14 +13,8 @@ const buildRequire = createRequire(import.meta.url)
 const { buildMutationCatalog } = buildRequire('../core/src/services/mutation-catalog-data.js')
 
 function bundledMutationCatalog() {
-  const filenames = [
-    'MutantEffect.json',
-    'ItemInfo.json',
-    'collections/CollectionSeries.json',
-    'collections/CollectionGroup.json',
-    'collections/CollectionItem.json',
-    'collections/MutantPublicity.json',
-  ]
+  const filenames = ['MutantEffect.json', 'ItemInfo.json', 'collections/CollectionSeries.json',
+    'collections/CollectionGroup.json', 'collections/CollectionItem.json', 'collections/MutantPublicity.json']
   const source = JSON.parse(readFileSync(new URL('../core/src/gameConfig/collections/sources.json', import.meta.url), 'utf8'))
   const inputs: Record<string, any[]> = {}
   const files: Record<string, { sha256: string, origin: string }> = {}
@@ -32,8 +25,7 @@ function bundledMutationCatalog() {
     if (filename.startsWith('collections/') && source.files[key]?.sha256 !== sha256)
       throw new Error(`Bundled mutation source hash mismatch: ${filename}`)
     inputs[key] = JSON.parse(bytes.toString('utf8'))
-    if (!Array.isArray(inputs[key]))
-      throw new Error(`Bundled mutation source is not an array: ${filename}`)
+    if (!Array.isArray(inputs[key])) throw new Error(`Bundled mutation source is not an array: ${filename}`)
     files[filename] = { sha256, origin: filename.startsWith('collections/') ? `${source.repository}@${source.commit}` : 'local-game-config' }
   }
   const items = new Map(inputs.ItemInfo!.map(item => [Number(item.id), item]))
@@ -41,18 +33,13 @@ function bundledMutationCatalog() {
   // Art must exist in the frontend's own static root, not just in the backend.
   const bundledArt = (image: string) => image.startsWith('/game-config/') && existsSync(new URL(`./public${image}`, import.meta.url)) ? image : ''
   for (const effect of [...catalog.normal, ...catalog.decoration]) effect.image = bundledArt(effect.image)
-  for (const series of catalog.collections) {
-    for (const item of series.items) {
-      // 与物品接口使用同一官方资源名；新补图不是 deco_icons/<物品ID>.png。
-      const icon = String(items.get(Number(item.id))?.icon_res || '')
-        .replace(/\/(?:spriteFrame|texture)$/, '')
-        .split('/')
-        .filter(Boolean)
-        .at(-1) || ''
-      item.image = (icon ? bundledArt(`/game-config/deco_icons/${icon}.png`) : '')
-        || bundledArt(`/game-config/deco_icons/${item.id}.png`)
-        || bundledArt(`/game-config/seed_images_named/mutant/${icon}.png`)
-    }
+  for (const series of catalog.collections) for (const item of series.items) {
+    // 与物品接口使用同一官方资源名；新补图不是 deco_icons/<物品ID>.png。
+    const icon = String(items.get(Number(item.id))?.icon_res || '')
+      .replace(/\/(?:spriteFrame|texture)$/, '').split('/').filter(Boolean).at(-1) || ''
+    item.image = (icon ? bundledArt(`/game-config/deco_icons/${icon}.png`) : '')
+      || bundledArt(`/game-config/deco_icons/${item.id}.png`)
+      || bundledArt(`/game-config/seed_images_named/mutant/${icon}.png`)
   }
   const revision = createHash('sha256').update(JSON.stringify(files)).digest('hex').slice(0, 12)
   return { ...catalog, bundle: { revision, collectionsCommit: source.commit, files, origin: 'bundled-local-config' } }

@@ -47,7 +47,6 @@ function handleClick(event: MouseEvent) {
   <component
     :is="componentTag"
     :to="to"
-    :href="blocked ? undefined : href"
     :type="!to && !href ? (type || 'button') : undefined"
     :disabled="!to && !href ? blocked : undefined"
     :aria-disabled="blocked ? 'true' : undefined"
@@ -57,7 +56,7 @@ function handleClick(event: MouseEvent) {
     :data-loading="!!loading"
     :data-clicked="clicked"
     :class="['base-button inline-flex items-center justify-center font-medium', sizeClasses, { 'w-full': block }]"
-    v-bind="$attrs"
+    v-bind="to ? $attrs : { ...$attrs, href: blocked ? undefined : href }"
     @click.capture="guardClick"
     @click="handleClick"
   >

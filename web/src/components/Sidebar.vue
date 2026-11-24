@@ -8,7 +8,7 @@ import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 
 import { createNavigationIndicatorMotion, createNavigationSelection } from '@/composables/useContentMotion'
-import { menuRoutes, warmMenuCode } from '@/router/menu'
+import { workspaceForRoute, workspaceMenuRoutes, warmMenuCode } from '@/router/menu'
 import { LOCAL_UI_READONLY } from '@/config/localReadonly'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -26,6 +26,9 @@ const shopStore = useShopStore()
 const toast = useToastStore()
 const route = useRoute()
 const router = useRouter()
+const workspace = computed(() => workspaceForRoute(route))
+const workspaceLabel = computed(() => workspace.value === 'ranch' ? '牧场工作区' : '农场工作区')
+const workspaceIcon = computed(() => workspace.value === 'ranch' ? 'i-carbon-sprout' : 'i-carbon-growth')
 const { currentAccount, currentAccountId } = storeToRefs(accountStore)
 const { status, realtimeConnected } = storeToRefs(statusStore)
 const { mysteryOffer, mysteryOfferAccountId } = storeToRefs(shopStore)
@@ -151,7 +154,7 @@ watch(() => status.value?.wsError, (wsError: any) => {
     return
 
   wsErrorNotifiedAt.value[accId] = errAt
-  router.push('/settings')
+  router.push(workspace.value === 'ranch' ? '/ranch/settings' : '/settings')
 }, { deep: true })
 
 const uptime = computed(() => {
@@ -184,7 +187,7 @@ const connectionStatus = computed(() => {
 // 根据用户角色过滤导航菜单
 const navItems = computed(() => {
   const isAdmin = userStore.isAdmin
-  return menuRoutes
+  return workspaceMenuRoutes(workspace.value)
     .filter(item => item.showInNav !== false && (!item.adminOnly || isAdmin))
     .map(item => ({
       path: item.path ? `/${item.path}` : '/',
@@ -460,6 +463,7 @@ async function copyToken() {
 
 <template>
   <aside
+    :data-sidebar-workspace="workspace"
     class="fixed inset-y-0 left-0 z-50 h-full w-72 flex flex-col border-r border-gray-200/50 p-3 transition-transform duration-300 lg:static lg:translate-x-0 dark:border-gray-700/50"
     :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'"
     :style="{ background: 'color-mix(in srgb, var(--surface-1) 88%, transparent)', color: 'var(--theme-text)' }"
@@ -489,6 +493,8 @@ async function copyToken() {
         <div class="i-carbon-close text-xl" />
       </button>
     </div>
+
+    <div class="px-4 pb-1 pt-3 text-xs font-semibold" :style="{ color: 'var(--muted-text)' }"><span :class="workspaceIcon" class="mr-1.5 inline-block" aria-hidden="true" />{{ workspaceLabel }}</div>
 
     <!-- User Info -->
     <div v-if="!LOCAL_UI_READONLY" class="px-1 py-4">
@@ -589,7 +595,7 @@ async function copyToken() {
     </div>
 
     <!-- Navigation -->
-    <nav class="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-1 py-2" aria-label="主导航">
+    <nav class="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-1 py-2" :aria-label="`${workspaceLabel}主导航`">
       <div ref="navigationList" class="sidebar-nav-list">
         <div
           ref="navigationIndicator"

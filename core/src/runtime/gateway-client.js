@@ -6,6 +6,7 @@ const {
     isCriticalRequest, isSafeReadRequest, createSafeReadFlights, createWriteDrain,
 } = require('../utils/request-priority');
 const { log, logWarn } = require('../utils/utils');
+const { assertGameRequestAllowed, isSceneRequestOwned } = require('../services/account-operation-barrier');
 
 const DEFAULT_SOCK = process.env.FARM_GATEWAY_SOCK || '/tmp/qq-farm-gateway.sock';
 const WORKER_REQUEST_TIMEOUT_MS = 60000;
@@ -272,6 +273,7 @@ async function sendRequest(service, method, body, options, read, markSent = () =
     const gate = session.gate ?? requestGate;
     const remoteEpoch = session.remoteGeneration ?? remoteGeneration;
     function validate() {
+        assertGameRequestAllowed(service, method);
         throwIfRequestCancelled(options);
         if (options.validateWaiters) options.validateWaiters();
         if (quiescing && (!critical || method !== 'Heartbeat')) throw quiescingError();
@@ -341,6 +343,8 @@ async function sendRequest(service, method, body, options, read, markSent = () =
                     meta: { priority: critical ? 'critical' : options.priority === 'critical' ? 'foreground' : options.priority,
                         timeoutMs: options.wireTimeoutMs, deadline: options.deadline,
                         ...(!read && !critical ? { settlementTimeoutMs: options.settlementTimeoutMs } : {}) } };
+                // 发送给网关前最后复查；回调只在 worker 内执行，不进入 IPC 帧。
+                options.assertCanSend?.();
                 if (!read) safeFlights.invalidate();
                 // write 调用即视为可能发送，异常也不重试；页面 signal 在此之后不再中断写。
                 item.sent = true;
@@ -361,6 +365,7 @@ async function sendRequest(service, method, body, options, read, markSent = () =
     }
 }
 async function sendMsgAsync(service, method, bodyBytes, meta) {
+    assertGameRequestAllowed(service, method);
     const options = getRequestOptions(meta, WORKER_REQUEST_TIMEOUT_MS, 30000);
     const body = Buffer.from(bodyBytes || []);
     if (!isSafeReadRequest(service, method) && !isCriticalRequest(service, method)) {
@@ -374,7 +379,11 @@ async function sendMsgAsync(service, method, bodyBytes, meta) {
         && !(isCriticalRequest(service, method) && method === 'Login' && sock && !sock.destroyed && !detached)) {
         throw requestError('网关连接不可用', { errorCode: 'CONNECTION_UNAVAILABLE', stage: 'queue' });
     }
-    if (!isSafeReadRequest(service, method)) return sendRequest(service, method, body, options, false);
+    if (!isSafeReadRequest(service, method)) {
+        return sendRequest(service, method, body, { ...options, assertCanSend: meta?.assertCanSend }, false);
+    }
+    // 场景租约拥有原始结算Promise，不能被普通只读订阅者提前取消/到期后误触发恢复。
+    if (isSceneRequestOwned()) return sendRequest(service, method, body, options, true);
     const session = { socket: sock, epoch: connectionEpoch, accountId, gate: requestGate, remoteGeneration };
     return safeFlights.run({ accountId, epoch: connectionEpoch, service, method, body, context: options,
         execute: ({ signal, markSent, validateWaiters, deadline, setOnNoWaiters }) => sendRequest(service, method, body,
@@ -383,7 +392,7 @@ async function sendMsgAsync(service, method, bodyBytes, meta) {
 function getRequestQueueSnapshot() { return requestGate.snapshot(); }
 function getOldestPendingStartedAt() { return pendingStartedAt.size ? Math.min(...pendingStartedAt.values()) : 0; }
 function getDiagnosticSnapshot() {
-    return { accountId, connectionEpoch, remoteGeneration, loggedIn, businessSuspended,
+    return { accountId, connectionEpoch, remoteGeneration, remoteGenerationSource: 'gateway', loggedIn, businessSuspended,
         connected: isConnected(), detached, quiescing, pending: pending.size,
         pendingWrites: getPendingWriteCount(), actualSent: [...pending.values()].filter(item => item.actualSent).length,
         pendingActualWrites: [...pending.values()].filter(item => !item.read && !item.critical && item.actualSent).length,

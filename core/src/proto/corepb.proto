@@ -54,3 +54,19 @@ message BuffEffect {
     int64 attr_value = 2;
     int64 extra_info = 3;
 }
+
+// ============ 牧场写回包通用结构（2026-11-17 二期，自固定上游 6ac7a3d 选取）============
+
+// kind: 1=动物操作 2=货架收获 3=清理；target_id 按 kind 语义为动物实例/槽位/污物ID。
+message FacilityOpResult {
+    int64 facility_inst_id = 1;
+    int32 kind = 2;
+    int64 target_id = 3;
+    repeated Item rewards = 10;
+    repeated Item costs = 11;
+}
+
+message ItemEntry {
+    int64 id = 1;
+    int64 count = 2;
+}

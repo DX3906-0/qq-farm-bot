@@ -130,6 +130,27 @@ export function integerText(value: any): string | null {
   }
   return null
 }
+/** 数量只针对当前未锁定实例；烟花仍受官方单枚燃放限制。 */
+export function itemUseLimit(item: any): number {
+  if (!item || [true, 1, '1'].includes(item.locked)) return 0
+  const text = integerText(item.count)
+  if (text === null || BigInt(text) <= 0n || BigInt(text) > BigInt(Number.MAX_SAFE_INTEGER)) return 0
+  return Number(item.id) === 6001 ? 1 : Number(text)
+}
+export function validateItemUseQuantity(item: any, value: unknown): { count: number, limit: number, error: string } {
+  const limit = itemUseLimit(item), text = integerText(value)
+  if (!limit) return { count: 0, limit, error: '当前实例不存在、已锁定或可用数量尚未确认，请刷新背包。' }
+  if (text === null || BigInt(text) <= 0n || BigInt(text) > BigInt(Number.MAX_SAFE_INTEGER))
+    return { count: 0, limit, error: '请输入大于零的整数数量。' }
+  const count = Number(text)
+  if (count > limit) return { count: 0, limit, error: Number(item.id) === 6001 ? '烟花每次只能燃放一枚。' : `当前实例最多可使用 ${limit} 个。` }
+  return { count, limit, error: '' }
+}
+export function useConsumptionConfirmed(reply: any, itemId: number, count: number): boolean {
+  return reply?.resultState === 'completed' && integerText(reply.usedCount) === integerText(count)
+    && (reply.usedItemId == null || integerText(reply.usedItemId) === integerText(itemId))
+    && Number.isSafeInteger(count) && count > 0
+}
 export function actualSaleRewards(reply: any): Array<{ id: number, count: string, name: string }> {
   const list = reply?.get_items ?? reply?.getItems
   if (!Array.isArray(list)) return []

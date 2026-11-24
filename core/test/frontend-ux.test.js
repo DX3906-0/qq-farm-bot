@@ -76,6 +76,1212 @@ function themeHarness(get, local = storage()) {
   return { ...h, store, styles, classes, dispose: () => pinia.disposePinia(instance) };
 }
 
+function shopStoreHarness(get, post = () => assert.fail('unexpected shop purchase')) {
+  const selected = vue.ref('A'), requests = [], purchases = [];
+  const account = { get currentAccountId() { return selected.value; } };
+  const apiSource = read('api/index.ts');
+  const coordinatorSource = apiSource.slice(apiSource.indexOf('export function createReadCoordinator()'), apiSource.indexOf('const safeReadPaths'));
+  const module = { exports: {} };
+  vm.runInNewContext(ts.transpileModule(coordinatorSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText,
+    { module, exports: module.exports, AbortController, CanceledError: webRequire('axios').CanceledError,
+      tokenRef: { value: '' }, sessionEpoch: 0, cloneRead: value => value === undefined ? value : JSON.parse(JSON.stringify(value)) });
+  const apiMock = { __esModule: true,
+    default: { post: (url, body, config) => { purchases.push({ url, body, config }); return post(url, body, config); } },
+    safeGet: (url, config) => { requests.push({ url, config }); return get(url, config); },
+    createReadCoordinator: module.exports.createReadCoordinator, invalidateSafeReads() {},
+    isReadCanceled: error => error?.code === 'ERR_CANCELED' || error?.name === 'AbortError',
+  };
+  const h = frontendHarness({ '@/api': apiMock, '@/stores/account': { useAccountStore: () => account } });
+  const instance = pinia.createPinia();
+  const store = h.load('stores/shop.ts').useShopStore(instance);
+  return { store, selected, requests, purchases, dispose: () => pinia.disposePinia(instance) };
+}
+function ranchStoreHarness(responder) {
+  const selected = vue.ref('A'), calls = [];
+  let invalidations = 0;
+  const api = {
+    get: (url, config) => { calls.push({ method: 'GET', url, config }); return responder('GET', url, config); },
+    post: (url, body, config) => { calls.push({ method: 'POST', url, body, config }); return responder('POST', url, body, config); },
+  };
+  const h = frontendHarness({
+    '@/api': { __esModule: true, default: api, safeGet: api.get,
+      invalidateSafeReads: () => { invalidations++; }, isReadCanceled: error => error?.code === 'ERR_CANCELED' },
+    '@/stores/account': { useAccountStore: () => ({ get currentAccountId() { return selected.value; } }) },
+  });
+  const instance = pinia.createPinia();
+  const store = h.load('stores/ranch.ts').useRanchStore(instance);
+  // Most store-unit fixtures represent a rendered page after the required
+  // service safety snapshot already succeeded; dedicated tests below exercise
+  // safe-read failure/recovery explicitly.
+  store.operationsReady = true;
+  return { store, selected, calls, invalidations: () => invalidations, storage: h.localStorage,
+    dispose: () => pinia.disposePinia(instance) };
+}
+const ranchWriteResponse = (accountId, action = 'harvest') => ({ data: { ok: true, accountId,
+  data: { status: 'confirmed', action, label: '牧场操作', count: 1, completed: 1, costs: [], rewards: [] } } });
+const ranchOperationsResponse = (accountId, pending = []) => ({ data: { ok: true, accountId,
+  data: { pending, scene: { phase: 'home', recoveryRequired: false }, friendSession: { phase: 'idle', recoveryRequired: false } } } });
+
+test('ranch writes: 跨账号独立在途，迟到成功/finally不清新账号目录或锁，重复点击只发送一次', async () => {
+  const a = deferred(), b = deferred();
+  const h = ranchStoreHarness((method, _url, third, fourth) => {
+    const config = method === 'GET' ? third : fourth;
+    return method === 'GET' ? Promise.resolve(ranchOperationsResponse(config.headers['x-account-id']))
+      : config.headers['x-account-id'] === 'A' ? a.promise : b.promise;
+  });
+  try {
+    const first = h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    const duplicate = await h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    assert.equal(duplicate.sent, false);
+    assert.equal(h.store.operating, true);
+    h.selected.value = 'B';
+    assert.equal(h.store.operating, false);
+    const bSafety = await h.store.fetchOperations('B');
+    assert.equal(bSafety.safe, true, '新账号先独立读取自己的待核对安全快照');
+    h.store.catalogs = { 5: [{ id: 222, name: 'B' }] };
+    const second = h.store.execute('B', 'clean', {}, { signature: 'b' });
+    await Promise.resolve();
+    const before = h.invalidations();
+    a.resolve(ranchWriteResponse('A'));
+    assert.equal((await first).stale, true);
+    assert.equal(h.store.operating, true, `A的finally不能解除B的在途状态: ${JSON.stringify({ states: h.store.operationStates, current: h.store.currentState, calls: h.calls.map(call => [call.method, call.config?.headers?.['x-account-id']]) })}`);
+    assert.equal(h.store.catalogs[5][0].id, 222);
+    assert.equal(h.invalidations(), before, '迟到A不能失效B的读取');
+    b.resolve(ranchWriteResponse('B', 'clean'));
+    assert.equal((await second).ok, true);
+    assert.equal(h.store.operating, false);
+    assert.equal(h.calls.filter(call => call.method === 'POST').length, 2);
+    assert.equal(h.storage.length, 0, '游戏写状态不持久化到页面存储');
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch quote: A-B-A迟到报价不能覆盖新报价，旧成功与旧错误均标stale', async () => {
+  const old = deferred(), fresh = deferred();
+  let count = 0;
+  const h = ranchStoreHarness(() => (++count === 1 ? old.promise : fresh.promise));
+  try {
+    const first = h.store.quote('A', 'harvest', { all: true });
+    h.selected.value = 'B'; h.selected.value = 'A';
+    const second = h.store.quote('A', 'harvest', { all: true });
+    const response = signature => ({ data: { ok: true, accountId: 'A', data: { action: 'harvest', expected: { signature } } } });
+    fresh.resolve(response('new'));
+    assert.equal((await second).quote.expected.signature, 'new');
+    old.resolve(response('old'));
+    assert.equal((await first).stale, true);
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch unknown: 切号不丢未知状态，空pending不自动解除，人工核对也不重放写', async () => {
+  const gate = deferred();
+  const h = ranchStoreHarness((method, _url, value) => method === 'POST' ? gate.promise
+    : Promise.resolve(ranchOperationsResponse(value.headers['x-account-id'])));
+  try {
+    const write = h.store.execute('A', 'feed', { all: true, bucketType: 2 }, { signature: 'a' });
+    await Promise.resolve();
+    h.selected.value = 'B';
+    h.store.catalogs = { 5: [{ id: 222, name: 'B' }] };
+    gate.reject(Object.assign(new Error('timeout'), { response: { data: { resultState: 'unknown', sent: true, outcomeUnknown: true } } }));
+    assert.equal((await write).stale, true);
+    assert.equal(h.store.catalogs[5][0].id, 222);
+    assert.equal(h.store.currentState, 'idle');
+    h.selected.value = 'A';
+    assert.equal(h.store.writeBlocked, true);
+    await h.store.fetchOperations('A');
+    assert.equal(h.store.writeBlocked, true, '空pending不是客户端操作终态证据');
+    const blocked = await h.store.execute('A', 'feed', { all: true }, { signature: 'a' });
+    assert.equal(blocked.sent, false);
+    assert.equal((await h.store.confirmClientOutcome('A')).ok, true);
+    assert.equal(h.store.writeBlocked, false);
+    assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+  }
+  finally { h.dispose(); }
+});
+
+test('服务端明确列出待核对目标时，前端不再全局禁用无关购买；场景恢复锁仍全局阻止', async () => {
+  const pending = { id: 'unknown-task', target: 'ranch:claimTasks:300011', label: '成长任务领取',
+    costs: [], createdAt: 1, message: '结果待核对' };
+  const h = ranchStoreHarness((method, url) => url === '/api/ranch/operations'
+    ? Promise.resolve(ranchOperationsResponse('A', [pending]))
+    : method === 'POST' ? Promise.resolve(ranchWriteResponse('A', 'buy'))
+      : Promise.resolve({ data: { ok: true, accountId: 'A', data: {} } }));
+  try {
+    const safety = await h.store.fetchOperations('A');
+    assert.equal(safety.safe, true);
+    assert.equal(h.store.currentState, 'unknown', '仍如实提示待核对记录');
+    assert.equal(h.store.writeBlocked, false, '只限制冲突目标，不全局禁用其它购买');
+    const result = await h.store.execute('A', 'buy', { shopId: 5, goodsId: 10003, count: 1 }, { signature: 'fresh-offer' });
+    assert.equal(result.ok, true);
+    assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+  }
+  finally { h.dispose(); }
+
+  const recovery = ranchStoreHarness((_method, url) => Promise.resolve({ data: { ok: true, accountId: 'A', data: {
+    pending: [pending], scene: { phase: 'unknown', recoveryRequired: true },
+    friendSession: { phase: 'idle', recoveryRequired: false },
+  } } }));
+  try {
+    await recovery.store.fetchOperations('A');
+    assert.equal(recovery.store.writeBlocked, true, '未知scene状态继续冻结所有场景写');
+  }
+  finally { recovery.dispose(); }
+});
+
+test('已读取的无关待核对账本不全局禁商城购买；恢复状态未知时仍禁止所有写入', async () => {
+  const row = { id: 'task-unknown', target: 'ranch:claimTasks:300011', label: '成长任务领取', costs: [], createdAt: 1, message: '结果待核对' };
+  const h = ranchStoreHarness((method, url) => {
+    if (url === '/api/ranch/operations') return Promise.resolve(ranchOperationsResponse('A', [row]));
+    if (method === 'POST' && url === '/api/ranch/operate') return Promise.resolve(ranchWriteResponse('A', 'buy'));
+    return Promise.resolve({ data: { ok: true, accountId: 'A', data: {} } });
+  });
+  try {
+    await h.store.fetchOperations('A');
+    assert.equal(h.store.currentState, 'unknown', '账本状态仍显式提示存在未知记录');
+    assert.equal(h.store.writeBlocked, false, '零成本任务领取unknown不应锁无关商城购买');
+    const result = await h.store.execute('A', 'buy', { shopId: 5, goodsId: 10003, count: 1 }, { signature: 'fresh-offer' });
+    assert.equal(result.ok, true);
+    assert.equal(h.calls.filter(call => call.method === 'POST').length, 1);
+  }
+  finally { h.dispose(); }
+
+  const recovery = ranchStoreHarness((_method, url) => Promise.resolve({ data: { ok: true, accountId: 'A', data: {
+    pending: [row], scene: { phase: 'unknown', recoveryRequired: true },
+    friendSession: { phase: 'idle', recoveryRequired: false },
+  } } }));
+  try {
+    await recovery.store.fetchOperations('A');
+    assert.equal(recovery.store.writeBlocked, true, '场景恢复状态unknown仍关闭所有牧场写');
+  }
+  finally { recovery.dispose(); }
+});
+
+test('ranch clear: 离页或清快照不释放在途写，迟到回复不恢复旧页面', async () => {
+  const gate = deferred();
+  const h = ranchStoreHarness(() => gate.promise);
+  try {
+    const write = h.store.execute('A', 'clean', {}, { signature: 'a' });
+    h.store.clear();
+    assert.equal(h.store.operating, true);
+    assert.equal((await h.store.execute('A', 'clean', {}, { signature: 'a' })).sent, false);
+    gate.resolve(ranchWriteResponse('A', 'clean'));
+    assert.equal((await write).stale, true);
+    assert.equal(h.store.notice, '');
+    assert.equal(h.store.overview, null);
+    assert.equal(h.store.operating, false);
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch reads: 写入使旧目录回包失效，缺失/错误待核对响应不假报为空', async () => {
+  const catalog = deferred(), write = deferred();
+  const h = ranchStoreHarness((method, url) => method === 'POST' ? write.promise
+    : url === '/api/ranch/catalog' ? catalog.promise : Promise.resolve({ data: { ok: true, accountId: 'A', data: {} } }));
+  try {
+    const read = h.store.fetchCatalog('A', 5);
+    const run = h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    catalog.resolve({ data: { ok: true, accountId: 'A', data: { goods: [{ id: 111, name: 'old' }] } } });
+    await read;
+    assert.equal(h.store.catalogs[5], undefined);
+    h.store.operations = [{ id: 'keep', target: 't', label: '待核对', costs: [], createdAt: 1, message: '保留' }];
+    assert.equal((await h.store.fetchOperations('A')).ok, false);
+    assert.equal(h.store.operations[0].id, 'keep');
+    assert.match(h.store.operationsError, /未完整返回/);
+    write.resolve(ranchWriteResponse('A'));
+    await run;
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch write failure: 错账号回包保持unknown，同步明确未发异常不残留flight', async () => {
+  let count = 0;
+  const h = ranchStoreHarness((method) => {
+    if (method === 'GET') return Promise.resolve(ranchOperationsResponse('A'));
+    count++;
+    if (count === 1) throw Object.assign(new Error('not sent'), { sent: false, resultState: 'not_sent' });
+    return Promise.resolve(ranchWriteResponse('wrong-account'));
+  });
+  try {
+    const rejected = await h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    assert.equal(rejected.resultState, 'not_sent');
+    assert.equal(h.store.operating, false);
+    await h.store.fetchOperations('A');
+    const wrong = await h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    assert.equal(wrong.outcomeUnknown, true);
+    assert.equal(h.store.currentState, 'unknown');
+    assert.equal(h.store.catalogs[5], undefined);
+    assert.equal(count, 2);
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch 4A reads: 背包A-B-A拒绝旧结果，罐头专区错误互不污染，缺桶字段不假成功', async () => {
+  const old = deferred(), fresh = deferred(), slot6 = deferred();
+  let bagReads = 0;
+  const reply = name => ({ data: { ok: true, accountId: 'A', data: { readOnly: true, sceneId: 2,
+    items: [{ id: '80021', uid: '9007199254740997', name, count: '3' }], goldVoucherBalance: '10000', pens: [], buckets: { normal: '100', organic: '200' } } } });
+  const h = ranchStoreHarness((method, url, config) => {
+    assert.equal(method, 'GET');
+    if (url === '/api/ranch/bag') {
+      bagReads++;
+      return bagReads === 1 ? old.promise : bagReads === 2 ? fresh.promise
+        : Promise.resolve({ data: { ok: true, accountId: 'A', data: { sceneId: 2, items: [], pens: [], buckets: {} } } });
+    }
+    return config.params.slotType === 6 ? slot6.promise
+      : Promise.resolve({ data: { ok: true, accountId: 'A', data: { slotType: 7, goods: [{ id: 'organic', name: '有机罐头' }] } } });
+  });
+  try {
+    const a = h.store.fetchBag('A');
+    h.selected.value = 'B'; h.selected.value = 'A';
+    const b = h.store.fetchBag('A');
+    fresh.resolve(reply('new')); await b;
+    old.resolve(reply('old')); await a;
+    assert.equal(h.store.bagOverview.items[0].name, 'new');
+    const six = h.store.fetchCanCatalog('A', 6);
+    await h.store.fetchCanCatalog('A', 7);
+    slot6.reject(new Error('专区六读取失败')); await six;
+    assert.equal(h.store.canCatalogs[7][0].id, 'organic');
+    assert.equal(h.store.canErrors[7] || '', '');
+    assert.match(h.store.canErrors[6], /专区六/);
+    await h.store.fetchBag('A');
+    assert.match(h.store.bagError, /未确认/);
+    assert.equal(h.store.bagOverview.items[0].name, 'new');
+  }
+  finally { h.dispose(); }
+});
+
+function ranchProgressResponse(accountId, section, patch = {}) {
+  const base = { readOnly: true, sceneId: 2, ownerGid: '10010', observedAt: Date.now(), serverTimeMs: Date.now(), dateKey: '2026-11-18',
+    cache: { hit: false, receivedAt: Date.now() } };
+  const value = section === 'tasks' ? { tasks: [], summary: { total: 0, claimable: 0, claimed: 0, daily: 0 },
+    guideReportingEnabled: false, automaticClaimEnabled: false }
+    : section === 'book' ? { type: 101, animals: [], normal: { levels: [], rewards: [], canClaim: false }, giant: { totalScore: '0', levels: [] }, mutations: [] }
+      : { shareId: '102', known: false, shareCount: null, claimed: null, canClaim: false, canReport: false,
+        rewards: [{ id: '80021', count: '5', name: '普通罐头' }], automaticShareEnabled: false, stateReason: '标记未确认' };
+  return { data: { ok: true, accountId, data: { ...base, ...value, ...patch } } };
+}
+
+test('ranch 4B reads: 任务A-B-A旧回包不回填，图鉴/分享错误独立，未知分享不是未领取', async () => {
+  const old = deferred(), fresh = deferred(); let tasks = 0;
+  const h = ranchStoreHarness((_method, url) => {
+    if (url === '/api/ranch/tasks') return (++tasks === 1 ? old.promise : fresh.promise);
+    if (url === '/api/ranch/book') return Promise.reject(new Error('图鉴临时读取失败'));
+    return Promise.resolve(ranchProgressResponse('A', 'share'));
+  });
+  try {
+    const first = h.store.fetchProgress('A', 'tasks');
+    h.selected.value = 'B'; h.selected.value = 'A';
+    const second = h.store.fetchProgress('A', 'tasks');
+    fresh.resolve(ranchProgressResponse('A', 'tasks', { source: 'new' })); await second;
+    old.resolve(ranchProgressResponse('A', 'tasks', { source: 'old' })); await first;
+    assert.equal(h.store.progressViews.tasks.source, 'new');
+    await h.store.fetchProgress('A', 'book'); await h.store.fetchProgress('A', 'share');
+    assert.match(h.store.progressErrors.book, /图鉴/);
+    assert.equal(h.store.progressErrors.share, '');
+    assert.equal(h.store.progressViews.share.known, false);
+    assert.equal(h.store.progressViews.share.claimed, null);
+    assert.equal(h.store.progressLoading.tasks, false);
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch 4B write: 旧专区读取在写入后失效，换页不释放pending，错操作回包保持unknown', async () => {
+  const read = deferred(), write = deferred();
+  const h = ranchStoreHarness(method => method === 'GET' ? read.promise : write.promise);
+  try {
+    const reading = h.store.fetchProgress('A', 'tasks');
+    const operation = h.store.execute('A', 'claimTasks', { all: true }, { signature: 'tasks' });
+    read.resolve(ranchProgressResponse('A', 'tasks')); await reading;
+    assert.equal(h.store.progressViews.tasks, undefined);
+    h.store.clear(); assert.equal(h.store.operating, true);
+    write.resolve(ranchWriteResponse('A', 'harvest'));
+    const result = await operation;
+    assert.equal(result.stale, true);
+    assert.equal(result.outcomeUnknown, true, '同账号但错动作也不能确认');
+    assert.equal(h.store.writeBlocked, true);
+    assert.equal(h.store.progressViews.tasks, undefined);
+  }
+  finally { h.dispose(); }
+});
+
+test('ranch 4B DTO: 错账号、农场图鉴类型和未知却可领取的分享状态均拒绝', async () => {
+  for (const [section, response] of [
+    ['tasks', ranchProgressResponse('B', 'tasks')],
+    ['book', ranchProgressResponse('A', 'book', { type: 1 })],
+    ['share', ranchProgressResponse('A', 'share', { canClaim: true })],
+  ]) {
+    const h = ranchStoreHarness(() => Promise.resolve(response));
+    try {
+      await h.store.fetchProgress('A', section);
+      assert.equal(h.store.progressViews[section], undefined);
+      assert.match(h.store.progressErrors[section], /未确认/);
+    }
+    finally { h.dispose(); }
+  }
+});
+
+test('ranch last summary: 总概览只保留有归属的历史观察，写入标旧且不跨账号混用', async () => {
+  const h = ranchStoreHarness((method, url, third, fourth) => {
+    const config = method === 'GET' ? third : fourth;
+    if (method === 'POST') return Promise.resolve(ranchWriteResponse('A'));
+    if (url === '/api/ranch/operations') return Promise.resolve(ranchOperationsResponse(config.headers['x-account-id']));
+    return Promise.resolve({ data: { ok: true, accountId: config.headers['x-account-id'], data: { readOnly: true, actionsEnabled: true,
+      sceneId: 2, observedAt: 123, facilities: [], summary: { animalCount: 3, ranchCount: 1, harvestableCount: 1 } } } });
+  });
+  try {
+    await h.store.fetchOverview('A'); h.store.clear();
+    assert.equal(h.store.overview, null);
+    assert.equal(h.store.lastSummaries.A.summary.animalCount, 3);
+    assert.equal(h.store.lastSummaries.A.accountId, 'A');
+    assert.equal(h.store.lastSummaries.A.stale, false);
+    await h.store.fetchOperations('A');
+    await h.store.execute('A', 'harvest', { all: true }, { signature: 'a' });
+    assert.equal(h.store.lastSummaries.A.stale, true);
+    h.selected.value = 'B';
+    assert.equal(h.store.lastSummaries.B, undefined);
+  }
+  finally { h.dispose(); }
+});
+
+const navigationLinkStub = vue.defineComponent({ props: ['to'], setup: (props, { slots }) => () => vue.h('a', { href: props.to }, slots.default?.()) });
+
+test('独立牧场名单：scene2结构校验、A-B-A与清页取消不回填旧名单', async () => {
+  const requests = [];
+  const h = ranchStoreHarness((_method, url, options) => { const pending = deferred(); requests.push({ url, options, pending }); return pending.promise; });
+  const response = (id, name, sceneId = 2) => ({ data: { ok: true, accountId: id, data: { sceneId, ownerGid: '10010', observedAt: Date.now(),
+    friends: [{ gid: 20001, name, avatarUrl: '' }] } } });
+  try {
+    const old = h.store.fetchFriends('A'); assert.equal(requests[0].url, '/api/ranch/friends');
+    h.selected.value = 'B'; await vue.nextTick(); h.selected.value = 'A'; await vue.nextTick();
+    const fresh = h.store.fetchFriends('A'); requests[1].pending.resolve(response('A', '牧场新昵称')); await fresh;
+    requests[0].pending.resolve(response('A', '迟到旧昵称')); await old;
+    assert.equal(h.store.friends[0].name, '牧场新昵称'); assert.equal(requests[0].options.signal.aborted, true);
+    const bad = h.store.fetchFriends('A'); requests[2].pending.resolve(response('A', '农场名单', 1)); await bad;
+    assert.equal(h.store.friends.length, 0); assert.match(h.store.friendsError, /未确认/);
+    const leaving = h.store.fetchFriends('A'); h.store.clear(); requests[3].pending.resolve(response('A', '离页旧名单')); await leaving;
+    assert.equal(h.store.friends.length, 0);
+    assert.doesNotMatch(read('views/Ranch.vue'), /useFriendStore|friendStore\.fetchFriends/);
+  } finally { h.dispose(); }
+});
+
+test('双工作区导航：农场恢复原页面与侧栏，牧场同名菜单对应独立业务路由', async () => {
+  const h = frontendHarness({ 'vue-router': { RouterLink: navigationLinkStub } });
+  const component = h.load('components/GameViewSwitch.vue').default;
+  for (const [view, expected] of [['farm', '去牧场'], ['ranch', '回农场'], ['overview', '进入农场']]) {
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { view }) }));
+    assert.match(html, new RegExp(expected)); assert.match(html, /href="\/(?:ranch)?"/);
+  }
+  const menu = h.load('router/menu.ts');
+  assert.match(menu.menuRoutes[0].component.toString(), /Dashboard\.vue/);
+  assert.equal(menu.menuRoutes[0].name, 'dashboard'); assert.equal(menu.menuRoutes[0].label, '概览');
+  assert.equal(menu.menuRoutes.find(row => row.name === 'personal').showInNav, undefined);
+  assert.match(menu.menuRoutes.find(row => row.name === 'personal').component.toString(), /Personal\.vue/);
+  assert.ok(['宠物', '藏品', '变异宝典', '分析', '设置'].every(label => menu.menuRoutes.some(row => row.label === label)));
+  assert.ok(!menu.menuRoutes.some(row => ['农场', '牧场'].includes(row.label)), '两个工作区不能作为普通菜单项');
+  assert.deepEqual(Array.from(menu.ranchMenuRoutes, row => row.label), ['概览', '个人', '好友', '活动', '商城', '图鉴', '设置', '后台']);
+  assert.deepEqual(Array.from(menu.ranchMenuRoutes.slice(0, 6), row => row.props.page), ['overview', 'personal', 'friends', 'activity', 'shop', 'illustrated']);
+  assert.equal(new Set(menu.allMenuRoutes.map(row => row.path)).size, menu.allMenuRoutes.length);
+  assert.equal(new Set(menu.allMenuRoutes.map(row => row.name)).size, menu.allMenuRoutes.length);
+  for (const [path, expected] of [['/', '/ranch'], ['/personal', '/ranch/personal'], ['/friends', '/ranch/friends'], ['/ranch/shop', '/shop'], ['/settings', '/ranch/settings'], ['/ranch', '/'], ['/pet', '/ranch']])
+    assert.equal(menu.workspaceSwitchPath({ path }), expected);
+  assert.equal(menu.workspaceForRoute({ path: '/ranch/settings' }), 'ranch');
+  assert.equal(menu.workspaceForRoute({ path: '/personal' }), 'farm');
+  assert.match(read('router/index.ts'), /path: 'farm', name: 'farm', redirect: \{ name: 'personal' \}/);
+  assert.match(read('router/index.ts'), /path: 'farm\/status', name: 'farm-status', redirect: \{ name: 'dashboard' \}/);
+  assert.doesNotMatch(read('views/Personal.vue'), /farmPage|GameViewSwitch/);
+  assert.match(read('views/Ranch.vue'), /:data-ranch-page="page"/);
+  assert.match(read('components/Sidebar.vue'), /workspaceMenuRoutes\(workspace\.value\)/);
+  assert.match(read('layouts/DefaultLayout.vue'), /workspace === 'farm' && route.name !== 'overview'/);
+  assert.doesNotMatch(read('components/GameViewSwitch.vue'), /fetch\(|api\.|operate|setInterval|fetchOverview/);
+});
+
+test('移动端工作区顶部导航：账号菜单限宽、工作区按钮不抢占账号区域', () => {
+  const layout = read('layouts/DefaultLayout.vue')
+  const account = read('components/TopAccountMenu.vue')
+  assert.match(layout, /gap-1 rounded-lg px-2 sm:gap-3 sm:px-4/)
+  assert.match(layout, /class="shrink-0 whitespace-nowrap px-2 sm:px-3"/)
+  assert.match(layout, /hidden min-\[380px\]:inline/)
+  assert.match(account, /max-w-\[min\(42vw,220px\)\].*sm:max-w-\[min\(76vw,280px\)\]/)
+  assert.match(account, /flex min-w-0 items-center gap-2/)
+})
+
+test('真实路由链接：去牧场与回农场保留href，未被BaseButton的undefined属性覆盖', async () => {
+  const routing = webRequire('vue-router');
+  const component = frontendHarness().load('components/GameViewSwitch.vue').default;
+  const router = routing.createRouter({ history: routing.createMemoryHistory(), routes: [
+    { path: '/', component: { render: () => null } }, { path: '/farm', component: { render: () => null } },
+    { path: '/ranch', component: { render: () => null } },
+  ] });
+  await router.push('/'); await router.isReady();
+  for (const [view, expected] of [['farm', '/ranch'], ['ranch', '/']]) {
+    const app = vue.createSSRApp({ render: () => vue.h(component, { view }) }).use(router);
+    const html = await renderer.renderToString(app);
+    assert.ok(html.includes(`href="${expected}"`), html);
+  }
+});
+
+async function ranchPageFixture(page, section = '', readonly = true, populated = true) {
+  const h = ranchStoreHarness(() => assert.fail('页面初始化不允许未声明API'));
+  const instance = pinia.createPinia(), calls = [], fixture = ranchVisualFixtures();
+  const account = pinia.defineStore('ranch-page-account', () => ({ currentAccountId: h.selected, currentAccount: vue.ref({ name: '离线牧场账号' }) }))(instance);
+  const friend = pinia.defineStore('ranch-page-friend', () => ({ friends: vue.ref([]), loading: vue.ref(false),
+    async fetchFriends() { calls.push('friends'); } }))(instance);
+  // This SSR fixture preserves preloaded presentation only. Real clear/flight
+  // behavior is tested independently and by the actual browser build below.
+  h.store.clear = () => {};
+  if (populated) h.store.$patch({ overview: fixture.overview, bagOverview: fixture.bagOverview,
+    friendOverview: fixture.friendOverview, progressViews: fixture.progressViews, catalogs: fixture.catalogs, canCatalogs: fixture.canCatalogs });
+  if (populated) h.store.friends = [
+    { gid: 700000002, name: '离线牧场好友', avatarUrl: '' },
+    { gid: 700000003, name: '很长的好友昵称也要完整显示而不是藏进下拉框', avatarUrl: '' },
+  ];
+  h.store.fetchFriends = async () => { calls.push('friends'); };
+  h.store.fetchOperations = async () => { calls.push('operations'); };
+  h.store.fetchOverview = async () => { calls.push('overview'); };
+  h.store.fetchBag = async () => { calls.push('bag'); };
+  h.store.fetchCatalog = async (_id, shop) => { calls.push('catalog:' + shop); };
+  h.store.fetchCanCatalog = async (_id, slot) => { calls.push('cans:' + slot); };
+  h.store.fetchProgress = async (_id, target) => { calls.push('progress:' + target); };
+  const routing = webRequire('vue-router'), menu = frontendHarness().load('router/menu.ts');
+  const router = routing.createRouter({ history: routing.createMemoryHistory(), routes: menu.allMenuRoutes.map(row => ({
+    path: '/' + row.path, component: { render: () => null }, meta: { gameWorkspace: row.workspace || 'farm' } })) });
+  const pathname = page === 'overview' ? '/ranch' : '/ranch/' + page;
+  await router.push({ path: pathname, query: section ? { section } : {} }); await router.isReady();
+  const local = frontendHarness().load('config/localReadonly.ts');
+  const render = frontendHarness({ '@/stores/account': { useAccountStore: () => account }, '@/stores/friend': { useFriendStore: () => friend },
+    '@/stores/ranch': { useRanchStore: () => h.store, ranchItemLabel: id => String(id) },
+    '@/stores/status': { useStatusStore: () => ({ async fetchStatus() { calls.push('status'); } }) },
+    '@/stores/setting': { useSettingStore: () => ({ async fetchSettings() { calls.push('settings'); } }) },
+    '@/api': { __esModule: true, default: { async get(path, options) {
+      assert.equal(path, '/api/logs');
+      assert.equal(options.params.module, 'ranch');
+      assert.equal(options.params.accountId, h.selected.value);
+      calls.push('ranch-logs');
+      return { data: { ok: true, data: [] } };
+    } } },
+    '@/config/localReadonly': { LOCAL_UI_READONLY: readonly, accountDataEmptyState: local.accountDataEmptyState } });
+  try {
+    const component = render.load('views/Ranch.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { page }) }).use(instance).use(router));
+    await Promise.resolve(); return { html, calls };
+  } finally { h.dispose(); pinia.disposePinia(instance); }
+}
+
+test('牧场独立页面SSR：商城目录/罐头不再藏在个人概览中，单页不伪装成八个顶级标签', async () => {
+  const catalog = await ranchPageFixture('shop', 'catalog');
+  assert.match(catalog.html, /幼崽与饲料/); assert.match(catalog.html, /豪猪/); assert.match(catalog.html, /价格：1005/);
+  assert.doesNotMatch(catalog.html, /场景概况|手动操作|成长手册与每日任务/); assert.equal(catalog.calls.length, 0);
+  const cans = await ranchPageFixture('shop', 'cans'); assert.match(cans.html, /离线罐头商品/); assert.equal(cans.calls.length, 0);
+  const friends = await ranchPageFixture('friends'); assert.match(friends.html, /好友列表/); assert.match(friends.html, /离线牧场好友/); assert.doesNotMatch(friends.html, /role="tablist"|<select/);
+  const personal = await ranchPageFixture('personal', 'bag'); assert.match(personal.html, /牧场背包与补给/);
+  assert.equal((personal.html.match(/role="tab"/g) || []).length, 4); assert.doesNotMatch(personal.html, /仓鼠集市|牧場活动目录/);
+});
+
+test('共享数字格式对牧场金券采用农场紧凑位数且保留int64整数精度', () => {
+  const formatter = frontendHarness().load('utils/number-format.ts');
+  assert.equal(formatter.formatCurrencyAmountByLabel('123456789', '金券'), '1.23亿');
+  assert.equal(formatter.formatIntegerAmount('987654321012345678'), '987,654,321,012,345,678');
+  assert.equal(formatter.formatCurrencyAmountByLabel('123456789', '金币'), '1.23亿');
+  assert.equal(formatter.formatCurrencyAmountByLabel('987654321012345678', '金券'), '9,876,543,210.12亿');
+});
+
+test('牧场概览使用三张账号与资源卡及日志和统计双栏，不展示内部实现声明', async () => {
+  const overview = await ranchPageFixture('overview');
+  assert.match(overview.html, /账号资源/);
+  assert.doesNotMatch(overview.html, /农场 Lv\.|农场等级未读取/);
+  assert.match(overview.html, /金券/);
+  assert.match(overview.html, /1\.23亿/);
+  assert.match(read('views/Ranch.vue'), /读取失败 · 重试/);
+  assert.match(read('views/Ranch.vue'), /bagError/);
+  assert.doesNotMatch(overview.html, />金币</);
+  assert.match(overview.html, /牧场等级/);
+  assert.match(overview.html, /Lv\.12/);
+  assert.match(overview.html, /牧草机存量/);
+  assert.match(read('views/Ranch.vue'), /bagOverview\?\.level \? `Lv\.\$\{bagOverview\.level\.level\}`/);
+  assert.match(overview.html, /md:w-3\/4[^>]+运行日志/);
+  assert.match(overview.html, /md:w-1\/4[^>]+牧场检查与统计/);
+  assert.match(overview.html, /检查间隔/);
+  assert.match(overview.html, /今日统计/);
+  assert.doesNotMatch(overview.html, /快捷入口|牧场设施/);
+  assert.match(overview.html, /metric-card/);
+  assert.equal((overview.html.match(/min-h-\[168px\]/g) || []).length, 3);
+  assert.doesNotMatch(overview.html, /操作与场景安全说明|scene2|逐次报价|连续重试|手动操作/);
+  assert.equal(overview.calls.length, 0);
+  const personal = await ranchPageFixture('personal', 'home');
+  assert.match(personal.html, /手动操作/);
+});
+
+test('牧场好友直接列出并搜索，点击按需展开且同步清旧详情，绝不批量读取', async () => {
+  const page = await ranchPageFixture('friends');
+  assert.match(page.html, /aria-label="牧场好友列表"/);
+  assert.match(page.html, /离线牧场好友/);
+  assert.equal((page.html.match(/class="ranch-friend-row/g) || []).length, 2);
+  assert.doesNotMatch(page.html, /<select|不会用农场名单|确认进入|来源与哈希/);
+  assert.equal(page.calls.length, 0);
+  const source = read('views/Ranch.vue'), selectedFriendGid = vue.ref(null), friendLoading = vue.ref(false), operating = vue.ref(false);
+  const friends = vue.ref([{ gid: 1, name: '好友甲' }, { gid: 2, name: 'Beta好友' }]), order = [];
+  const stop = vue.watch(selectedFriendGid, () => order.push('clear'), { flush: 'sync' });
+  const context = { ref: vue.ref, computed: vue.computed, friends, selectedFriendGid, friendLoading, operating,
+    currentAccountId: vue.ref('A'), friendsLoading: vue.ref(false), friendsError: vue.ref(''), LOCAL_UI_READONLY: false,
+    loadFriendRanch: async () => order.push('read:' + selectedFriendGid.value), ranchStore: { async fetchFriends() { order.push('roster'); } } };
+  const code = source.slice(source.indexOf('const friendSearch ='), source.indexOf('const manualReviewError ='))
+    + source.slice(source.indexOf('async function selectRanchFriend'), source.indexOf('async function selectCatalog'));
+  const result = vm.runInNewContext(ts.transpileModule(code + '\n;({ friendSearch, filteredRanchFriends, selectRanchFriend })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  try {
+    result.friendSearch.value = 'BETA'; assert.equal(result.filteredRanchFriends.value[0].gid, 2);
+    result.friendSearch.value = '1'; assert.equal(result.filteredRanchFriends.value[0].gid, 1);
+    await result.selectRanchFriend(1); await result.selectRanchFriend(2); await result.selectRanchFriend(2);
+    assert.deepEqual(order, ['clear', 'read:1', 'clear', 'read:2', 'clear']);
+    await result.selectRanchFriend(999); assert.equal(order.length, 5);
+    context.LOCAL_UI_READONLY = true; await result.selectRanchFriend(1);
+    assert.deepEqual(order, ['clear', 'read:1', 'clear', 'read:2', 'clear', 'clear']);
+  } finally { stop(); }
+});
+
+test('牧场界面诊断只写账号内存日志，去重有界、跨切页保留，不改变未知保护', () => {
+  const h = ranchStoreHarness(() => assert.fail('记录诊断不得发请求'));
+  try {
+    h.store.operationStates.A = 'unknown';
+    h.store.appendInterfaceLog('A', 'ranch_ui_read', '读取失败 ?token=secret');
+    h.store.appendInterfaceLog('A', 'ranch_ui_read', '读取失败 ?token=secret');
+    assert.equal(h.store.interfaceLogs.length, 1);
+    assert.doesNotMatch(h.store.interfaceLogs[0].msg, /secret/);
+    h.store.clear(); assert.equal(h.store.interfaceLogs.length, 1);
+    assert.equal(h.store.currentState, 'unknown'); assert.equal(h.store.writeBlocked, true);
+    h.selected.value = 'B'; assert.equal(h.store.interfaceLogs.length, 0);
+    h.store.appendInterfaceLog('A', 'ranch_ui_read', '旧账号迟到错误'); assert.equal(h.store.interfaceLogs.length, 0);
+    h.store.appendInterfaceLog('B', 'ranch_ui_read', 'B读取失败'); assert.equal(h.store.interfaceLogs.length, 1);
+    for (let i = 0; i < 120; i++) h.store.appendInterfaceLog('B', 'ranch_ui_read', '错误' + i);
+    assert.equal(h.store.interfaceLogs.length, 100); assert.equal(h.calls.length, 0);
+    h.selected.value = 'A'; assert.equal(h.store.interfaceLogs.length, 1); assert.equal(h.store.currentState, 'unknown');
+  } finally { h.dispose(); }
+  const source = read('views/Ranch.vue'), template = source.slice(source.indexOf('<template>'), source.indexOf('<style scoped>'));
+  assert.doesNotMatch(template, /ranch-error|ranch-notice|ranch-pending|role="alert"|本账号牧场结果或离场状态未确认/);
+  assert.match(source, /appendInterfaceLog\?\.\(accountId, 'ranch_ui_pending'/);
+  const diagnosticObserver = source.slice(source.indexOf('// 诊断只进入当前账号'), source.indexOf('watch(selectedFriendGid'));
+  assert.doesNotMatch(diagnosticObserver, /routineState\.value\?\.lastError/, '后端巡查暂停不能重复伪装成界面读取错误');
+  assert.match(source, /\.\.\.\(ranchStore.interfaceLogs \|\| \[\]\)/);
+});
+
+test('牧场日志与农场同款紧凑排版、模块/事件徽标及双列统计，不更改读取契约', async () => {
+  const source = read('views/Ranch.vue');
+  const farm = read('views/Dashboard.vue');
+  const code = source.slice(source.indexOf('function ranchLogTagClass'), source.indexOf('async function readRanchLogs'));
+  const helpers = vm.runInNewContext(ts.transpileModule(code + '\n;({ ranchLogTagClass, ranchLogEventLabel })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText);
+  const farmTag = farm.slice(farm.indexOf('function getLogTagClass'), farm.indexOf('function getLogMsgClass'));
+  const getFarmClass = vm.runInNewContext(ts.transpileModule(farmTag + '\n;getLogTagClass',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText);
+  for (const tag of ['牧场', '系统', '活动', '错误']) assert.equal(helpers.ranchLogTagClass({ tag }), getFarmClass(tag));
+  assert.match(helpers.ranchLogTagClass({ tag: '牧场', isWarn: true }), /bg-orange/);
+  assert.match(helpers.ranchLogTagClass({ tag: '牧场', meta: { result: 'unknown' } }), /bg-orange/);
+  assert.equal(helpers.ranchLogEventLabel('ranch_harvest'), '收获');
+  assert.equal(helpers.ranchLogEventLabel('ranch_patrol_paused'), '巡查暂停');
+  assert.equal(helpers.ranchLogEventLabel('unrecognized_event'), 'unrecognized_event');
+  assert.match(source, /ranch-log-list[^\n]+text-sm leading-relaxed font-mono/);
+  assert.match(source, /\[\{\{ ranchLogTime\(entry\) \}\}\]/);
+  assert.match(source, /ranchLogTagClass\(entry\)/);
+  assert.match(source, /ranchLogEventLabel\(entry.meta.event\)/);
+  const logMarkup = source.slice(source.indexOf('aria-label="运行日志"'), source.indexOf('aria-label="牧场检查与统计"'));
+  assert.doesNotMatch(logMarkup, /divide-y|py-2\.5/);
+  const overview = await ranchPageFixture('overview');
+  assert.match(overview.html, /下次检查倒计时/);
+  assert.match(overview.html, /ranch-countdown[^>]*font-mono/);
+  assert.equal((overview.html.match(/ranch-stat-tile/g) || []).length, 5);
+  assert.match(overview.html, /grid grid-cols-2 gap-2 2xl:gap-3/);
+  assert.equal(overview.calls.length, 0);
+});
+
+test('牧场调度展示依据真实期限，未知/过期快照不伪装倒计时，近100条统计跨日更新', () => {
+  const source = read('views/Ranch.vue');
+  const code = source.slice(source.indexOf('const savedAutomation ='), source.indexOf('function logTimestamp'));
+  const now = new Date(2026, 10, 21, 12).getTime();
+  class TestDate extends Date { static now() { return now; } }
+  const currentAccountId = vue.ref('A'), currentState = vue.ref('idle'), operations = vue.ref([]);
+  const panelStatus = vue.ref({ automation: { ranch: true }, ranchAutomation: { enabled: true, running: false,
+    farmMin: 2, farmMax: 5, nextCheckAt: now + 67000, lastStartedAt: now - 10000, lastFinishedAt: now - 5000, lastResult: 'confirmed' } });
+  const presentation = vue.ref({ kind: 'online' });
+  const settingStore = { settingsAccountId: 'A', readError: '', confirmedAutomation: { ranch: false } };
+  const readableLogs = vue.ref({ readAt: now });
+  const ranchLogEntries = vue.ref([
+    { ts: now, meta: { event: 'ranch_harvest', result: 'ok' } },
+    { ts: now, meta: { event: 'ranch_harvest', result: 'unknown' } },
+    { ts: now - 86400000, meta: { event: 'ranch_harvest', result: 'ok' } },
+    { ts: now, meta: { event: 'ranch_friend_stroke', result: 'ok' } },
+    { ts: now, meta: { event: 'ranch_patrol_complete', result: 'idle' } },
+    { ts: now, meta: { event: 'ranch_patrol_paused', result: 'unknown' } },
+  ]);
+  const result = vm.runInNewContext(ts.transpileModule(code + '\n;({ savedAutomation, ranchCycleText, ranchRoutineText, ranchCountdownText, ranchTodayStats, routineClock })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText,
+    { computed: vue.computed, ref: vue.ref, panelStatus, currentAccountId, currentState, operations, presentation, settingStore,
+      readableLogs, ranchLogEntries, Date: TestDate, logTimestamp: entry => entry.ts });
+  assert.equal(result.savedAutomation.value.ranch, true, '状态接口的已生效开关优先于旧设置快照');
+  assert.equal(result.ranchCycleText.value, '2–5 秒（同农场）');
+  assert.equal(result.ranchCountdownText.value, '00:01:07');
+  result.routineClock.value = now + 60000;
+  assert.equal(result.ranchCountdownText.value, '00:00:07');
+  result.routineClock.value = now + 67000;
+  assert.equal(result.ranchCountdownText.value, '等待调度', '到期不是已执行证据');
+  panelStatus.value.ranchAutomation.running = true;
+  assert.equal(result.ranchCountdownText.value, '巡查中');
+  assert.equal(result.ranchRoutineText.value, '巡查中');
+  for (const kind of ['error', 'stale', 'stopped', 'offline', 'readonly', 'unknown']) {
+    presentation.value.kind = kind;
+    assert.equal(result.ranchCountdownText.value, '—', kind);
+    assert.equal(result.ranchRoutineText.value, '—', kind);
+  }
+  presentation.value.kind = 'online'; panelStatus.value.ranchAutomation.running = false;
+  currentState.value = 'unknown';
+  assert.equal(result.ranchRoutineText.value, '安全状态待核对'); assert.equal(result.ranchCountdownText.value, '—');
+  currentState.value = 'pending'; assert.equal(result.ranchCountdownText.value, '操作中');
+  currentState.value = 'idle'; panelStatus.value.ranchAutomation.lastResult = 'unknown';
+  assert.equal(result.ranchCountdownText.value, '—');
+  panelStatus.value.ranchAutomation.lastResult = 'error';
+  assert.equal(result.ranchRoutineText.value, '等待巡查');
+  panelStatus.value.ranchAutomation.enabled = false; assert.equal(result.ranchCountdownText.value, '未安排巡查');
+  assert.equal(result.ranchTodayStats.value[0].count, 1); assert.equal(result.ranchTodayStats.value[4].count, 1);
+  result.routineClock.value = now + 86400000;
+  assert.equal(result.ranchTodayStats.value[0].count, 0, '跨日不能继续显示昨天的成功记录');
+  panelStatus.value = null; assert.equal(result.ranchCountdownText.value, '—');
+  settingStore.settingsAccountId = 'B'; assert.equal(result.savedAutomation.value, null);
+  assert.match(source, /下次检查/); assert.match(source, /routineState\.lastFinishedAt/);
+  assert.match(source, /近100条日志中的今日成功记录/);
+});
+
+test('牧场概览日志与定时器：A-B-A取消旧读取、隐藏页无额外读取、倒计时不发RPC且卸载清理', async () => {
+  const source = read('views/Ranch.vue');
+  const code = source.slice(source.indexOf('async function readRanchLogs'), source.indexOf('function itemKey'));
+  const cleanup = source.slice(source.indexOf('onBeforeUnmount(() => {'), source.indexOf('</script>'));
+  const pending = [], timers = new Map(), mounted = [], unmounted = [];
+  let timerId = 0, statusReads = 0, cleared = 0, now = 1000;
+  class TestDate extends Date { static now() { return now; } }
+  const props = vue.reactive({ page: 'overview' }), currentAccountId = vue.ref('A'), document = { hidden: false };
+  const logSnapshot = vue.ref(null), logLoading = vue.ref(false), logError = vue.ref(false), routineClock = vue.ref(now);
+  const context = { AbortController, Date: TestDate, props, currentAccountId, document, logSnapshot, logLoading, logError, routineClock,
+    LOCAL_UI_READONLY: false, ref: vue.ref, computed: vue.computed, statusStore: { async fetchStatus() { statusReads++; } }, settingStore: { async fetchSettings() {} },
+    ranchStore: { clear() { cleared++; } }, onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn),
+    setInterval: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; }, clearInterval: id => timers.delete(id),
+    api: { get(url, options) { const gate = deferred(); pending.push({ url, options, gate }); return gate.promise; } } };
+  const result = vm.runInNewContext(ts.transpileModule('let logRequest;\n' + code + cleanup + '\n;({ readRanchLogs, resetRanchLogs })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context);
+  mounted[0](); assert.equal(timers.size, 2);
+  const clockTick = [...timers.values()].find(timer => timer.delay === 1000).fn;
+  const readTick = [...timers.values()].find(timer => timer.delay === 15000).fn;
+  now = 2000; clockTick(); assert.equal(routineClock.value, now); assert.equal(pending.length, 0); assert.equal(statusReads, 0);
+  document.hidden = true; readTick(); clockTick();
+  await result.readRanchLogs('A'); assert.equal(pending.length, 0); assert.equal(statusReads, 0);
+  document.hidden = false; props.page = 'personal'; readTick(); await result.readRanchLogs('A');
+  assert.equal(pending.length, 0); assert.equal(statusReads, 0);
+  props.page = 'overview'; await result.readRanchLogs('B'); assert.equal(pending.length, 0);
+  const first = result.readRanchLogs('A');
+  assert.equal(pending[0].options.headers['x-account-id'], 'A');
+  assert.equal(pending[0].options.params.accountId, 'A'); assert.equal(pending[0].options.params.module, 'ranch');
+  assert.equal(pending[0].options.params.limit, 100);
+  currentAccountId.value = 'B'; result.resetRanchLogs(); currentAccountId.value = 'A';
+  const second = result.readRanchLogs('A');
+  assert.equal(pending[0].options.signal.aborted, true);
+  pending[1].gate.resolve({ data: { ok: true, data: [{ msg: '新日志' }] } }); await second;
+  pending[0].gate.resolve({ data: { ok: true, data: [{ msg: '旧日志' }] } }); await first;
+  assert.equal(logSnapshot.value.entries[0].msg, '新日志'); assert.equal(logLoading.value, false);
+  const failing = result.readRanchLogs('A'); pending[2].gate.reject(new Error('当前日志异常')); await failing;
+  assert.equal(logError.value, true); assert.equal(logSnapshot.value.entries[0].msg, '新日志');
+  const leaving = result.readRanchLogs('A'); unmounted[0]();
+  assert.equal(timers.size, 0); assert.equal(pending[3].options.signal.aborted, true); assert.equal(cleared, 1);
+  pending[3].gate.reject(new Error('离页后的旧异常')); await leaving;
+  assert.equal(logSnapshot.value, null); assert.equal(logError.value, false); assert.equal(logLoading.value, false);
+});
+
+test('牧场页面初始化按所属功能读取，商城/图鉴/活动不顺带读取概览或其他业务', async () => {
+  for (const [page, section, expected] of [['overview', '', 'overview'], ['personal', 'bag', 'bag'], ['personal', 'tasks', 'progress:tasks'],
+    ['personal', 'share', 'progress:share'], ['friends', '', 'friends'], ['shop', '', 'catalog:5'], ['shop', 'cans', 'cans:6'],
+    ['shop', 'market', 'progress:market'], ['activity', '', 'progress:activities'], ['illustrated', '', 'progress:book']]) {
+    const value = await ranchPageFixture(page, section, false, false);
+    assert.deepEqual(value.calls, page === 'overview' ? ['operations', 'status', 'settings', 'ranch-logs', 'bag', expected] : ['operations', expected], `${page}/${section} 不得读隐藏页面`);
+  }
+});
+
+test('工作区加载控制器：路由绘制与插画结束双确认，迟到事件/取消/卸载不能解除新加载', () => {
+  let completed = 0;
+  const controller = frontendHarness().load('composables/useContentMotion.ts').createWorkspaceTravel(() => { completed++; });
+  controller.begin(1, 'ranch', '/ranch'); controller.arrived(1);
+  assert.equal(controller.active.value.painted, false); assert.equal(completed, 0);
+  controller.painted(1, '/wrong'); assert.equal(completed, 0);
+  controller.painted(1, '/ranch'); assert.equal(controller.active.value, null); assert.equal(completed, 1);
+  controller.begin(2, 'farm', '/'); controller.painted(2, '/'); controller.arrived(1);
+  assert.equal(controller.active.value.arrived, false); controller.cancel(); controller.arrived(2); assert.equal(completed, 1);
+  controller.begin(3, 'ranch', '/ranch/shop'); controller.begin(4, 'farm', '/shop');
+  controller.arrived(3); controller.painted(3, '/ranch/shop'); assert.equal(controller.active.value.id, 4);
+  controller.painted(4, '/shop'); controller.arrived(4); assert.equal(completed, 2);
+  controller.dispose(); controller.begin(5, 'ranch', '/ranch'); assert.equal(controller.active.value, null);
+  const layout = read('layouts/DefaultLayout.vue'), overlay = read('components/WorkspaceTravelOverlay.vue');
+  assert.match(layout, /router.beforeResolve\(async[\s\S]*travelController.begin/);
+  assert.match(layout, /:inert="workspaceTravel \? true : undefined"/); assert.match(layout, /travelController\.dispose\(\)/);
+  assert.match(overlay, /emit\('arrived', props.requestId\)/); assert.match(overlay, /prefers-reduced-motion/);
+  assert.match(overlay, /workspace-cart-body/); assert.match(overlay, /workspace-wheel-hub/);
+  assert.match(overlay, /workspace-child-bob/); assert.match(overlay, /cubic-bezier\(\.22,\.72,\.28,1\)/);
+  assert.doesNotMatch(overlay, /setInterval|setTimeout|api\.|fetch\(|operate|gameRpc/);
+});
+
+test('总概览：不主动切换牧场场景，加载账号状态并展示资源、动态与异常入口', async () => {
+  const instance = pinia.createPinia();
+  const account = pinia.defineStore('overview-account-fixture', () => ({ currentAccountId: vue.ref('A'), currentAccount: vue.ref({ id: 'A', name: '账号A' }) }))(instance);
+  const status = pinia.defineStore('overview-status-fixture', () => ({ status: vue.ref(null), currentStatusReady: vue.ref(false),
+    currentStatusMetadata: vue.ref(null), currentStatusStale: vue.ref(false), loading: vue.ref(false), error: vue.ref(''),
+    logs: vue.ref([]), accountLogs: vue.ref([]), fetchStatus: async () => {} }))(instance);
+  const ranch = pinia.defineStore('overview-ranch-fixture', () => ({
+    operations: vue.ref(Array.from({ length: 10 }, (_, index) => ({ id: `record-${index}`, label: '普通领取牧场任务', target: `ranch:claimTasks:${300011 + index}` }))),
+    operationsReady: vue.ref(true), operationsLoading: vue.ref(false), operationsError: vue.ref(''),
+    fetchOperations: async () => ({ ok: true, safe: true }),
+  }))(instance);
+  const h = frontendHarness({ '@/stores/account': { useAccountStore: () => account }, '@/stores/status': { useStatusStore: () => status },
+    '@/stores/ranch': { useRanchStore: () => ranch }, '@/config/localReadonly': { LOCAL_UI_READONLY: false }, 'vue-router': { RouterLink: navigationLinkStub } });
+  try {
+    const component = h.load('views/Overview.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component) }));
+    assert.match(html, /总概览/); assert.match(html, /10 条待核对/); assert.match(html, /普通领取牧场任务/);
+    assert.match(html, /最近动态/); assert.match(html, /账户资源/); assert.match(html, /查看记录/);
+    assert.doesNotMatch(html, /牧场操作保护|无本地在途写|保留原有经营与状态页面|同一套交互风格|总概览不主动切换游戏场景/);
+    const source = read('views/Overview.vue');
+    assert.match(source, /fetchStatus/); assert.match(source, /fetchOperations/);
+    assert.doesNotMatch(source, /fetchOverview|fetchBag|fetchProgress|setInterval|connectRealtime|api\./);
+  }
+  finally { pinia.disposePinia(instance); }
+});
+
+test('4B分享SSR：没有102标记时两种写按钮均禁用，不展示已领取或未领取推断', async () => {
+  const h = ranchStoreHarness(() => Promise.reject(new Error('不允许渲染发请求')));
+  h.store.progressViews = { share: ranchProgressResponse('A', 'share').data.data };
+  const render = frontendHarness({ '@/stores/ranch': { useRanchStore: () => h.store,
+    ranchItemLabel: id => `物品#${id}` } });
+  try {
+    const component = render.load('components/RanchProgressPanel.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { section: 'share' }) }));
+    assert.match(html, /保持未确认|保持未确认|未确认/);
+    assert.doesNotMatch(html, /服务端没有返回牧场分享标记|ui-notice|progress-error/);
+    assert.doesNotMatch(html, /今日已领取/);
+    assert.match(html, /disabled/);
+    assert.equal(h.calls.length, 0);
+  }
+  finally { h.dispose(); }
+});
+
+test('仓鼠集市只禁用冲突余额的购买，其他商品保持可购买并说明安全锁原因', async () => {
+  const h = ranchStoreHarness(() => assert.fail('本用例只验证已加载集市的渲染'));
+  h.store.clear = () => {};
+  h.store.operations = [{ id: 'pending-buy', target: 'ranch:buy:9001', label: '购买商品', costs: [
+    { resourceKey: 'item:1005', amount: '50' }], createdAt: 1, message: 'unknown' }];
+  h.store.progressViews = { market: { readOnly: true, sceneId: 2, ownerGid: 'gid', observedAt: Date.now(), dateKey: '2026-11-23',
+    serverTimeMs: Date.now(), shopId: 7, opened: true, present: true, periodDay: '20261123', roundIndex: 1,
+    shelves: [], automaticExchangeEnabled: false, cache: { hit: false, receivedAt: Date.now() },
+    goods: [
+      { id: '9001', shelfId: 1, slot: 0, name: '金豆商品', reward: { id: '80021', count: '1', image: '', name: '罐头' },
+        currencyId: '1005', currencyName: '金豆豆', currencyImage: '', unitPrice: '50', currencyBalance: '1000',
+        remaining: '5', maxCount: 5, limitUsed: '0', available: true, discounted: false, priceValidUntilMs: null, requiredLevel: null, stateReason: '' },
+      { id: '9002', shelfId: 1, slot: 1, name: '松果商品', reward: { id: '80031', count: '1', image: '', name: '有机罐头' },
+        currencyId: '1008', currencyName: '松果币', currencyImage: '', unitPrice: '50', currencyBalance: '1000',
+        remaining: '5', maxCount: 5, limitUsed: '0', available: true, discounted: false, priceValidUntilMs: null, requiredLevel: null, stateReason: '' },
+    ] } };
+  const render = frontendHarness({ '@/stores/ranch': { useRanchStore: () => h.store } });
+  try {
+    const component = render.load('components/RanchMarketPanel.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { section: 'market', accountId: 'A' }) }));
+    assert.match(html, /有购买结果待核对，且使用相同余额/);
+    const cards = [...html.matchAll(/<article[\s\S]*?<\/article>/g)].map(match => match[0]);
+    assert.equal(cards.length, 2);
+    assert.match(cards[0], /disabled/);
+    assert.match(cards[1], /购买/);
+    assert.doesNotMatch(cards[1], /disabled/);
+  }
+  finally { h.dispose(); }
+});
+
+function marketResponse(accountId, patch = {}) {
+  return { data: { ok: true, accountId, data: { readOnly: true, sceneId: 2, ownerGid: '10010', observedAt: Date.now(),
+    dateKey: '2026-11-18', serverTimeMs: Date.now(), shopId: 7, opened: true, present: true, periodDay: '20261118', roundIndex: 0,
+    shelves: [], goods: [], automaticExchangeEnabled: false, cache: { hit: false }, ...patch } } };
+}
+
+test('4C前端：集市A-B-A旧回复不回填，错卡结构与活动详情归属拒绝', async () => {
+  const old = deferred(), fresh = deferred(); let count = 0;
+  const h = ranchStoreHarness((_method, url) => url === '/api/ranch/market' ? (++count === 1 ? old.promise : fresh.promise)
+    : Promise.resolve({ data: { ok: true, accountId: 'A', data: { readOnly: true, sceneId: 2, ownerGid: '10010',
+      observedAt: Date.now(), dateKey: '2026-11-18', actionsEnabled: false, activities: [], guide: {}, detail: { id: 'wrong' } } } }));
+  try {
+    const first = h.store.fetchProgress('A', 'market'); h.selected.value = 'B'; h.selected.value = 'A';
+    const second = h.store.fetchProgress('A', 'market'); fresh.resolve(marketResponse('A', { stamp: 'new' })); await second;
+    old.resolve(marketResponse('A', { stamp: 'old' })); await first;
+    assert.equal(h.store.progressViews.market.stamp, 'new');
+    await h.store.fetchProgress('A', 'activities', '12345');
+    assert.equal(h.store.progressViews.activities, undefined);
+    assert.match(h.store.progressErrors.activities, /未确认/);
+    assert.equal(h.calls.at(-1).config.params.groupId, '12345');
+  }
+  finally { h.dispose(); }
+  const bad = ranchStoreHarness(() => Promise.resolve(marketResponse('A', { goods: [{ id: '1', unitPrice: 'NaN' }] })));
+  try { await bad.store.fetchProgress('A', 'market'); assert.equal(bad.store.progressViews.market, undefined); }
+  finally { bad.dispose(); }
+});
+
+test('4C前端写：兑换在途跨页不解除，旧集市读不能在写后回填', async () => {
+  const read = deferred(), write = deferred();
+  const h = ranchStoreHarness(method => method === 'GET' ? read.promise : write.promise);
+  try {
+    const reading = h.store.fetchProgress('A', 'market');
+    const operation = h.store.execute('A', 'exchange', { goodsId: '9007199254740997', count: 1 }, { signature: 'offer' });
+    read.resolve(marketResponse('A')); await reading;
+    assert.equal(h.store.progressViews.market, undefined);
+    h.store.clear(); assert.equal(h.store.operating, true);
+    write.resolve(ranchWriteResponse('A', 'exchange')); assert.equal((await operation).stale, true);
+    assert.equal(h.store.progressViews.market, undefined);
+  }
+  finally { h.dispose(); }
+});
+
+test('4C视图SSR：官方图源原URL保留，活动未确认不显示完成或产生写请求', async () => {
+  const picture = await renderComponent('components/RanchItemImage.vue', { src: '/game-config/ranch/item-icons/60013.png', alt: '豪猪' });
+  assert.match(picture, /src="\/game-config\/ranch\/item-icons\/60013\.png"/);
+  const h = ranchStoreHarness(() => Promise.reject(new Error('渲染不得发请求')));
+  h.store.progressViews = { activities: { activities: [{ id: '1234', name: '牧歌初启', beginTimeMs: null, endTimeMs: null,
+    children: [], actionsEnabled: false, progressState: 'unconfirmed' }], actionsEnabled: false, detail: null,
+    notice: '具体进度尚未核验', serverTimeMs: Date.now(), observedAt: Date.now(),
+    guide: { title: '牧歌初启', description: '公告不是账号进度', bulletinId: 26111702, sections: [], notice: '未自动领取' } } };
+  const render = frontendHarness({ '@/stores/ranch': { useRanchStore: () => h.store } });
+  try {
+    const component = render.load('components/RanchMarketPanel.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { section: 'activities' }) }));
+    assert.match(html, /时间未确认/); assert.doesNotMatch(html, /具体领奖进度未核验|状态未确认|领奖进度未确认/);
+    assert.doesNotMatch(html, /全部已领取|已完成全部/); assert.equal(h.calls.length, 0);
+    h.store.progressViews.activities.activities[0].beginTimeMs = Date.now() - 1000;
+    h.store.progressViews.activities.activities[0].endTimeMs = Date.now() + 60000;
+    h.store.progressViews.activities.serverTimeMs = undefined;
+    const noClock = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { section: 'activities' }) }));
+    assert.match(noClock, /时间未确认/); assert.doesNotMatch(noClock, /活动时间内/);
+  }
+  finally { h.dispose(); }
+});
+
+test('牧场活动SSR展示牧歌四分区、真实进度与已确认操作入口，不在渲染期发请求', async () => {
+  const h = ranchStoreHarness(() => assert.fail('SSR不得读取活动或提交领奖'));
+  const root = { id: '2026111700', name: '牧歌初启', children: [], beginTimeMs: Date.now() - 1000, endTimeMs: Date.now() + 60000 };
+  const muge = { activityId: '2026111700', title: '牧歌初启', serverTime: Date.now(), startTime: Date.now() - 1000,
+    endTime: Date.now() + 60000, active: true, rules: [], sections: {},
+    celebration: { total: '100', tiers: [{ id: '1', threshold: '50', status: 2, rewards: [{ id: '7001', count: '1', name: '牧草', image: '' }] }] },
+    friends: { count: 3, tiers: [] }, handbook: { points: '10', tiers: [], tasks: [] },
+    personality: { answers: {}, personalityId: '0', settleCount: '0', image: '', shareRewardClaimed: false },
+    questions: [{ id: 1, title: '你一般什么时候上线玩农场？', options: [{ value: 1, text: '睁眼就开始玩', label: 'A' }] }] };
+  h.store.progressViews = { activities: { activities: [root], detail: root, actionsEnabled: false, guide: {}, muge,
+    serverTimeMs: Date.now(), observedAt: Date.now() } };
+  const render = frontendHarness({ '@/stores/ranch': { useRanchStore: () => h.store } });
+  try {
+    const component = render.load('components/RanchMarketPanel.vue').default;
+    const html = await renderer.renderToString(vue.createSSRApp({ render: () => vue.h(component, { section: 'activities', accountId: 'A' }) }));
+    for (const title of ['兴牧庆典', '牧友同行', '成长手册', '牧场人格']) assert.match(html, new RegExp(title));
+    assert.match(html, /全服累计饲养/);
+    assert.match(html, /100 只/);
+    assert.match(html, /领取 1 档奖励/);
+    const panelSource = read('components/RanchMugeActivityPanel.vue');
+    assert.match(panelSource, /领取按钮已锁定/);
+    assert.match(panelSource, /活动当前不在可操作时间/);
+    assert.match(panelSource, /自动领取：/);
+    assert.match(panelSource, /具体奖励是否到账以各档状态显示“已领取”为准/);
+    assert.match(panelSource, /question\.title/);
+    assert.match(panelSource, /queuedAnswers = new Map/);
+    assert.match(panelSource, /while \(queuedAnswers\.size/);
+    assert.match(panelSource, /blockedUnknownAccount/);
+    assert.match(panelSource, /aria-label="牧歌初启活动分区"/);
+    assert.doesNotMatch(panelSource.match(/<nav[^>]*aria-label="牧歌初启活动分区"[\s\S]*?<\/nav>/)?.[0] || '', /disabled/);
+    assert.match(panelSource, /saveAnswers/);
+    assert.match(read('components/RanchMugeActivityPanel.vue'), /startRetake/);
+    assert.match(read('views/Ranch.vue'), /activityReadOnlyReason/);
+    assert.match(read('views/Ranch.vue'), /ranch_activity_claim/);
+    assert.match(read('components/RanchMugeActivityPanel.vue'), /answers: \{\}, clear: true/);
+    assert.match(panelSource, /muge-preview-dialog/);
+    assert.doesNotMatch(html, /状态未确认|具体领奖进度未核验|只显示活动 ID/);
+    assert.equal(h.calls.length, 0);
+  } finally { h.dispose(); }
+});
+
+test('牧歌人格图片可放大，键盘Escape/遮罩/关闭按钮退出且对话框有无障碍语义', () => {
+  const source = read('components/RanchMugeActivityPanel.vue');
+  assert.match(source, /放大查看牧场人格/);
+  assert.match(source, /function selectRandomAnswers/);
+  assert.match(source, /Math\.floor\(random\(\) \* question\.options\.length\)/);
+  assert.match(source, /const option = question\.options\[index\]/);
+  assert.match(source, /if \(await operate\('settle'\)\)/);
+  assert.match(source, /不同账号的答案不保证对应不同人格结果/);
+  assert.match(source, /role="dialog" aria-modal="true"/);
+  assert.match(source, /window\.addEventListener\('keydown', onPreviewKeydown\)/);
+  assert.match(source, /event\.key === 'Escape'/);
+  assert.match(source, /@click\.self="imagePreviewOpen = false"/);
+  assert.match(source, /aria-label="关闭图片预览"/);
+});
+
+test('牧歌问卷保存队列不锁分区导航，等待/未知结果不触发隐式重放', () => {
+  const source = read('components/RanchMugeActivityPanel.vue');
+  const nav = source.match(/<nav[^>]*aria-label="牧歌初启活动分区"[\s\S]*?<\/nav>/)?.[0] || '';
+  assert.match(source, /queuedAnswers = new Map/);
+  assert.match(source, /while \(queuedAnswers\.size/);
+  assert.match(source, /queuedAnswers\.clear\(\)/);
+  assert.match(source, /unknownBlockedForCurrentAccount/);
+  assert.doesNotMatch(nav, /disabled/);
+  assert.match(nav, /@click\.stop="tab = section\.key"/);
+  assert.match(source, /savingQuestion === question\.id \? '保存中/);
+  assert.match(source, /queuedQuestionIds\.has\(question\.id\) \? '等待保存/);
+});
+
+test('4C安全复查：缺失或非有限服务端时钟不能成为可用集市/活动快照', async () => {
+  for (const section of ['market', 'activities']) for (const clock of [undefined, 0, -1, '123', Number.NaN]) {
+    const response = marketResponse('A', { serverTimeMs: clock });
+    if (section === 'activities') Object.assign(response.data.data, { activities: [], actionsEnabled: false, guide: {}, detail: null });
+    const h = ranchStoreHarness(() => Promise.resolve(response));
+    try {
+      await h.store.fetchProgress('A', section);
+      assert.equal(h.store.progressViews[section], undefined, `${section}: bad server clock ${clock}`);
+      assert.match(h.store.progressErrors[section], /结构未确认|时间未确认/);
+    } finally { h.dispose(); }
+  }
+});
+
+test('牧场缺图与只读空态：文字和辅助语义明确，不让用户寻找不存在的账号入口', async () => {
+  const placeholder = await renderComponent('components/RanchItemImage.vue', { alt: '巨大鸭' });
+  assert.match(placeholder, /巨大鸭：图标未确认/); assert.match(placeholder, />未确认</); assert.doesNotMatch(placeholder, /<img/);
+  const local = frontendHarness().load('config/localReadonly.ts');
+  assert.equal(local.accountDataEmptyState(true, '').title, '本地仅查看界面');
+  assert.match(read('views/Ranch.vue'), /emptyState\.title/); assert.match(read('views/Ranch.vue'), /emptyState\.description/);
+  assert.match(read('views/Overview.vue'), /仅查看界面，不加载账号或游戏数据/);
+});
+
+const decorationDto = () => ({ id: 501, itemId: 2130, itemCount: 1, shopId: 4, name: '头像框', price: 30,
+  priceKnown: true, contentKnown: true, currencyId: 1005, currencyName: '金豆豆', currencyKnown: true,
+  unlocked: true, owned: false, canBuy: true, availability: 'available' });
+const decorationResponse = (accountId = 'A') => ({ data: { ok: true, accountId, shopId: 4, currencyId: 1005,
+  data: [decorationDto()], userGoldBean: 100 } });
+const decorationPurchaseResponse = (accountId = 'A') => ({ data: { ok: true,
+  data: { accountId, outcome: 'completed', getItems: [{ id: 2130, count: 1 }], costItems: [{ id: 1005, count: 30 }] } } });
+
+test('shop catalog reads merge once, bind the owner and reject old two-frame placeholder responses', async () => {
+  const pending = deferred();
+  const h = shopStoreHarness(() => pending.promise);
+  try {
+    const a = h.store.fetchDecorations('A'), b = h.store.fetchDecorations('A');
+    assert.equal(h.requests.length, 1); pending.resolve(decorationResponse());
+    await Promise.all([a, b]); assert.equal(h.store.decorations.length, 1);
+    assert.equal(h.store.decorations[0].currencyId, 1005);
+  } finally { h.dispose(); }
+  const legacy = shopStoreHarness(async () => ({ data: { ok: true, data: [{ id: 2130, price: 0, canBuy: true }] } }));
+  try { assert.equal((await legacy.store.fetchDecorations('A')).ok, false); assert.equal(legacy.store.decorations.length, 0); assert.ok(legacy.store.decorationError); }
+  finally { legacy.dispose(); }
+});
+
+test('shop failed refresh preserves the visible catalog but disables stale purchase state', async () => {
+  let failed = false;
+  const h = shopStoreHarness(async url => {
+    if (failed) throw new Error('catalog unavailable');
+    if (url === '/api/shop/seed') return { data: { ok: true, accountId: 'A', shopId: 2,
+      data: [{ id: 991, itemId: 20040, name: '牧草种子', price: 30, priceKnown: true, canBuy: true, unlocked: true }] } };
+    return decorationResponse();
+  });
+  try {
+    await h.store.fetchSeeds('A'); await h.store.fetchDecorations('A'); failed = true;
+    await h.store.fetchSeeds('A'); await h.store.fetchDecorations('A');
+    assert.equal(h.store.seeds.length, 1); assert.equal(h.store.decorations.length, 1);
+    assert.equal(h.store.seeds[0].canBuy, false); assert.equal(h.store.decorations[0].canBuy, false);
+    assert.equal(h.store.seeds[0].availability, 'unverified'); assert.ok(h.store.decorationError);
+  } finally { h.dispose(); }
+});
+
+test('shop A-B-A late catalog response cannot restore the old account goods or error/loading state', async () => {
+  const pending = deferred(); const h = shopStoreHarness(() => pending.promise);
+  try {
+    const a = h.store.fetchDecorations('A'); h.selected.value = 'B'; h.selected.value = 'A';
+    pending.resolve(decorationResponse()); await a;
+    assert.equal(h.store.decorations.length, 0); assert.equal(h.store.decorationLoading, false);
+  } finally { h.dispose(); }
+});
+
+test('decoration store purchase freezes the goods/currency snapshot and repeated clicks issue only one POST', async () => {
+  const pending = deferred(); const h = shopStoreHarness(async () => decorationResponse(), () => pending.promise);
+  try {
+    await h.store.fetchDecorations('A'); const item = h.store.decorations[0];
+    const a = h.store.buyDecorationGoods('A', item), b = h.store.buyDecorationGoods('A', item);
+    assert.equal(h.purchases.length, 1);
+    assert.equal(h.purchases[0].url, '/api/shop/decoration/buy');
+    assert.equal(h.purchases[0].config.headers['x-account-id'], 'A');
+    assert.deepEqual(JSON.parse(JSON.stringify(h.purchases[0].body.expectedOffer)), { itemId: 2130, itemCount: 1, currencyId: 1005, price: 30 });
+    assert.equal((await b).resultState, 'not_sent');
+    pending.resolve(decorationPurchaseResponse()); assert.equal((await a).ok, true);
+    assert.equal(h.requests.length, 1, 'store purchase must not spawn hidden catalog reads');
+  } finally { h.dispose(); }
+});
+
+test('decoration store unknown or empty success receipts block repeat purchases and a read refresh cannot clear them', async () => {
+  for (const outcome of ['timeout', 'empty']) {
+    const h = shopStoreHarness(async () => decorationResponse(), async () => {
+      if (outcome === 'timeout') throw new Error('network timeout');
+      return { data: { ok: true, data: { accountId: 'A', outcome: 'completed', getItems: [] } } };
+    });
+    try {
+      await h.store.fetchDecorations('A'); const item = h.store.decorations[0];
+      assert.equal((await h.store.buyDecorationGoods('A', item)).ok, false);
+      assert.equal(h.store.decorations[0].resultUnknown, true);
+      await h.store.fetchDecorations('A'); assert.equal(h.store.decorations[0].canBuy, false);
+      h.selected.value = 'B'; h.selected.value = 'A'; await h.store.fetchDecorations('A');
+      await h.store.buyDecorationGoods('A', item); assert.equal(h.purchases.length, 1);
+    } finally { h.dispose(); }
+  }
+});
+
+test('decoration rejected/not-sent purchase is not mislabeled unknown, and stale purchase results are isolated', async () => {
+  const rejected = shopStoreHarness(async () => decorationResponse(), async () => ({ data: { ok: false, sent: false, resultState: 'not_sent', error: 'price changed' } }));
+  try {
+    await rejected.store.fetchDecorations('A'); const item = rejected.store.decorations[0];
+    assert.equal((await rejected.store.buyDecorationGoods('A', item)).resultState, 'not_sent');
+    assert.notEqual(rejected.store.decorations[0].resultUnknown, true);
+  } finally { rejected.dispose(); }
+  const pending = deferred(), stale = shopStoreHarness(async () => decorationResponse(), () => pending.promise);
+  try {
+    const a = stale.store.buyDecorationGoods('A', decorationDto());
+    stale.selected.value = 'B'; stale.selected.value = 'A'; pending.resolve(decorationPurchaseResponse());
+    assert.equal((await a).canceled, true); assert.equal(stale.store.decorations.length, 0);
+  } finally { stale.dispose(); }
+});
+
+test('unlisted forage and unverified/owned decoration cannot send a purchase from the store', async () => {
+  const h = shopStoreHarness(async () => decorationResponse());
+  try {
+    for (const extra of [{ currencyKnown: false }, { priceKnown: false }, { price: null }, { owned: true }, { resultUnknown: true }, { canBuy: false }]) {
+      assert.equal((await h.store.buyDecorationGoods('A', { ...decorationDto(), ...extra })).ok, false);
+    }
+    assert.equal((await h.store.buyDecorationGoods('B', decorationDto())).ok, false);
+    assert.equal(h.purchases.length, 0);
+  } finally { h.dispose(); }
+  const availability = frontendHarness().load('composables/shop/useShopAvailability.ts').createShopAvailability({
+    currentLevel: () => 109, currentGold: () => 100, currentCoupon: () => 100, userGoldBean: () => 100 });
+  const forage = { itemId: 20040, isForage: true, catalogOnly: true, price: null, priceKnown: false, availability: 'not_listed', canBuy: false };
+  assert.equal(availability.getSeedStatusLabel(forage), '尚未上架'); assert.equal(availability.canAffordGoods(forage), false);
+  assert.equal(availability.getDecorationStatusLabel({ ...decorationDto(), owned: true }), '已拥有');
+  assert.equal(availability.getDecorationStatusLabel({ ...decorationDto(), resultUnknown: true }), '结果待核对');
+  assert.equal(availability.canAffordDecoration({ ...decorationDto(), currencyId: null }), false);
+});
+
+test('actual shop cards render truthful forage unknown values and owned/free decoration states, without source labels', async () => {
+  const forage = await renderComponent('components/shop/SeedGoodsCard.vue', { currentLevel: 109, canAfford: false, statusLabel: '尚未上架', hint: '服务器未上架',
+    item: { id: null, itemId: 20040, name: '牧草种子', isForage: true, catalogOnly: true, price: null, priceKnown: false, harvestKnown: false, requiredLevel: null, seasons: null, expPerSeason: null, canBuy: false } });
+  assert.match(forage, /牧草种子/); assert.match(forage, /售价待确认/); assert.match(forage, /生长与收获数据待确认/); assert.match(forage, /disabled/);
+  assert.doesNotMatch(forage, /季数 1|每季经验 0|价格 0|售价 10|来源|provenance/);
+  const owned = await renderComponent('components/shop/DecorationGoodsCard.vue', { currentLevel: 109, canAfford: true, statusLabel: '已拥有', hint: '无需重复购买', item: { ...decorationDto(), owned: true, canBuy: false } });
+  assert.match(owned, /已拥有/); assert.match(owned, /disabled/); assert.doesNotMatch(owned, /立即购买/);
+  const free = await renderComponent('components/shop/DecorationGoodsCard.vue', { currentLevel: 109, canAfford: true, statusLabel: '可免费领', hint: '限时免费', item: { ...decorationDto(), price: 0, isFree: true, isDiscounted: true, originalPrice: 30 } });
+  assert.match(free, /免费领取/); assert.match(free, /原价/);
+});
+
+test('mixed shop4 forage is shown once in seeds, never as a decoration or an invented golden-bean offer', async () => {
+  const forage = { ...decorationDto(), id: 2129, itemId: 20040, name: '牧草种子', price: 20, itemType: 5, category: 'seed', isSeed: true };
+  const h = shopStoreHarness(async url => url === '/api/shop/seed'
+    ? { data: { ok: true, accountId: 'A', shopId: 2, data: [{ id: null, itemId: 20040, name: '牧草种子', catalogOnly: true, price: null, seedLevel: 1, requiredLevel: null }] } }
+    : { data: { ...decorationResponse().data, data: [decorationDto(), forage] } });
+  try {
+    await h.store.fetchSeeds('A'); await h.store.fetchDecorations('A');
+    assert.equal(h.store.displayDecorations.length, 1);
+    assert.equal(h.store.displayDecorations.some(x => x.itemId === 20040), false);
+    const rows = h.store.displaySeeds.filter(x => x.itemId === 20040);
+    assert.equal(rows.length, 1); assert.equal(rows[0].id, 2129); assert.equal(rows[0].shopId, 4);
+    assert.equal(rows[0].price, 20); assert.equal(rows[0].catalogOnly, false);
+    assert.equal(rows[0].currencyId, null); assert.equal(rows[0].currencyKnown, false);
+    assert.equal(rows[0].canBuy, false); assert.equal(rows[0].availability, 'unverified');
+    assert.equal(rows[0].seasons, null); assert.equal(rows[0].harvestKnown, false);
+    assert.equal((await h.store.buySeedGoods('A', rows[0])).ok, false); assert.equal(h.purchases.length, 0);
+    assert.equal(h.requests.length, 2, 'classification must not add hidden catalog or game requests');
+  } finally { h.dispose(); }
+});
+
+test('legacy forage DTO and historical unknown are classified safely and no seed-tab alias can replay the same SKU', async () => {
+  const forage = { ...decorationDto(), id: 2129, itemId: 20040, name: '牧草种子', price: 20 };
+  const h = shopStoreHarness(async () => ({ data: { ...decorationResponse().data, data: [forage] } }),
+    async () => ({ data: { ok: false, error: 'old outcome unconfirmed', sent: true, resultState: 'unknown', outcomeUnknown: true } }));
+  try {
+    await h.store.fetchDecorations('A');
+    assert.equal(h.store.displayDecorations.length, 0); assert.equal(h.store.displaySeeds[0].currencyKnown, false);
+    // Model a former, already-confirmed UI snapshot. The alias must still use the
+    // same protected API and key, not the legacy generic purchase endpoint.
+    await h.store.buySeedGoods('A', forage);
+    assert.equal(h.purchases.length, 1); assert.equal(h.purchases[0].url, '/api/shop/decoration/buy');
+    assert.equal(h.purchases[0].body.goodsId, 2129);
+    await h.store.fetchDecorations('A');
+    assert.equal(h.store.displaySeeds[0].resultUnknown, true);
+    assert.equal(h.store.displaySeeds[0].availability, 'unknown');
+    h.selected.value = 'B'; h.selected.value = 'A'; await h.store.fetchDecorations('A');
+    await h.store.buySeedGoods('A', forage);
+    assert.equal(h.purchases.length, 1); assert.equal(h.store.displaySeeds[0].resultUnknown, true);
+  } finally { h.dispose(); }
+});
+
+test('seed card and availability distinguish listed-but-unverified billing from unlisted or historical-unknown offers', async () => {
+  const availability = frontendHarness().load('composables/shop/useShopAvailability.ts').createShopAvailability({
+    currentLevel: () => 109, currentGold: () => 100, currentCoupon: () => 100, userGoldBean: () => 100 });
+  const item = { id: 2129, itemId: 20040, name: '牧草种子', isForage: true, shopId: 4, price: 20, priceKnown: true,
+    currencyKnown: false, catalogOnly: false, unlocked: true, canBuy: false, harvestKnown: false, availability: 'unverified' };
+  assert.equal(availability.getSeedStatusLabel(item), '信息待确认');
+  assert.equal(availability.canAffordGoods(item), false);
+  assert.match(availability.getSeedHint(item), /已列出|币种/);
+  assert.equal(availability.getSeedStatusLabel({ ...item, resultUnknown: true }), '结果待核对');
+  assert.match(availability.getSeedHint({ ...item, resultUnknown: true }), /背包/);
+  const html = await renderComponent('components/shop/SeedGoodsCard.vue', { currentLevel: 109, canAfford: true,
+    statusLabel: availability.getSeedStatusLabel(item), hint: availability.getSeedHint(item), item });
+  assert.match(html, /币种待确认/); assert.match(html, /种植后可收获牧草/); assert.match(html, /disabled/);
+  assert.doesNotMatch(html, /金豆豆|金币|牧场饲料作物|每季经验 0/);
+});
+
+function shopConfirmHarness() {
+  const script = read('views/Shop.vue').split('<script setup lang="ts">')[1].split('</script>')[0];
+  const sf = ts.createSourceFile('Shop.ts', script, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const names = new Set(['openConfirm', 'runConfirmedAction', 'closeQuantityModal', 'openQuantityModal', 'runQuantityPurchase', 'getShopMaxQuantity', 'buyDecoration']);
+  const functions = sf.statements.filter(node => ts.isFunctionDeclaration(node) && names.has(node.name?.text)).map(node => node.getText(sf)).join('\n');
+  const accountWatch = sf.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
+    && node.expression.expression.getText(sf) === 'watch' && node.expression.arguments[0]?.getText(sf) === 'currentAccountId').getText(sf);
+  const currentAccountId = vue.ref('A'), quantityModal = vue.ref({ show: false, item: null, mode: 'shop', accountId: '', epoch: 0 }), pendingAction = vue.ref(null), showConfirm = vue.ref(false), confirmLoading = vue.ref(false);
+  const feedback = [], purchases = [], refreshes = [], gate = deferred(), module = { exports: {} };
+  const code = `let shopUiEpoch=0;\n${functions}\nconst stop=${accountWatch}\nmodule.exports={openConfirm,runConfirmedAction,openQuantityModal,runQuantityPurchase,buyDecoration,stop}`;
+  vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
+    { module, watch: vue.watch, currentAccountId, quantityModal, pendingAction, showConfirm, confirmLoading,
+      confirmTitle: vue.ref(''), confirmMessage: vue.ref(''),
+      toast: { success: message => feedback.push(message), error: message => feedback.push(message) },
+      shopStore: { clearShopData() {}, refreshAll: async accountId => { refreshes.push(accountId); }, buyDecorationGoods: async (...args) => { purchases.push(args); return gate.promise; } },
+      refreshAll: async () => { refreshes.push(currentAccountId.value); }, refreshMysteryAutoBuyStatus() {},
+      buyGoods: async (...args) => { purchases.push(args); }, buyMallGoods: async (...args) => { purchases.push(args); },
+    });
+  return { ...module.exports, currentAccountId, quantityModal, pendingAction, showConfirm, feedback, purchases, refreshes, gate };
+}
+
+test('actual shop confirmation and quantity handlers cancel A-B-A stale intents before any purchase', async () => {
+  const h = shopConfirmHarness();
+  try {
+    h.openConfirm('购买', '商品', async () => h.purchases.push('must not run'));
+    const oldAction = h.pendingAction.value;
+    h.currentAccountId.value = 'B'; h.currentAccountId.value = 'A';
+    assert.equal(h.showConfirm.value, false); await oldAction(); assert.equal(h.purchases.length, 0);
+    h.openQuantityModal({ id: 991, name: '牧草种子', price: 20, canBuy: true }, 'shop', '金币', 100);
+    const oldQuantity = { ...h.quantityModal.value };
+    h.currentAccountId.value = 'B'; h.currentAccountId.value = 'A';
+    assert.equal(h.quantityModal.value.show, false);
+    h.quantityModal.value = oldQuantity; await h.runQuantityPurchase(1); assert.equal(h.purchases.length, 0);
+    h.openQuantityModal({ id: null, name: '牧草种子', price: null, catalogOnly: true, canBuy: false }, 'shop', '金币', 100);
+    assert.equal(h.purchases.length, 0);
+  } finally { h.stop(); }
+});
+
+test('actual shop late decoration purchase reply cannot toast or refresh the newly selected account', async () => {
+  const h = shopConfirmHarness();
+  try {
+    const work = h.buyDecoration(decorationDto(), 'A'); assert.equal(h.purchases.length, 1);
+    h.currentAccountId.value = 'B'; h.currentAccountId.value = 'A';
+    const reads = h.refreshes.length;
+    h.gate.resolve({ ok: true }); await work;
+    assert.equal(h.feedback.length, 0); assert.equal(h.refreshes.length, reads);
+  } finally { h.stop(); }
+});
+
 test('theme startup has a single definition/sync and preserves the eight existing themes', () => {
   assert.doesNotMatch(read('main.ts'), /const themes\s*[:=]|setProperty\('--theme-/);
   assert.equal((read('main.ts').match(/fetchTheme\(/g) || []).length, 1);
@@ -310,8 +1516,10 @@ test('unconfirmed first write and changed account cannot continue stages or masq
   finally { uncertain.dispose(); }
   const first = deferred(), h = settingsSaveHarness(async () => first.promise);
   try {
+    h.payload.automation = { ranch: true, ranch_harvest: true, ranch_friend_mosquito: false, ranch_check_minutes: 30 };
     const result = h.store.saveSettings('A', h.payload); h.selected.value = 'B'; h.selected.value = 'A';
     first.resolve({ data: { ok: true } }); assert.equal((await result).outcomeUnknown, true);
+    assert.equal(h.calls[0][3].headers['x-account-id'], 'A');
     assert.equal(h.calls.length, 1, 'later automation stage sent after A-B-A'); assert.equal(h.store.mutationStates.A, 'unknown');
   } finally { h.dispose(); }
 });
@@ -409,6 +1617,131 @@ test('real settings preserves a same-instance draft registry, isolates save sect
   for (const action of ['select', 'toggle', 'settings', 'delete']) assert.match(account, new RegExp(`@click\\.stop="emit\\('${action}'`));
 });
 
+test('ranch automation dialog keeps all switches in a bounded scroll body and its completion control outside', async () => {
+  const source = read('components/settings/AutomationSettingsTab.vue');
+  const dialog = source.slice(source.indexOf('<!-- 分类设置弹窗 -->'), source.indexOf('<!-- 香囊优先赠送好友选择弹窗 -->'));
+  const ranch = dialog.slice(dialog.indexOf("displayedCategory === 'ranch'"), dialog.indexOf("displayedCategory === 'activity'"));
+  assert.match(dialog, /class="[^\"]*\bcategory-dialog\b[^\"]*\bmin-w-0\b/);
+  assert.match(source, /\.category-dialog\s*\{[^}]*max-height:\s*88dvh/);
+  assert.match(dialog, /<div class="flex shrink-0 items-center justify-between/);
+  assert.match(dialog, /<div class="[^\"]*\bmin-h-0\b[^\"]*\boverflow-y-auto\b[^\"]*">\s*<fieldset class="[^\"]*\bmin-w-0\b[^\"]*" :disabled="saving \|\| !activeCategory">/);
+  assert.match(dialog, /<\/fieldset>\s*<\/div>\s*<div class="flex shrink-0 justify-end[^>]*>\s*<BaseButton[^>]*@click="closeCategory">完成<\/BaseButton>/);
+  assert.doesNotMatch(ranch, /scene[12]/);
+  assert.match(ranch, /<SettingToggle v-model="settings\.automation\.ranch"/);
+  assert.match(ranch, /<SettingToggle v-for="group in ranchQuickGroups"[^>]*@update:model-value="\(value: boolean\) => setRanchGroup\(group, value\)"/);
+  assert.match(ranch, /好友牧场互动（可选）/);
+  assert.match(ranch, /购买与补给设置/);
+  assert.doesNotMatch(ranch, /v-model\.number="settings\.automation\.ranch_check_minutes"/);
+  assert.match(ranch, /巡查间隔跟随农场设置/);
+  assert.match(ranch, /仅偷取指定好友（与农场共用）/);
+  assert.match(ranch, /stealPickerVisible = true/);
+  assert.match(ranch, /badPickerVisible = true/);
+  assert.match(ranch, /<SettingToggle v-for="group in ranchQuickGroups"[^>]*:disabled="!settings\.automation\.ranch"/);
+  assert.match(ranch, /<SettingToggle v-for="toggle in ranchOptionalToggles"[^>]*:disabled="!settings\.automation\.ranch"/);
+  assert.ok((ranch.match(/:disabled="!settings\.automation\.ranch"/g) || []).length >= 6, '主开关关闭时全部可编辑的自动化选项均需原生禁用');
+  const categoryCode = source.slice(source.indexOf('const ranchToggles ='), source.indexOf('const rainPoemToggles ='))
+    + source.slice(source.indexOf('const categoryToggleKeys:'), source.indexOf('</script>'));
+  const settings = vue.ref({ automation: { ranch: true, ranch_harvest: true, ranch_check_minutes: 30 } });
+  const counts = vm.runInNewContext(ts.transpileModule(categoryCode + '\n({ categoryToggleList, categoryEnabledCount, ranchQuickGroups, ranchGroupEnabled, setRanchGroup, ranchOptionalToggles, ranchFriendToggles })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, { settings });
+  assert.equal(counts.categoryToggleList('ranch').length, 10, '卡片摘要展示4组、升级/库存和3项补购选项');
+  assert.equal(counts.categoryEnabledCount('ranch'), 1, '部分开启的常用组不冒充整组开启');
+  const care = counts.ranchQuickGroups.find(group => group.key === 'ranch_group_care');
+  assert.equal(counts.ranchGroupEnabled(care), false);
+  counts.setRanchGroup(care, true);
+  assert.equal(counts.ranchGroupEnabled(care), true);
+  assert.equal(JSON.stringify(care.keys.map(key => settings.value.automation[key])), '[true,true,true,true,true]');
+  counts.setRanchGroup(care, false);
+  assert.ok(care.keys.every(key => settings.value.automation[key] === false));
+  assert.equal(counts.ranchOptionalToggles.length, 3);
+  assert.equal(counts.ranchFriendToggles.length, 4);
+  assert.ok(!counts.categoryToggleList('ranch').includes('ranch_check_minutes'), '分钟字段不是布尔开关');
+  const entries = source.match(/const ranchToggles = \[([\s\S]*?)\n\]/)[1];
+  assert.deepEqual(Array.from(entries.matchAll(/key: '(ranch_\w+)'/g), match => match[1]), [
+    'ranch_harvest', 'ranch_produce', 'ranch_clean', 'ranch_sell', 'ranch_grass', 'ranch_grass_buy',
+    'ranch_feed_normal', 'ranch_feed_organic', 'ranch_fill_cans', 'ranch_complete_upgrade', 'ranch_place', 'ranch_cub_buy',
+    'ranch_daily_tasks_claim', 'ranch_growth_tasks_claim', 'ranch_daily_share_claim', 'ranch_activity_claim',
+    'ranch_friend_steal', 'ranch_friend_clean', 'ranch_friend_stroke', 'ranch_friend_mosquito',
+  ]);
+  const label = entries.match(/key: 'ranch_place', label: '([^']+)'/)[1];
+  const html = await renderComponent('components/settings/SettingToggle.vue', { label, modelValue: true });
+  assert.match(html, /ui-subtle-panel box-border flex w-full max-w-full min-w-0 items-center/);
+  assert.match(html, /class="min-w-0 flex-1 \[overflow-wrap:anywhere\]"/);
+  assert.doesNotMatch(html, /\btruncate\b/);
+  assert.match(html, /class="base-switch-field shrink-0"/);
+  assert.ok(html.includes(`aria-label="${label}"`));
+});
+
+test('牧场自动化：21个布尔开关默认关闭，任务、分享与活动领取独立授权', async () => {
+  const source = read('components/settings/AutomationSettingsTab.vue');
+  const storeSource = fs.readFileSync(path.join(__dirname, '../src/models/store.js'), 'utf8');
+  const defaults = vm.runInNewContext('({' + storeSource.match(/    ranch: false,[\s\S]*?\n    ranch_check_minutes: \d+/)[0] + '\n})');
+  const entries = source.match(/const ranchToggles = \[([\s\S]*?)\n\]/)[1];
+  const keys = ['ranch', ...Array.from(entries.matchAll(/key: '(ranch_\w+)'/g), match => match[1])];
+  const booleanKeys = Object.keys(defaults).filter(key => typeof defaults[key] === 'boolean');
+  assert.equal(booleanKeys.length, 21);
+  assert.deepEqual(booleanKeys, keys, '默认布尔列表与前端开关列表必须一致');
+  for (const key of keys) assert.equal(defaults[key], false, key);
+  assert.equal(defaults.ranch_check_minutes, 30, '保留原有分钟默认值');
+  assert.match(source, /ranch_cub_buy: boolean/);
+  const settings = vue.ref({ automation: { ...defaults } });
+  const code = source.slice(source.indexOf('const ranchToggles ='), source.indexOf('const rainPoemToggles ='))
+    + source.slice(source.indexOf('const categoryToggleKeys:'), source.indexOf('</script>'));
+  const counts = vm.runInNewContext(ts.transpileModule(code + '\n({ categoryEnabledCount })',
+    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, { settings });
+  assert.equal(counts.categoryEnabledCount('ranch'), 0);
+  settings.value.automation.ranch_place = true;
+  assert.equal(settings.value.automation.ranch_cub_buy, false, '库存补栏不能连带授权购买');
+  assert.equal(counts.categoryEnabledCount('ranch'), 1);
+  settings.value.automation.ranch_cub_buy = true;
+  assert.equal(counts.categoryEnabledCount('ranch'), 2);
+  settings.value.automation.ranch_cub_buy = false;
+  assert.equal(settings.value.automation.ranch_place, true, '关闭补购不应关闭库存补栏');
+  assert.equal(counts.categoryEnabledCount('ranch'), 1);
+  const label = entries.match(/key: 'ranch_cub_buy', label: '([^']+)'/)[1];
+  assert.equal(label, '库存不足时用金券购买普通幼崽');
+  const toggleHtml = await renderComponent('components/settings/SettingToggle.vue', { label, modelValue: false });
+  assert.ok(toggleHtml.includes(`aria-label="${label}"`));
+  assert.match(toggleHtml, /aria-checked="false"/);
+  assert.doesNotMatch(toggleHtml, /<input[^>]*\schecked(?:\s|=|>)/);
+  const bag = await ranchPageFixture('personal', 'bag');
+  assert.equal(bag.calls.length, 0, '展示帮助文案不得触发额外请求');
+  assert.match(bag.html, /<details[^>]*><summary[^>]*>自动补栏规则/);
+  assert.doesNotMatch(bag.html, /shop5|ranch_place|后台轮询/);
+  const note = source.match(/<p class="category-dialog__note[^>]*>([^<]+)<\/p>/)[1];
+  for (const help of [`${note} ${bag.html}`]) {
+    for (const rule of ['默认关闭', '需同时开启库存补栏',
+      '单价不超过1080金券', '每轮最多3只', '保留10000金券', '不使用钻石、点券', '不购买或消耗巨大幼崽']) {
+      assert.ok(help.includes(rule), `缺少安全提示：${rule}`);
+    }
+  }
+});
+
+test('牧场自动化设置按需读取共用好友名单，切号关闭旧弹窗且不额外读取', () => {
+  const source = read('components/settings/AutomationSettingsTab.vue');
+  const code = 'let nowTimer = null;\n' + source.slice(source.indexOf('function ensureFriends()'), source.indexOf('// 活动控制分类的介绍文案'));
+  const props = vue.reactive({ currentAccountId: 'A', saving: false }), mounted = [], stops = [];
+  const qixiPickerVisible = vue.ref(false), badPickerVisible = vue.ref(false), stealPickerVisible = vue.ref(false), friendSearch = vue.ref('旧查询');
+  let reads = 0;
+  const scope = vue.effectScope();
+  try {
+    const result = scope.run(() => vm.runInNewContext(ts.transpileModule(code + '\n({ openCategory, activeCategory, displayedCategory })',
+      { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText,
+      { ref: vue.ref, watch: (...args) => { const stop = vue.watch(...args); stops.push(stop); return stop; }, props,
+        qixiPickerVisible, badPickerVisible, stealPickerVisible, friendSearch, nowMs: vue.ref(0),
+        friendStore: { friends: [], loading: false, fetchFriends(id) { assert.equal(id, 'A'); reads++; } },
+        onMounted: fn => mounted.push(fn), onUnmounted() {}, overlayMotion: { dispose() {} },
+        window: { setInterval: () => 1, clearInterval() {} } }));
+    mounted[0](); result.openCategory('ranch'); assert.equal(reads, 0, '打开分类及其动画不能预读隐藏好友名单');
+    stealPickerVisible.value = true; assert.equal(reads, 1);
+    props.currentAccountId = 'B';
+    assert.equal(result.activeCategory.value, null); assert.equal(result.displayedCategory.value, null);
+    assert.equal(stealPickerVisible.value, false); assert.equal(badPickerVisible.value, false); assert.equal(qixiPickerVisible.value, false);
+    assert.equal(friendSearch.value, ''); assert.equal(reads, 1);
+    props.currentAccountId = 'A'; assert.equal(reads, 1, 'A-B-A返回不能自动恢复旧名单弹窗');
+  } finally { for (const stop of stops) stop(); scope.stop(); }
+});
+
 test('real form inputs forward native constraints and key events to actual controls with accessible hints', async () => {
   const html = await renderComponent('components/ui/BaseInput.vue', { type: 'number', modelValue: 0, min: 0, max: 1440, step: 1, required: true,
     id: 'delay-value', name: 'delay', label: '延迟', hint: '分钟', class: 'w-40' });
@@ -479,7 +1812,9 @@ test('real confirmation dialog uses native modal semantics, safe initial focus a
 test('page motion uses ephemeral painted continuity, keeps one real page and has no developer-facing copy', () => {
   const layout = read('layouts/DefaultLayout.vue');
   assert.match(layout, /:key="route.path" class="page-view/);
-  assert.doesNotMatch(layout, /mode="out-in"|<KeepAlive|<Transition/);
+  assert.doesNotMatch(layout, /mode="out-in"|<KeepAlive/);
+  assert.doesNotMatch(layout.slice(layout.indexOf('ref="pageViewport"'), layout.indexOf('</main>')), /<Transition|<KeepAlive/);
+  assert.match(layout, /<Transition name="workspace-travel">/);
   assert.match(layout, /router.beforeResolve/);
   assert.match(layout, /releaseGuard\(\)[\s\S]*return paint/);
   const personal = read('views/Personal.vue');
@@ -505,7 +1840,7 @@ test('page motion uses ephemeral painted continuity, keeps one real page and has
 test('anonymous local viewing requires an explicit build and exact loopback origin, never a production/query auth switch', () => {
   const api = frontendHarness().load('config/localReadonly.ts');
   assert.equal(api.allowsLocalReadonly(true, 'http://127.0.0.1:4177/personal'), true);
-  for (const url of ['http://127.0.0.1:3007/personal', 'http://localhost:4177/', 'https://farm.example/personal?readonly=1', 'http://192.0.2.1:3007/'])
+  for (const url of ['http://127.0.0.1:3007/personal', 'http://localhost:4177/', 'https://farm.example/personal?readonly=1', 'http://20.222.178.208:3007/'])
     assert.equal(api.allowsLocalReadonly(true, url), false, url);
   assert.equal(api.allowsLocalReadonly(false, 'http://127.0.0.1:4177/'), false);
   assert.match(read('main.ts'), /if \(LOCAL_UI_READONLY\)[\s\S]*current_account_id/);
@@ -821,6 +2156,71 @@ test('bag unknown write remains blocked across component remount and account swi
     assert.equal(again.outcomeUnknown, true); assert.equal(writes, 1);
   } finally { h.dispose(); }
 });
+test('bag custom/all quantity is a positive integer bounded by the selected unlocked instance; fireworks remain single use', () => {
+  const rules = frontendHarness().load('utils/operation-result.ts');
+  const item = { id: 101619, count: 7, uid: '9007199254740993', locked: false };
+  for (const amount of [1, 3, '7']) {
+    const checked = rules.validateItemUseQuantity(item, amount);
+    assert.equal(checked.error, ''); assert.equal(checked.count, Number(amount)); assert.equal(checked.limit, 7);
+  }
+  for (const amount of [0, -1, 1.5, '', null, true, '1e2', '2.1', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, 8]) {
+    const checked = rules.validateItemUseQuantity(item, amount);
+    assert.equal(checked.count, 0, String(amount)); assert.ok(checked.error, String(amount));
+  }
+  for (const locked of [true, 1, '1']) assert.equal(rules.itemUseLimit({ ...item, locked }), 0);
+  assert.equal(rules.itemUseLimit(null), 0);
+  assert.equal(rules.itemUseLimit({ ...item, count: '9007199254740993' }), 0);
+  const firework = { ...item, id: 6001, count: 99 };
+  assert.equal(rules.itemUseLimit(firework), 1);
+  assert.match(rules.validateItemUseQuantity(firework, 2).error, /一枚/);
+});
+test('bag custom quantity submits one exact count and UID, freezes the pending request and confirms the returned amount', async () => {
+  const pending = deferred(), calls = [];
+  const h = dataStoreHarness('stores/bag.ts', async () => bagReply(), async (url, body, options) => {
+    calls.push({ url, body: JSON.parse(JSON.stringify(body)), options }); return pending.promise;
+  });
+  try {
+    const first = h.store.useItem('A', 101619, 7, '9007199254740993');
+    const repeated = h.store.useItem('A', 101619, 3, '9007199254740993');
+    assert.equal(calls.length, 1); assert.equal(calls[0].body.count, 7);
+    assert.equal(calls[0].body.uid, '9007199254740993'); assert.equal(calls[0].options.headers['x-account-id'], 'A');
+    assert.equal(await h.store.fetchBag('A'), false);
+    pending.resolve({ data: { ok: true, data: { resultState: 'completed', usedItemId: 101619, usedCount: 7, rewards: [{ id: 700001, count: 7 }] } } });
+    assert.equal((await first).ok, true); assert.equal((await repeated).data.usedCount, 7);
+    assert.equal(h.store.mutationStates.A, 'idle');
+  } finally { h.dispose(); }
+});
+test('bag invalid quantity or unsafe UID refuses before HTTP, partial use reply locks the account without retrying a smaller amount', async () => {
+  let writes = 0;
+  const h = dataStoreHarness('stores/bag.ts', async () => bagReply(), async () => {
+    writes++; return { data: { ok: true, data: { resultState: 'completed', usedCount: 1 } } };
+  });
+  try {
+    for (const amount of [0, -1, 1.5, true, null, '', NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      const result = await h.store.useItem('A', 101619, amount, '11'); assert.equal(result.sent, false);
+    }
+    assert.equal((await h.store.useItem('A', 101619, 1, Number.MAX_SAFE_INTEGER + 1)).sent, false);
+    assert.equal(writes, 0);
+    const result = await h.store.useItem('A', 101619, 5, '11');
+    assert.equal(result.ok, false); assert.equal(result.outcomeUnknown, true);
+    h.selected.value = 'B'; h.selected.value = 'A';
+    assert.equal((await h.store.useItem('A', 101619, 1, '11')).outcomeUnknown, true);
+    assert.equal(writes, 1);
+  } finally { h.dispose(); }
+});
+test('real quantity dialog exposes custom/all controls, disables invalid confirmation and never stores quantities or changes the single-use contract', async () => {
+  const source = read('components/BagPanel.vue');
+  assert.match(source, /全部使用/); assert.match(source, /自定义使用数量/);
+  assert.match(source, /handleUseClick\(item, itemUseLimit\(item\)\)/);
+  assert.match(source, /requestedUse!\.count, action\.item\.uid/);
+  assert.match(source, /:confirm-disabled="dialogAction\?\.action === 'use' && !!useValidation\.error"/);
+  assert.doesNotMatch(source, /bagStore\.useItem\([^\n]+, 1, action\.item\.uid\)/);
+  const descriptor = compiler.parse(source, { filename: 'BagPanel.vue' });
+  assert.equal(descriptor.errors.length, 0); compiler.compileScript(descriptor.descriptor, { id: 'bag-quantity', inlineTemplate: true });
+  const html = await renderComponent('components/ConfirmModal.vue', { show: true, confirmDisabled: true });
+  assert.match(html, /确认操作/); assert.match(html, /disabled/);
+  assert.match(read('components/ConfirmModal.vue'), /props\.confirmDisabled/);
+});
 test('result presentation does not label zero-op or unknown as success, sale gains come only from actual get_items', () => {
   const result = frontendHarness().load('utils/operation-result.ts');
   assert.equal(result.feedbackForResult({ ok: true, count: 0, message: '没有可捣乱土地' }, 'fallback').state, 'info');
@@ -958,6 +2358,23 @@ test('account status metadata ignores delayed A-B-A HTTP success and errors with
   const h = accountStatusHarness(async () => { throw { response: { data: { error: '当前接口失败' } } }; });
   try { await h.store.fetchStatus('A'); assert.equal(h.store.error, '当前接口失败'); assert.equal(h.store.statusMetadata, null); }
   finally { h.dispose(); }
+});
+
+test('牧场运行状态接口：HTTP与WS保留真实调度字段，切号不沿用旧账号状态', async () => {
+  const routine = { enabled: true, running: false, nextCheckAt: 123456, lastStartedAt: 120000,
+    lastFinishedAt: 121000, lastResult: 'error', lastError: '真实巡查异常', farmMin: 2, farmMax: 5 };
+  const h = accountStatusHarness(async () => ({ data: { ok: true, accountId: 'A', data: { ranchAutomation: routine } } }));
+  try {
+    await h.store.fetchStatus('A');
+    assert.deepEqual(JSON.parse(JSON.stringify(h.store.status.ranchAutomation)), routine);
+    assert.equal(h.store.statusAccountId, 'A'); assert.equal(h.requests.length, 1);
+    h.store.connectRealtime('A');
+    h.handlers.get('status:update')({ accountId: 'A', status: { ranchAutomation: { ...routine, nextCheckAt: 234567, lastResult: 'yielded' } } });
+    assert.equal(h.store.status.ranchAutomation.nextCheckAt, 234567); assert.equal(h.requests.length, 1);
+    h.selected.value = 'B'; assert.equal(h.store.currentStatusReady, false); assert.equal(h.store.status, null);
+    h.handlers.get('status:update')({ accountId: 'A', status: { ranchAutomation: routine } });
+    assert.equal(h.store.status, null);
+  } finally { h.dispose(); }
 });
 
 test('account status WS metadata latches interruption until a valid current snapshot and never crosses accounts', () => {
@@ -1928,7 +3345,7 @@ test('Edge 本轮设置验收：键盘弹层、内存草稿与账号独立操作
     await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
     await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
     await send('Page.navigate', { url: 'http://127.0.0.1:4177/settings?tab=account&v=settings-20261114' });
-    await evaluate(String.raw`(async()=>{for(let i=0;i<160&&!document.querySelector('.settings-page');i++)await new Promise(r=>requestAnimationFrame(r));if(!document.querySelector('.settings-page'))throw Error('Real settings did not mount');window.__verifyFrame=()=>new Promise(r=>requestAnimationFrame(r));window.__verifyWait=async f=>{for(let i=0;i<240&&!f();i++)await window.__verifyFrame();if(!f())throw Error('verification wait failed')};window.__verifyIdle=()=>window.__verifyWait(()=>!document.documentElement.dataset.contentMotion)})()`);
+    await evaluate(String.raw`(async()=>{for(let i=0;i<160&&!document.querySelector('.settings-page');i++)await new Promise(r=>requestAnimationFrame(r));if(!document.querySelector('.settings-page'))throw Error('Real settings did not mount: '+JSON.stringify({href:location.href,title:document.title,body:document.body?.innerText.slice(0,500),html:document.querySelector('#app')?.innerHTML.slice(0,800),errors}));window.__verifyFrame=()=>new Promise(r=>requestAnimationFrame(r));window.__verifyWait=async f=>{for(let i=0;i<240&&!f();i++)await window.__verifyFrame();if(!f())throw Error('verification wait failed')};window.__verifyIdle=()=>window.__verifyWait(()=>!document.documentElement.dataset.contentMotion)})()`);
     report.realReadonly = await evaluate(String.raw`(()=>({noAccount:!localStorage.getItem('admin_token')&&!localStorage.getItem('current_account_id')&&!localStorage.getItem('user_info'),tabs:[...document.querySelectorAll('.settings-tab')].map(e=>({label:e.textContent.trim(),role:e.getAttribute('role')})),noFakeAccounts:document.querySelectorAll('.account-card').length===0}))()`);
     assert.equal(report.realReadonly.noAccount, true); assert.equal(report.realReadonly.noFakeAccounts, true); assert.equal(report.realReadonly.tabs.length, 5);
     for (const theme of ['light-green', 'dark-purple']) {
@@ -1975,6 +3392,23 @@ test('Edge 本轮设置验收：键盘弹层、内存草稿与账号独立操作
       if(!reopened||reopened.closest('.fixed').inert)throw Error('Reopened automation did not restore controls');reopened.querySelector('[aria-label="关闭"]').click();await window.__fixtureWait(()=>!reopened.isConnected);
       return{realComponent:true,exitMs:150,contentPreserved:true,staleControlsInert:true,reopenUsable:true}
     })()`);
+    await evaluate(String.raw`(async()=>{const v=window.__settingsVerification,opener=[...document.querySelectorAll('.auto-card')].find(e=>e.textContent.includes('牧场自动化'));if(!opener)throw Error('Ranch automation category missing');opener.click();await window.__fixtureWait(()=>document.querySelector('.category-dialog__body'));})()`);
+    report.ranchAutomationLayout = await evaluate(String.raw`(()=>{const panel=document.querySelector('.category-dialog'),body=panel?.querySelector('.category-dialog__body');if(!panel||!body)throw Error('Ranch automation dialog missing');const bounds=e=>{const r=e.getBoundingClientRect();return{left:r.left,right:r.right,width:r.width,scrollWidth:e.scrollWidth,clientWidth:e.clientWidth}};const cards=[...body.querySelectorAll('.ui-subtle-panel')],note=body.querySelector('.category-dialog__note');return{panel:bounds(panel),body:bounds(body),cards:cards.map(bounds),note:note&&bounds(note),horizontalOverflow:body.scrollWidth>body.clientWidth+1,allCardsInside:cards.every(e=>e.getBoundingClientRect().left>=panel.getBoundingClientRect().left-1&&e.getBoundingClientRect().right<=panel.getBoundingClientRect().right+1),noteInside:!!note&&note.getBoundingClientRect().right<=panel.getBoundingClientRect().right+1}})()`);
+    assert.equal(report.ranchAutomationLayout.horizontalOverflow,false,JSON.stringify(report.ranchAutomationLayout));
+    assert.equal(report.ranchAutomationLayout.allCardsInside,true,JSON.stringify(report.ranchAutomationLayout));
+    assert.equal(report.ranchAutomationLayout.noteInside,true,JSON.stringify(report.ranchAutomationLayout));
+    await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false}).then(({data})=>{const file=path.join(directory,'ranch-automation-desktop.png');fs.writeFileSync(file,Buffer.from(data,'base64'));report.screenshots.push(file)});
+    await send('Emulation.setDeviceMetricsOverride',{width:375,height:900,deviceScaleFactor:1,mobile:false});
+    report.ranchAutomationMobile = await evaluate(String.raw`(()=>{const panel=document.querySelector('.category-dialog'),body=panel?.querySelector('.category-dialog__body');if(!panel||!body)throw Error('Mobile ranch automation dialog missing');const cards=[...body.querySelectorAll('.ui-subtle-panel')],right=panel.getBoundingClientRect().right;return{viewport:innerWidth,documentWidth:document.documentElement.scrollWidth,panelWidth:panel.getBoundingClientRect().width,bodyWidth:body.clientWidth,bodyScrollWidth:body.scrollWidth,cardCount:cards.length,allCardsInside:cards.every(e=>e.getBoundingClientRect().right<=right+1),horizontalOverflow:body.scrollWidth>body.clientWidth+1}})()`);
+    assert.ok(report.ranchAutomationMobile.documentWidth<=375,JSON.stringify(report.ranchAutomationMobile));
+    assert.equal(report.ranchAutomationMobile.horizontalOverflow,false,JSON.stringify(report.ranchAutomationMobile));
+    assert.equal(report.ranchAutomationMobile.allCardsInside,true,JSON.stringify(report.ranchAutomationMobile));
+    assert.equal(report.ranchAutomationMobile.cardCount,16,JSON.stringify(report.ranchAutomationMobile));
+    report.ranchAutomationScroll = await evaluate(String.raw`(async()=>{const panel=document.querySelector('.category-dialog'),body=panel?.querySelector('.category-dialog__body'),footer=panel?.querySelector('.flex.shrink-0.justify-end');body.scrollTop=body.scrollHeight;await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));const cards=[...body.querySelectorAll('.ui-subtle-panel')],last=cards.at(-1),br=body.getBoundingClientRect(),lr=last.getBoundingClientRect(),fr=footer.getBoundingClientRect();return{scrollTop:body.scrollTop,scrollHeight:body.scrollHeight,clientHeight:body.clientHeight,lastCardFullyVisible:lr.top>=br.top-1&&lr.bottom<=br.bottom+1,footerVisible:fr.top>=panel.getBoundingClientRect().top&&fr.bottom<=panel.getBoundingClientRect().bottom,lastCardFooterSeparated:lr.bottom<=fr.top+1}})()`);
+    assert.ok(report.ranchAutomationScroll.lastCardFullyVisible,JSON.stringify(report.ranchAutomationScroll));
+    assert.ok(report.ranchAutomationScroll.footerVisible,JSON.stringify(report.ranchAutomationScroll));
+    assert.ok(report.ranchAutomationScroll.lastCardFooterSeparated,JSON.stringify(report.ranchAutomationScroll));
+    await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:false}).then(({data})=>{const file=path.join(directory,'ranch-automation-mobile-bottom.png');fs.writeFileSync(file,Buffer.from(data,'base64'));report.screenshots.push(file)});
     report.polish = await evaluate(String.raw`(async()=>{
       const m=window.__motionVerification,s=m.motionState;const frame=()=>new Promise(r=>requestAnimationFrame(r));
       s.show=true;await window.__fixtureTick();const modal=[...document.querySelectorAll('dialog')].find(e=>e.textContent.includes('离线视觉验收'));if(!modal?.matches(':modal'))throw Error('Modal lost native semantics');
@@ -2129,6 +3563,489 @@ async function edgeRealtimeReport(browser, url, width, reduced) {
     await browser.send('Target.closeTarget', { targetId });
   }
 }
+
+function ranchVisualFixtures() {
+  const root = path.resolve(web, '../core/src/gameConfig/ranch');
+  const config = name => JSON.parse(fs.readFileSync(path.join(root, name + '.json'), 'utf8'));
+  const manifest = config('image-manifest'), items = new Map(config('MCItemInfo').map(row => [String(row.id), row]));
+  const facilities = new Map(config('MCFacilityConfig').map(row => [String(row.facility_id), row]));
+  const now = Date.now(), sourceCommit = '6ac7a3d7930018058d201af86beea8de6a9f8507';
+  const reward = (id, count = '1') => ({ id: String(id), count, name: items.get(String(id))?.name || `物品 ${id}`, image: manifest.items[String(id)]?.url || '' });
+  const base = { readOnly: true, sceneId: 2, ownerGid: '700000001', observedAt: now, serverTimeMs: now,
+    dateKey: new Date(now).toLocaleDateString('en-CA'), sourceCommit, cache: { hit: true, receivedAt: now } };
+  const animal = (id, instanceId, giant = false) => ({ instanceId, animalId: String(id), slot: instanceId,
+    name: `${giant ? '巨大' : ''}${items.get(String(id))?.name || '动物'}`, image: giant ? '' : manifest.items[String(id)]?.url || '',
+    imageRole: '官方幼崽道具图标，不是当前阶段立绘', stage: 2, stageName: '成长中', produceCount: 1, maxProduceCount: 3,
+    limitedCanUsed: true, canHarvest: false, canProduce: true, canFeed: true, canRelease: true, grassBlocked: false,
+    producing: true, nextAtMs: now + 3600000, expectedHarvest: { exp: '80', items: [reward(1060001, '2')] },
+    expectedProduce: { exp: '40', items: [reward(2060001)] }, mutation: giant ? { type: 1, tier: 2, weightX10: 1124, strokable: true } : null });
+  const pen = (id, facilityId, animals) => ({ id, facilityId,
+    moduleType: facilities.get(String(facilityId)).module_type === 'MODULE_TYPE_RANCH_COOP' ? 6 : 7,
+    name: facilities.get(String(facilityId)).name, image: manifest.facilities[String(facilityId)]?.url || '',
+    level: facilities.get(String(facilityId)).level, capacity: facilities.get(String(facilityId)).capacity, state: 0, upgradeState: 0,
+    upgradeEndAtMs: null, nextUpgrade: null, position: { x: 1, y: 2 }, feedMachine: null,
+    ranch: { id, husbandryType: facilities.get(String(facilityId)).module_type === 'MODULE_TYPE_RANCH_COOP' ? 1 : 2,
+      capacity: facilities.get(String(facilityId)).capacity, animalCount: animals.length, grass: { amount: '1234567', emptyAtMs: now + 7200000 },
+      hazardCount: 1, shelfCount: 1, animals, hazards: [{ id: '9001', type: 1, ownerGid: '700000001' }],
+      shelves: [{ slot: 1, totalRemain: '3', canCollect: true, products: [reward(1060001, '3')] }] } });
+  const overview = { ...base, actionsEnabled: true, source: { repository: 'pinned-local-config', commit: sourceCommit },
+    grid: { width: 12, height: 12, cellCount: 144, openCellCount: 24, regionOccupied: 2, regionQuota: 4 },
+    summary: { facilityCount: 3, ranchCount: 2, animalCount: 3, harvestableCount: 0, grassBlockedCount: 0 },
+    facilities: [pen('9223372036854775806', 6001001, [animal(60001, 1), animal(60013, 2)]), pen('9007199254740997', 6002001, [animal(70002, 3, true)]),
+      { id: '9007199254740996', facilityId: 7001001, moduleType: 8, name: '牧草机', image: manifest.facilities['7001001'].url,
+        level: 1, capacity: 100, state: 0, upgradeState: 0, upgradeEndAtMs: null, nextUpgrade: null, position: { x: 5, y: 6 },
+        ranch: null, feedMachine: { count: 100, consumeRate: 1, remainingSec: 3600, status: 1 } }],
+    layoutActionsEnabled: false, cells: [{ id: '1', x: 1, y: 2, status: 1, regionId: 1, occupiedBy: '9223372036854775806', unlockEndAtMs: null }], buildingItems: [] };
+  const bagItem = (id, category, extra = {}) => ({ ...reward(id, '12'), uid: '9223372036854775806', availableCount: '12', availableTypeCount: '12',
+    type: 101, locked: false, category, can: null, animal: null, product: null, canUseCan: false, canPlace: false, ...extra });
+  const bagOverview = { ...base, receivedAt: now, cacheHit: true, level: { level: 12, exp: '1000', currentExp: '80', neededExp: '300' },
+    items: [bagItem(60013, 'cub', { animal: { id: 60013, husbandryType: 1, giantCub: false }, canPlace: true }),
+      bagItem(80021, 'can', { can: { bucketId: 7003, seconds: 3600, family: '普通罐头' }, canUseCan: true }),
+      bagItem(65002, 'cub', { animal: { id: 60002, husbandryType: 1, giantCub: true }, canPlace: true }),
+      bagItem(1060001, 'product', { product: { weightX10: 1124, tier: 2 } })],
+    goldVoucherBalance: '123456789',
+    pens: [{ id: '9223372036854775806', name: '牧场窝', husbandryType: 1, capacity: 3, animalCount: 2, room: 1 }], buckets: { normal: '7200', organic: '3600' } };
+  const tasks = { ...base, guideReportingEnabled: false, automaticClaimEnabled: false, summary: { total: 3, claimable: 1, claimed: 0, daily: 2 },
+    tasks: [0, 1, 2].map((index) => ({ id: String(700001 + index), category: index < 2 ? 'daily' : 'growth',
+      description: index === 0 ? '照料牧场动物，完成当天经营任务' : '本地布局示例：较长的任务说明也应完整换行，不与状态标签重叠',
+      progress: index === 0 ? '3' : '1', total: '3', group: '1', claimed: false, unlocked: true, configConfirmed: true,
+      shareMultiple: '1', condition: '', rewards: [reward(1005, '30')], extraRewards: [], canClaim: index === 0, stateReason: index === 0 ? '可普通领取' : '未完成' })) };
+  const giantProductFor = require('../src/services/ranch-config').getRanchGiantProduct;
+  const animals = new Map(config('MCAnimalConfig').map(row => [String(row.id), row]));
+  const book = { ...base, type: 101, normal: { currentLevel: 2, totalProgress: 5, nextProgress: 8, levels: [],
+    rewards: [reward(1005, '80')], rewardStatusConfirmed: false, canClaim: false, stateReason: '当前奖励终态未确认' },
+    giant: { totalScore: '1124', currentId: 2, calculationMode: 1, levels: [{ id: 1, need: '1000', claimed: false, canClaim: true, rewards: [reward(1008, '10')] }] },
+    animals: [60001, 60013, 60002].map(animalId => {
+      const id = Number(animals.get(String(animalId))?.product_item?.id || animalId), mapping = giantProductFor(id);
+      return { id: String(id), name: items.get(String(id))?.name || '动物', image: manifest.items[String(id)]?.url || '',
+        rarity: 1, layer: 2, progress: 2, unlocked: true, isNew: false,
+        giantItem: mapping ? { id: String(mapping.itemId), name: mapping.item?.name || '巨大产物', image: manifest.items[String(mapping.itemId)]?.url || '' } : null,
+        giant: animalId === 60002 ? { unlocked: true, tier: 2, tierName: '巨大', bestWeightKg: 11.24, minWeightKg: 10, maxWeightKg: 20, harvestCount: '3', isNew: false } : null };
+    }), mutations: [] };
+  const share = { ...base, shareId: '102', docId: '2101', known: false, shareCount: null, claimed: null,
+    shared: false, canReport: false, canClaim: false, automaticShareEnabled: false, rewards: [reward(1005, '10')], stateReason: '牧场分享标记尚未确认' };
+  const market = { ...base, shopId: 7, opened: true, present: true, periodDay: '20261118', roundIndex: 2, automaticExchangeEnabled: false,
+    shelves: [{ id: 1, name: '幼崽货架', sort: 1 }, { id: 2, name: '补给货架', sort: 2 }],
+    goods: [60013, 80021, 65002].map((id, index) => ({ id: String(9223372036854775806n - BigInt(index)), shelfId: index === 0 ? 1 : 2, slot: index,
+      name: items.get(String(id))?.name || `物品 ${id}`, reward: reward(id), currencyId: index === 0 ? '1005' : '1008',
+      currencyName: index === 0 ? '金豆豆' : '松果币', currencyImage: '', unitPrice: '123456789', currencyBalance: '1234567890123456789',
+      remaining: '3', maxCount: 3, limitUsed: '1', available: index !== 2, discounted: index === 0, priceValidUntilMs: now + 60000,
+      requiredLevel: 5, stateReason: index === 2 ? '兑换条件尚未确认，保持禁用' : '' })) };
+  const guide = config('OpeningActivity');
+  const activities = { ...base, actionsEnabled: false, notice: '这里只展示目录和时间，不执行活动领奖或人格测试。', detail: null, guide,
+    activities: [{ id: '9223372036854775806', name: '牧歌初启 · 目录示例', parentId: '0', groupId: '9223372036854775806', type: '2',
+      beginTimeMs: new Date(guide.begin).getTime(), endTimeMs: new Date(guide.endExclusive).getTime(), actionsEnabled: false,
+      progressState: 'unconfirmed', children: [{ id: '9007199254740997', name: '兴牧庆典：具体领取进度未确认', children: [] }] }] };
+  const friendOverview = { gid: '700000002', name: '示例好友（未连接真实账号）', level: 12, hostAtHome: true, tourist: false, observedAt: now,
+    remaining: { stroke: 1, putMosquito: 2 }, summary: { ranchCount: 1, animalCount: 1, stealableShelfCount: 1, cleanableHazardCount: 1, strokableCount: 1, mosquitoRoom: 1 },
+    ranches: [{ id: '9223372036854775806', husbandryType: 1, name: '牧场窝', capacity: 6, animalCount: 1, mosquitoes: 1, mosquitoLimit: 2,
+      mosquitoRoom: 1, canPutMosquito: true, hazardCount: 1, cleanableHazardCount: 1, animals: [{ instanceId: 1, animalId: '60001', name: '小鸡', stage: 2, stroked: false, canStroke: true, mutation: null }],
+      shelves: [{ slot: 1, canSteal: true, products: [{ id: '1060001', count: '3', canSteal: true }] }] }], cache: { hit: true, receivedAt: now } };
+  const catalogGood = (id, itemId) => ({ ...reward(itemId), id, itemId, itemCount: 1, name: items.get(String(itemId))?.name || '示例商品',
+    currencyId: 1005, currencyBalance: '1000', unitPrice: 5, maxCount: 3, remaining: 3, available: true, unlocked: true, owned: false, valid: true, discounted: false });
+  const catalogs = { 5: [catalogGood(501, 60013)], 6: [catalogGood(502, 7001)] };
+  const canGood = { id: '600001', name: '离线罐头商品', rewards: [reward(80021)], currencyId: 1005,
+    unitPrice: '5', currencyBalance: '1000', free: false, remaining: 3, maxCount: 3, available: true, stateReason: '' };
+  const canCatalogs = { 6: [canGood], 7: [{ ...canGood, id: '600002', rewards: [reward(80031)] }] };
+  return { overview, bagOverview, friendOverview, catalogs, canCatalogs, progressViews: { tasks, book, share, market, activities },
+    accounts: [{ id: 'fixture-ranch-A', name: '内存布局示例甲', platform: 'qq', running: false }, { id: 'fixture-ranch-B', name: '内存布局示例乙', platform: 'wx', running: false }] };
+}
+
+test('Edge 双工作区只读验收：两套完整侧栏、独立页面、赶牛动画与未知保护', { skip: !process.env.FARM_LOCAL_RANCH_VERIFY }, async () => {
+  const http = require('node:http');
+  const build = path.resolve(process.env.FARM_LOCAL_RANCH_BUILD), directory = path.resolve(process.env.FARM_LOCAL_RANCH_VERIFY);
+  assert.ok(fs.statSync(path.dirname(directory)).isDirectory()); fs.mkdirSync(directory, { recursive: true });
+  const report = { ok: false, actualVuePages: true, fixtureDataOnly: true, noRealAccountLogin: true, samples: [], screenshots: [], issues: [],
+    requests: [], sockets: [], serverDenied: [], errors: [] };
+  const origin = 'http://127.0.0.1:4177';
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, origin);
+    if (/^\/(?:api(?:\/|$)|socket\.io(?:\/|$))/.test(url.pathname) || !['GET', 'HEAD'].includes(request.method)) {
+      report.serverDenied.push({ path: url.pathname, method: request.method }); response.writeHead(403); response.end(); return;
+    }
+    const filename = path.resolve(build, '.' + decodeURIComponent(url.pathname));
+    if (filename !== build && !filename.startsWith(build + path.sep)) { response.writeHead(403); response.end(); return; }
+    const existing = fs.existsSync(filename) && fs.statSync(filename).isFile();
+    if (!existing && /\.[^/]+$/.test(url.pathname)) { response.writeHead(404); response.end(); return; }
+    const target = existing ? filename : path.join(build, 'index.html');
+    const type = ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+      '.svg': 'image/svg+xml', '.png': 'image/png', '.webp': 'image/webp', '.json': 'application/json', '.woff2': 'font/woff2' })[path.extname(target)] || 'application/octet-stream';
+    response.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store',
+      'Content-Security-Policy': "default-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'" });
+    if (request.method === 'HEAD') response.end(); else fs.createReadStream(target).pipe(response);
+  });
+  server.on('upgrade', (request, socket) => { report.serverDenied.push({ path: request.url, method: 'UPGRADE' }); socket.destroy(); });
+  let browser, send;
+  try {
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(4177, '127.0.0.1', resolve); });
+    browser = await realtimeEdge(process.env.FARM_EDGE_EXECUTABLE, directory);
+    const { targetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
+    const { sessionId } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
+    send = (method, params = {}) => browser.send(method, params, sessionId);
+    const evaluate = async expression => {
+      const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+      if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
+      return result.result.value;
+    };
+    const pending = new Set();
+    browser.events.on('Fetch.requestPaused', event => {
+      if (event.sessionId !== sessionId) return;
+      const job = (async () => {
+        const { requestId, request } = event.params, url = new URL(request.url);
+        const allowed = url.protocol === 'data:' || url.origin === origin && ['GET', 'HEAD'].includes(request.method)
+          && !/^\/(?:api(?:\/|$)|socket\.io(?:\/|$))/.test(url.pathname);
+        if (!allowed) { report.errors.push('禁止的网络尝试：' + request.url); await send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }); }
+        else await send('Fetch.continueRequest', { requestId });
+      })();
+      pending.add(job); job.then(() => pending.delete(job), error => { pending.delete(job); report.errors.push(error.message); });
+    });
+    browser.events.on('Network.requestWillBeSent', event => { if (event.sessionId === sessionId) report.requests.push({ url: event.params.request.url, method: event.params.request.method }); });
+    browser.events.on('Network.webSocketCreated', event => { if (event.sessionId === sessionId) report.sockets.push(event.params.url); });
+    browser.events.on('Runtime.exceptionThrown', event => { if (event.sessionId === sessionId) report.errors.push(event.params.exceptionDetails.exception?.description || event.params.exceptionDetails.text); });
+    await send('Page.enable'); await send('Runtime.enable'); await send('Network.enable');
+    await send('Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+    let initScript;
+    async function open(route, width, theme) {
+      await send('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+      await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+      if (initScript) await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: initScript });
+      initScript = (await send('Page.addScriptToEvaluateOnNewDocument', { source: `if(location.origin===${JSON.stringify(origin)}){for(const key of ['admin_token','user_info','current_account_id'])localStorage.removeItem(key);localStorage.setItem('ui_theme',${JSON.stringify(theme)})}` })).identifier;
+      const pathname = route.split('?')[0], canonical = pathname === '/farm' ? '/personal' : pathname === '/farm/status' ? '/' : pathname;
+      const workspace = canonical.startsWith('/ranch') ? 'ranch' : 'farm';
+      const page = { '/ranch':'overview', '/ranch/personal':'personal', '/ranch/friends':'friends', '/ranch/activity':'activity', '/ranch/shop':'shop', '/ranch/illustrated':'illustrated' }[canonical];
+      await send('Page.navigate', { url: origin + route });
+      await evaluate(`(async()=>{const frame=()=>new Promise(r=>requestAnimationFrame(r));for(let i=0;i<180&&(!document.querySelector('[data-game-workspace="${workspace}"]')||!document.querySelector('[data-page-content]')?.firstElementChild||${page ? `!document.querySelector('[data-ranch-page="${page}"]')` : 'false'});i++)await frame();await frame();await frame();if(!document.querySelector('[data-game-workspace="${workspace}"]')||location.pathname!==${JSON.stringify(canonical)})throw Error('工作区页面未加载：'+location.pathname);if(localStorage.getItem('admin_token')||localStorage.getItem('user_info')||localStorage.getItem('current_account_id'))throw Error('匿名只读页面出现账号凭据')})()`);
+    }
+    async function capture(name) {
+      const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+      fs.writeFileSync(path.join(directory, name + '.png'), Buffer.from(data, 'base64')); report.screenshots.push(name + '.png');
+    }
+    async function sample(label) {
+      const value = await evaluate(`(async()=>{
+        const frame=()=>new Promise(r=>requestAnimationFrame(r));await frame();await frame();
+        const root=document.querySelector('[data-page-content]'),page=root?.firstElementChild,title=page?.querySelector('h1')||document.querySelector('.layout-page-context');
+        if(!root||!page||!title)throw Error('真实页面结构缺失');
+        const workspace=document.querySelector('[data-game-workspace]')?.dataset.gameWorkspace,sidebar=document.querySelector('[data-sidebar-workspace]');
+        const links=[...sidebar.querySelectorAll('.sidebar-nav-link')],sidebarPaths=links.map(e=>e.dataset.navPath),sidebarLabels=links.map(e=>e.querySelector('.sidebar-nav-content').textContent.trim());
+        const expectedWorkspace=location.pathname.startsWith('/ranch')?'ranch':'farm';
+        const correctWorkspace=workspace===expectedWorkspace&&sidebar.dataset.sidebarWorkspace===expectedWorkspace&&sidebarPaths.every(p=>workspace==='ranch'?p.startsWith('/ranch'):!p.startsWith('/ranch'));
+        const commonMenus=['概览','个人','好友','活动','商城','图鉴','设置'].every(label=>sidebarLabels.includes(label));
+        const originalFarmMenus=workspace==='ranch'||['宠物','藏品','变异宝典','分析'].every(label=>sidebarLabels.includes(label));
+        const selectedSide=links.filter(e=>e.getAttribute('aria-current')==='page');
+        const visibleRoute=sidebarPaths.includes(location.pathname),sidebarSelectionValid=!visibleRoute||selectedSide.length===1&&selectedSide[0].dataset.navPath===location.pathname;
+        const rgb=value=>{const c=document.createElement('canvas');c.width=c.height=1;const x=c.getContext('2d');x.fillStyle=value;x.fillRect(0,0,1,1);return [...x.getImageData(0,0,1,1).data].slice(0,3)};
+        const luminance=value=>rgb(value).map(v=>v/255).map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4).reduce((s,v,i)=>s+v*[.2126,.7152,.0722][i],0);
+        const ratio=(a,b)=>{const x=luminance(a),y=luminance(b);return(Math.max(x,y)+.05)/(Math.min(x,y)+.05)};
+        const css=getComputedStyle(document.documentElement), card=page.querySelector('.ui-card,.ranch-card')||document.querySelector('main>header');
+        const contrast=ratio(getComputedStyle(title).color,getComputedStyle(card).backgroundColor);
+        const texts=[...page.querySelectorAll('p,b,strong,h3')].filter(e=>e.getBoundingClientRect().width>0&&e.scrollWidth>e.clientWidth+2)
+          .map(e=>({tag:e.tagName,class:e.className,text:e.textContent.trim().slice(0,80),width:e.clientWidth,scrollWidth:e.scrollWidth})).slice(0,10);
+        const tabs=page.querySelector('.ranch-tabs'),selected=tabs?.querySelector('[aria-selected="true"]');
+        const active=selected?document.getElementById(selected.getAttribute('aria-controls')):null;
+        const strip=tabs?.getBoundingClientRect(),selectedBox=selected?.getBoundingClientRect();
+        const tabRows=tabs?new Set([...tabs.querySelectorAll('[role="tab"]')].map(e=>Math.round(e.getBoundingClientRect().top))).size:0;
+        const tabVisible=!tabs||selectedBox.left>=strip.left-1&&selectedBox.right<=strip.right+1;
+        const header=document.querySelector('main>header'),brand=header?.querySelector('div.truncate'),badge=header?.querySelector('.layout-readonly-status');
+        const mobileHeaderSeparated=!brand||!badge||getComputedStyle(brand).display==='none'||brand.getBoundingClientRect().right<=badge.getBoundingClientRect().left-4;
+        const metrics=page.querySelector('.ranch-metrics');const compactMetrics=!metrics||[...metrics.querySelectorAll('.ranch-stat')].every(e=>e.getBoundingClientRect().height<=120);
+        const imgs=[...page.querySelectorAll('img')];await Promise.all(imgs.filter(img=>img.loading!=='lazy').map(img=>img.decode().catch(()=>{})));
+        return{label:${JSON.stringify(label)},route:location.pathname,width:innerWidth,theme:localStorage.getItem('ui_theme'),title:title.textContent,
+          workspace,sidebarPaths,sidebarLabels,correctWorkspace,commonMenus,originalFarmMenus,sidebarSelectionValid,
+          documentWidth:document.documentElement.scrollWidth,pageWidth:page.clientWidth,pageScrollWidth:page.scrollWidth,contrast,
+          livePages:document.querySelectorAll('[data-page-content]').length,tabCount:tabs?.querySelectorAll('[role="tab"]').length||0,
+          tabSelectionValid:!tabs||tabs.querySelectorAll('[aria-selected="true"]').length===1&&!!active,
+          tabRows,tabVisible,mobileHeaderSeparated,compactMetrics,
+          localEmptyCorrect:!!localStorage.getItem('current_account_id')||!page.hasAttribute('data-ranch-page')||page.textContent.includes('本地仅查看界面'),
+          overflowText:texts,images:imgs.map(img=>({src:img.getAttribute('src'),alt:img.getAttribute('alt'),loaded:img.complete&&img.naturalWidth>0})),
+          anonymous:!localStorage.getItem('admin_token')&&!localStorage.getItem('user_info')}
+      })()`);
+      report.samples.push(value);
+      if (value.documentWidth > value.width || value.pageScrollWidth > value.pageWidth + 1 || value.overflowText.length) report.issues.push({ kind: 'overflow', ...value });
+      if (value.contrast < 4.5 || value.livePages !== 1 || !value.tabSelectionValid || !value.anonymous) report.issues.push({ kind: 'theme-or-state', ...value });
+      if (!value.correctWorkspace || !value.commonMenus || !value.originalFarmMenus || !value.sidebarSelectionValid || value.tabCount > 4) report.issues.push({ kind: 'workspace-navigation', ...value });
+      if (!value.mobileHeaderSeparated || !value.localEmptyCorrect || !value.compactMetrics || value.width <= 820 && (!value.tabVisible || value.tabRows > 1)) report.issues.push({ kind: 'responsive-or-copy', ...value });
+      return value;
+    }
+    const fixture = ranchVisualFixtures();
+    async function seed(preserveProtection = false) {
+      await evaluate(`(async()=>{
+        const app=document.getElementById('app').__vue_app__,pinia=app.config.globalProperties.$pinia;
+        const stores=pinia._s,account=stores.get('account'),ranch=stores.get('ranch');if(!account||!ranch)throw Error('真实Pinia store缺失');
+        const fixture=${JSON.stringify(fixture)};window.__ranchVisual={stores,fixture};
+        account.accounts=fixture.accounts;account.currentAccountId='fixture-ranch-A';
+        for(let i=0;i<4;i++)await new Promise(r=>requestAnimationFrame(r));
+        ranch.$patch({overview:fixture.overview,bagOverview:fixture.bagOverview,friendOverview:fixture.friendOverview,progressViews:fixture.progressViews,catalogs:fixture.catalogs,canCatalogs:fixture.canCatalogs,operations:[],operationsError:'',operationStates:${preserveProtection ? "ranch.operationStates" : "{'fixture-ranch-A':'idle','fixture-ranch-B':'idle'}"},notice:'内存示例 · 仅用于布局验收，未连接真实账号'});
+        ranch.friends=[{gid:700000002,name:'示例牧场好友（未连接真实账号）',avatarUrl:''}];
+      })()`);
+    }
+    async function choose(label) {
+      await evaluate(`(async()=>{const button=[...document.querySelectorAll('.ranch-tabs [role="tab"]')].find(e=>e.textContent.trim()===${JSON.stringify(label)});if(!button)throw Error('缺少牧场专区');button.click();for(let i=0;i<8;i++)await new Promise(r=>requestAnimationFrame(r));if(button.getAttribute('aria-selected')!=='true')throw Error('专区未响应')})()`);
+    }
+    if (process.env.FARM_RANCH_DASHBOARD_ONLY) {
+      for (const theme of ['light-green', 'dark-blue']) for (const width of [1440, 375]) {
+        await open('/ranch', width, theme); await seed();
+        await evaluate(`(async()=>{
+          const seen=new Set();
+          function find(v){if(!v||typeof v!=='object'||seen.has(v))return;seen.add(v);
+            if(v.component){if(v.component.type.__name==='Ranch')return v.component;const hit=find(v.component.subTree);if(hit)return hit}
+            if(v.suspense){const hit=find(v.suspense.activeBranch);if(hit)return hit}
+            if(Array.isArray(v.children))for(const child of v.children){const hit=find(child);if(hit)return hit}}
+          const app=document.getElementById('app').__vue_app__,vm=find(app._container._vnode);
+          if(!vm?.setupState||!('logSnapshot' in vm.setupState))throw Error('日志夹具仅用于开发只读构建，不注入生产钩子');
+          const now=Date.now(),samples=[
+            ['ranch_harvest','收获动物完成','ok'],['ranch_produce','催产完成','ok'],['ranch_clean','清理牧场完成','ok'],
+            ['ranch_sell','出售牧场产物完成','ok'],['ranch_addGrass','补充牧草完成','ok'],['ranch_buy','购买鸭 ×1完成','ok'],
+            ['ranch_place','普通幼崽放养完成','ok'],['ranch_friend_stroke','示例好友：抚摸完成','ok'],
+            ['ranch_friend_putMosquito','示例好友：放蚊子完成','ok'],['ranch_patrol_complete','自动巡查完成：无待执行动作','idle'],
+            ['ranch_patrol_paused','自动巡查已暂停：存在待核对记录，未重放','unknown'],
+            ['ranch_automation','自动巡查停止：示例异常，保留原始提示','error'],
+            ['ranch_fixture_future_event','较长的未知事件名称与说明也应在窄屏完整换行，不挤出卡片或遮挡右侧栏。','idle']];
+          vm.setupState.logSnapshot={accountId:'fixture-ranch-A',readAt:now,entries:samples.map(([event,msg,result],i)=>({
+            ts:now-i*60000,tag:'牧场',msg,isWarn:result==='unknown',meta:{module:'ranch',event,result}}))};
+          for(let i=0;i<4;i++)await new Promise(r=>requestAnimationFrame(r));
+          if(document.querySelectorAll('.ranch-log-list li').length!==samples.length)throw Error('真实模板未渲染日志样本');
+        })()`);
+        const check = await evaluate(`(()=>{
+          const log=document.querySelector('.ranch-log-list'),first=log.querySelector('li'),badge=first.querySelector('time+span'),
+            body=document.querySelector('[data-ranch-dashboard-body]'),side=body.querySelector('aside'),tiles=[...side.querySelectorAll('.ranch-stat-tile')];
+          const l=log.getBoundingClientRect(),s=side.getBoundingClientRect(),style=getComputedStyle(log),line=getComputedStyle(first);
+          return {width:innerWidth,theme:localStorage.getItem('ui_theme'),rows:log.querySelectorAll('li').length,
+            font:style.fontFamily,lineHeight:style.lineHeight,rowMargin:line.marginBottom,rowPadding:line.paddingTop,
+            module:badge.textContent,event:first.querySelector('time+span+span').textContent,time:first.querySelector('time').textContent,
+            tileCount:tiles.length,tileColumns:getComputedStyle(tiles[0].parentElement).gridTemplateColumns,
+            pageOverflow:document.documentElement.scrollWidth>innerWidth,logOverflow:log.scrollWidth>log.clientWidth+1,
+            sideBySide:s.left>l.right,stacked:s.top>=l.bottom,heading:side.querySelector('h2').textContent}
+        })()`);
+        assert.equal(check.rows, 13); assert.equal(check.module, '牧场'); assert.equal(check.event, '收获');
+        assert.match(check.time, /^\[\d{2}:\d{2}:\d{2}\]$/); assert.match(check.font, /mono/i);
+        assert.equal(check.rowPadding, '0px'); assert.equal(check.tileCount, 5);
+        assert.equal(check.pageOverflow, false, JSON.stringify(check)); assert.equal(check.logOverflow, false, JSON.stringify(check));
+        assert.ok(width === 1440 ? check.sideBySide : check.stacked, JSON.stringify(check));
+        report.samples.push(check);
+        if (width === 375) await evaluate(`document.querySelector('[aria-label="运行日志"]').scrollIntoView({block:'start'})`);
+        await capture(`ranch-dashboard-${theme}-${width}`);
+        if (width === 375) { await evaluate(`document.querySelector('[aria-label="牧场检查与统计"]').scrollIntoView({block:'start'})`); await capture(`ranch-dashboard-sidebar-${theme}-${width}`); }
+      }
+      for (const theme of ['light-green', 'dark-blue']) for (const width of [1440, 375]) {
+        await open('/ranch/friends', width, theme); await seed();
+        const friendCheck = await evaluate(`(async()=>{
+          const frame=()=>new Promise(r=>requestAnimationFrame(r));
+          const {stores,fixture}=window.__ranchVisual,ranch=stores.get('ranch');
+          ranch.friends=[{gid:700000002,name:'牧场好友甲',avatarUrl:''},{gid:700000003,name:'很长的好友昵称也会完整显示而不是被藏进下拉菜单里',avatarUrl:''},{gid:700000004,name:'Beta牧场好友',avatarUrl:''}];
+          ranch.friendsError='示例读取失败，只应进入日志，不应出现警告条';
+          await frame();await frame();
+          if(document.querySelectorAll('.ranch-friend-row').length!==3||document.querySelector('[data-ranch-page] select'))throw Error('好友没有直接列出');
+          const search=document.querySelector('input[aria-label="搜索牧场好友"]');
+          search.value='Beta';search.dispatchEvent(new Event('input',{bubbles:true}));await frame();
+          if(document.querySelectorAll('.ranch-friend-row').length!==1)throw Error('本地搜索未筛选');
+          search.value='';search.dispatchEvent(new Event('input',{bubbles:true}));await frame();
+          document.querySelector('.ranch-friend-row').click();await frame();await frame();
+          ranch.friendOverview=fixture.friendOverview;await frame();await frame();
+          const row=document.querySelector('.ranch-friend-row[aria-expanded="true"]'),details=document.getElementById(row?.getAttribute('aria-controls'));
+          if(!details||!details.textContent.includes('动物'))throw Error('好友详情未原位展开');
+          const hasBanner=!!document.querySelector('[data-ranch-page] .ranch-error,[data-ranch-page] .ranch-notice,[data-ranch-page] [role="alert"]');
+          const root=document.querySelector('[data-ranch-page]');
+          return{page:'friends',width:innerWidth,theme:localStorage.getItem('ui_theme'),rows:document.querySelectorAll('.ranch-friend-row').length,
+            hasBanner,pageOverflow:document.documentElement.scrollWidth>innerWidth,pageWidth:root.clientWidth,scrollWidth:root.scrollWidth,inlineDetail:details.parentElement.tagName==='LI'}
+        })()`);
+        assert.equal(friendCheck.rows,3);assert.equal(friendCheck.hasBanner,false);assert.equal(friendCheck.pageOverflow,false,JSON.stringify(friendCheck));
+        assert.ok(friendCheck.inlineDetail);assert.ok(friendCheck.scrollWidth<=friendCheck.pageWidth+1,JSON.stringify(friendCheck));
+        report.samples.push(friendCheck);
+        if(width===375)await evaluate(`document.querySelector('[aria-label="牧场好友列表"]').scrollIntoView({block:'start'})`);
+        await capture(`ranch-friends-list-${theme}-${width}`);
+        await evaluate(`document.querySelector('.ranch-friend-row[aria-expanded="true"]').click()`);
+        assert.equal(await evaluate(`document.querySelectorAll('.ranch-friend-row[aria-expanded="true"]').length`),0);
+      }
+      await Promise.all([...pending]);
+      const forbidden=report.requests.filter(r=>!['GET','HEAD'].includes(r.method)||/^https?:/.test(r.url)&&(new URL(r.url).origin!==origin||/^\/(?:api(?:\/|$)|socket\.io(?:\/|$))/.test(new URL(r.url).pathname)));
+      assert.equal(forbidden.length,0);assert.equal(report.sockets.length,0);assert.equal(report.serverDenied.length,0);assert.equal(report.errors.length,0,JSON.stringify(report.errors));
+      report.ok=true;console.log('RANCH_DASHBOARD_VISUAL_VERIFIED',JSON.stringify({samples:report.samples.length,screenshots:report.screenshots.length,apiRequests:0,websockets:0,networkWrites:0}));
+      return;
+    }
+    const businessPages = ['/', '/personal', '/friends', '/activity', '/shop', '/illustrated', '/settings',
+      '/ranch', '/ranch/personal', '/ranch/friends', '/ranch/activity', '/ranch/shop', '/ranch/illustrated', '/ranch/settings'];
+    const ranchScenes = [
+      ['/ranch', '', 'overview'], ['/ranch/personal?section=home', '', 'personal'], ['/ranch/personal?section=bag', '', 'bag'],
+      ['/ranch/personal?section=tasks', '', 'tasks'], ['/ranch/personal?section=share', '', 'share'], ['/ranch/friends', '', 'friends'],
+      ['/ranch/activity', '', 'activity'], ['/ranch/illustrated', '', 'illustrated'],
+      ['/ranch/shop?section=catalog', '', 'catalog'], ['/ranch/shop?section=cans', '', 'cans'], ['/ranch/shop?section=market', '', 'market'],
+    ];
+    for (const theme of ['light-green', 'dark-blue']) for (const width of [375, 768, 1440]) {
+      for (const route of businessPages) {
+        await open(route, width, theme); await sample('anonymous-' + route);
+        if (width === 1440 && theme === 'light-green' && ['/', '/personal', '/ranch'].includes(route))
+          await capture(route === '/' ? 'farm-overview-light-1440' : route === '/personal' ? 'farm-personal-light-1440' : 'ranch-anonymous-light-1440');
+      }
+      for (const [route, label, key] of ranchScenes) {
+        await open(route, width, theme); await seed(); if (label) await choose(label);
+        await sample('fixture-' + key);
+        if (key === 'overview') {
+          const layout = await evaluate(`(()=>{
+            const body=document.querySelector('[data-ranch-dashboard-body]'), log=body?.querySelector('[aria-label="运行日志"]'), side=body?.querySelector('aside');
+            if(!log||!side)return null;
+            const l=log.getBoundingClientRect(),s=side.getBoundingClientRect(), cards=[...document.querySelectorAll('[data-ranch-page="overview"] .metric-card')];
+            return { cards:cards.length, cardRows:new Set(cards.map(card=>Math.round(card.getBoundingClientRect().top))).size,
+              aligned:Math.abs(l.top-s.top)<2, sideBySide:s.left>l.left+l.width-2, widthRatio:l.width/s.width, stacked:s.top>=l.bottom,
+              hasStats:side.textContent.includes('今日统计'), hasInterval:side.textContent.includes('检查间隔') };
+          })()`);
+          assert.ok(layout, '牧场概览必须具有日志和右侧栏');
+          assert.equal(layout.cards, 3);
+          assert.ok(layout.hasStats && layout.hasInterval);
+          if (width === 1440) assert.ok(layout.aligned && layout.sideBySide && layout.cardRows === 1 && layout.widthRatio > 2.5 && layout.widthRatio < 3.5, JSON.stringify(layout));
+          if (width === 375) assert.ok(layout.stacked && layout.cardRows === 3, JSON.stringify(layout));
+        }
+        if (width === 1440 || width === 375 && theme === 'light-green') {
+          await capture(`ranch-${key}-${theme === 'light-green' ? 'light' : 'dark'}-${width}`);
+          if (key === 'personal') {
+            await evaluate(`document.querySelector('.ranch-animal')?.scrollIntoView({block:'center'})`);
+            await capture(`ranch-animals-${theme === 'light-green' ? 'light' : 'dark'}-${width}`);
+          }
+        }
+      }
+    }
+    await open('/ranch/illustrated', 1440, 'light-green'); await seed();
+    report.giantBook = await evaluate(`(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(r));
+      const button=[...document.querySelectorAll('.ranch-progress button')].find(e=>e.textContent.includes('巨大动物'))
+        ||[...document.querySelectorAll('button')].find(e=>e.textContent.includes('巨大动物'));
+      if(!button)throw Error('缺少巨大图鉴筛选');button.click();await frame();await frame();
+      const text=document.querySelector('.ranch-progress')?.textContent||document.querySelector('[data-page-content]').textContent;
+      if(!text.includes('巨大')||!text.includes('未确认'))throw Error('巨大图鉴缺图或分类说明缺失');
+      return{independentFilter:true,missingImageExplicit:true}
+    })()`);
+    await evaluate(`document.querySelectorAll('.ranch-progress button').forEach(e=>{if(e.textContent.includes('巨大动物'))e.scrollIntoView({block:'start'})})`);
+    await capture('ranch-giant-book-light-1440');
+    for (const route of ['/farm', '/farm/status', '/overview', '/ranch/overview']) { await open(route, 1440, 'light-green'); await sample('compatibility-' + route); }
+    await open('/ranch/personal?section=home', 375, 'light-green'); await seed();
+    await evaluate(`document.querySelector('.ranch-tabs [role="tab"]').focus()`);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'End', code: 'End', windowsVirtualKeyCode: 35 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'End', code: 'End', windowsVirtualKeyCode: 35 });
+    assert.equal(await evaluate(`document.activeElement.textContent.trim()`), '每日分享');
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r' });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    report.keyboard = await sample('fixture-keyboard-last-tab');
+    assert.equal(await evaluate(`document.querySelector('.ranch-tabs [aria-selected="true"]').textContent.trim()`), '每日分享');
+    await choose('我的牧场');
+    report.protection = await evaluate(`(async()=>{
+      const app=document.getElementById('app').__vue_app__,router=app.config.globalProperties.$router;
+      const v=window.__ranchVisual,a=v.stores.get('account'),r=v.stores.get('ranch');
+      const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+      const navigate=async path=>{await router.push(path);for(let i=0;i<8;i++)await frame()};
+      r.operationStates={'fixture-ranch-A':'pending','fixture-ranch-B':'idle'};await frame();await frame();
+      await navigate('/ranch/shop');await navigate('/ranch/personal?section=home');
+      if(r.currentState!=='pending')throw Error('独立子页切换清除在途提示');
+      r.operationStates={'fixture-ranch-A':'unknown','fixture-ranch-B':'idle'};await frame();await frame();
+      await navigate('/personal');
+      if(r.operationStates['fixture-ranch-A']!=='unknown')throw Error('返回农场解除牧场未知保护');
+      await navigate('/ranch/personal?section=home');
+      a.currentAccountId='fixture-ranch-B';await frame();await frame();if(r.currentState!=='idle')throw Error('甲号未知污染乙号');
+      a.currentAccountId='fixture-ranch-A';await frame();await frame();if(r.currentState!=='unknown')throw Error('A-B-A丢失未知保护');
+      r.$patch({overview:v.fixture.overview,progressViews:v.fixture.progressViews});await frame();await frame();
+      const controls=[...document.querySelectorAll('.ranch-content button')].filter(e=>/催产|出售全部|喂养|放生/.test(e.textContent));
+      if(!controls.length||controls.some(e=>!e.disabled))throw Error('未知状态允许重复写按钮');
+      if(!document.body.textContent.includes('本账号牧场结果或离场状态未确认'))throw Error('未知告警缺失');
+      return{pendingIndicatorSurvivesPage:true,unknownSurvivesPageAndAccount:true,accountIsolation:true,writeButtonsDisabled:controls.length}
+    })()`);
+    await sample('fixture-unknown'); await capture('ranch-unknown-light-375');
+    await open('/personal', 1440, 'light-green');
+    await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    report.motion = await evaluate(`(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(r));await frame();await frame();
+      document.querySelector('.sidebar-nav-link[data-nav-path="/friends"]').click();
+      for(let i=0;i<100&&!document.getAnimations().some(a=>a.animationName==='content-snapshot-out');i++)await frame();
+      const animations=document.getAnimations().filter(a=>['content-snapshot-in','content-snapshot-out'].includes(a.animationName));
+      if(animations.length!==2||document.querySelector('.workspace-travel-mask'))throw Error('同工作区切页未保留原快照动画');
+      const frames=animations.map(a=>({name:a.animationName,frames:a.effect.getKeyframes().map(k=>({transform:k.transform,opacity:k.opacity}))}));
+      await Promise.all(animations.map(a=>a.finished.catch(()=>{})));for(let i=0;i<8&&document.documentElement.dataset.contentMotion;i++)await frame();
+      if(document.querySelectorAll('[data-page-content]').length!==1||document.documentElement.dataset.contentMotion)throw Error('动画结束后仍保活或卡住');
+      return{nativeSnapshots:2,onlyOnePage:true,finalRoute:location.pathname,frames}
+    })()`);
+    await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+    report.reducedMotion = await evaluate(`(async()=>{document.querySelector('[data-workspace-switch]').click();for(let i=0;i<60&&(!document.querySelector('[data-ranch-page="friends"]')||document.querySelector('.workspace-travel-mask'));i++)await new Promise(r=>requestAnimationFrame(r));if(document.documentElement.dataset.contentMotion||document.querySelector('.workspace-travel-mask')||document.getAnimations().some(a=>a.animationName?.startsWith('workspace-journey')||['content-snapshot-in','content-snapshot-out'].includes(a.animationName)))throw Error('减动效仍推页或锁住界面');if(!document.querySelector('[data-ranch-page="friends"]'))throw Error('减动效未切换完整工作区');return{routeChanged:true,animations:0}})()`);
+    await open('/', 1440, 'light-green');
+    report.navigationGuard = await evaluate(`(async()=>{
+      const router=document.getElementById('app').__vue_app__.config.globalProperties.$router;
+      const remove=router.beforeEach(to=>to.path==='/ranch'?new Promise(resolve=>{window.__releaseJourneyGuard=resolve}):true);
+      document.querySelector('[data-workspace-switch]').click();for(let i=0;i<8;i++)await new Promise(r=>requestAnimationFrame(r));
+      if(typeof window.__releaseJourneyGuard!=='function'||document.querySelector('.workspace-travel-mask')||document.querySelector('[data-game-workspace]').inert)throw Error('导航确认未通过就被加载层遮挡');
+      window.__releaseJourneyGuard(false);remove();for(let i=0;i<8;i++)await new Promise(r=>requestAnimationFrame(r));
+      if(location.pathname!=='/'||document.querySelector('.workspace-travel-mask'))throw Error('取消导航仍切换工作区');return{guardBeforeJourney:true,cancelKeepsWorkspace:true}
+    })()`);
+    report.journeys = [];
+    async function captureJourney(destination, width = 1440, count = 14) {
+      await open(destination === 'ranch' ? '/' : '/ranch', width, 'light-green');
+      await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+      const info = await evaluate(`(async()=>{
+        const frame=()=>new Promise(r=>requestAnimationFrame(r));document.querySelector('[data-workspace-switch]').click();
+        let mask,animations,main;for(let i=0;i<90;i++){mask=document.querySelector('.workspace-travel-mask');animations=mask?.querySelector('svg')?.getAnimations({subtree:true})||[];main=animations.find(a=>a.animationName?.startsWith('workspace-journey-move'));if(main)break;await frame()}
+        if(!main||mask.dataset.travelDestination!==${JSON.stringify(destination)})throw Error('真实切换插画未启动');
+        for(const a of animations){a.pause();a.currentTime=0}window.__journeyFrames={animations,main};
+        for(let i=0;i<12;i++)await frame();const card=mask.querySelector('.workspace-travel-card'),box=card.getBoundingClientRect();
+        if(!document.querySelector('[data-game-workspace]').inert||getComputedStyle(mask).opacity<.98)throw Error('加载背景未隔离或插画未完整显示');
+        return{destination:${JSON.stringify(destination)},width:innerWidth,duration:Number(main.effect.getComputedTiming().duration),animations:animations.length,route:location.pathname,
+          clip:{x:Math.floor(box.left),y:Math.floor(box.top),width:Math.ceil(box.width),height:Math.ceil(box.height),scale:1},backgroundInert:true,caption:card.textContent.trim()}
+      })()`);
+      info.frames = [];
+      for (let index = 0; index < count; index++) {
+        const time = info.duration * index / count;
+        await evaluate(`(async()=>{for(const a of window.__journeyFrames.animations)a.currentTime=${time};await new Promise(r=>requestAnimationFrame(r));await new Promise(r=>requestAnimationFrame(r))})()`);
+        const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: info.clip });
+        const name = `travel-${destination}-${width}-frame-${String(index).padStart(2, '0')}.png`;
+        fs.writeFileSync(path.join(directory, name), Buffer.from(data, 'base64')); info.frames.push(name);
+      }
+      await evaluate(`(async()=>{for(const a of window.__journeyFrames.animations)a.play();window.__journeyFrames.main.currentTime=${info.duration - 1};for(let i=0;i<90&&document.querySelector('.workspace-travel-mask');i++)await new Promise(r=>requestAnimationFrame(r));if(document.querySelector('.workspace-travel-mask')||document.querySelector('[data-game-workspace]').inert)throw Error('插画结束未释放界面')})()`);
+      report.journeys.push(info);
+    }
+    await captureJourney('ranch'); await captureJourney('farm'); await captureJourney('ranch', 375, 3);
+    await open('/', 1440, 'light-green');
+    await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    report.travelIdleTiming = await evaluate(`(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(r));const samples=[];let previous=await frame();
+      for(let i=0;i<30;i++){const now=await frame();samples.push(now-previous);previous=now}
+      const sorted=samples.filter(n=>Number.isFinite(n)&&n>0).sort((a,b)=>a-b);
+      if(sorted.length<10)throw Error('空闲基线有效帧样本不足');
+      return {frames:sorted.length,medianMs:sorted[Math.floor(sorted.length/2)],p95Ms:sorted[Math.floor(sorted.length*.95)],longFrames:sorted.filter(n=>n>50).length}
+    })()`);
+    report.travelFrameTiming = await evaluate(`(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(r));document.querySelector('[data-workspace-switch]').click();
+      for(let i=0;i<90&&!document.querySelector('.workspace-journey');i++)await frame();
+      const frames=[];let previous=await frame();
+      for(let i=0;i<180&&document.querySelector('.workspace-travel-mask');i++) {const now=await frame();frames.push(now-previous);previous=now}
+      if(document.querySelector('.workspace-travel-mask'))throw Error('工作区动画未在预算内结束');
+      const sorted=frames.filter(n=>Number.isFinite(n)&&n>0).sort((a,b)=>a-b);
+      if(sorted.length<10)throw Error('工作区动画有效帧样本不足');
+      return {frames:frames.length,medianMs:sorted[Math.floor(sorted.length/2)]||0,p95Ms:sorted[Math.floor(sorted.length*.95)]||0,longFrames:frames.filter(n=>n>50).length}
+    })()`);
+    await open('/', 1440, 'light-green');
+    await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'no-preference' }] });
+    report.travelAnimationCancel = await evaluate(`(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(r));document.querySelector('[data-workspace-switch]').click();let main;
+      for(let i=0;i<90;i++){main=document.querySelector('.workspace-journey')?.getAnimations().find(a=>a.animationName?.startsWith('workspace-journey-move'));if(main)break;await frame()}
+      if(!main)throw Error('取消测试未捕获主动画');main.cancel();
+      for(let i=0;i<90&&document.querySelector('.workspace-travel-mask');i++)await frame();
+      if(document.querySelector('.workspace-travel-mask')||document.querySelector('[data-game-workspace]').inert)throw Error('动画取消后界面仍锁住');
+      return {released:true}
+    })()`);
+    await Promise.all([...pending]);
+    report.apiRequests = report.requests.filter(r => /^https?:/.test(r.url) && /^\/(?:api(?:\/|$)|socket\.io(?:\/|$))/.test(new URL(r.url).pathname));
+    report.externalRequests = report.requests.filter(r => /^https?:/.test(r.url) && new URL(r.url).origin !== origin);
+    report.networkWrites = report.requests.filter(r => !['GET', 'HEAD'].includes(r.method));
+    assert.equal(report.apiRequests.length, 0); assert.equal(report.externalRequests.length, 0); assert.equal(report.sockets.length, 0);
+    assert.equal(report.serverDenied.length, 0); assert.equal(report.networkWrites.length, 0); assert.equal(report.errors.length, 0, JSON.stringify(report.errors));
+    assert.equal(report.issues.length, 0, JSON.stringify(report.issues.map(i => ({ kind: i.kind, label: i.label, theme: i.theme, width: i.width, overflowText: i.overflowText }))));
+    report.ok = true;
+    console.log('RANCH_VISUAL_VERIFIED', JSON.stringify({ samples: report.samples.length, screenshots: report.screenshots.length, apiRequests: 0, websockets: 0, networkWrites: 0, issues: 0 }));
+  } catch (error) {
+    report.failure = error.message;
+    if (send) try { const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }); fs.writeFileSync(path.join(directory, 'failure.png'), Buffer.from(data, 'base64')); } catch {}
+    throw error;
+  } finally {
+    if (browser) await browser.close();
+    if (server.listening) await new Promise(resolve => server.close(resolve));
+    report.previewClosed = !server.listening;
+    fs.writeFileSync(path.join(directory, 'ranch-visual-verification.json'), JSON.stringify(report, null, 2) + '\n');
+  }
+});
 
 test('Edge 本地只读切页帧诊断：实际指针输入、捕获延迟与帧节奏', {
   skip: !process.env.FARM_LOCAL_MOTION_TRACE,

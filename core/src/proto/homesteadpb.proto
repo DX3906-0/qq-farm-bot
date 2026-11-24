@@ -1,0 +1,153 @@
+syntax = "proto3";
+package gamepb.homesteadpb;
+
+import "corepb.proto";
+import "animalpb.proto";
+
+// Read-only homestead subset selected from liyangpengs/qq-farm-bot
+// commit 6ac7a3d7930018058d201af86beea8de6a9f8507 (QQ 1.17.0.3).
+// Facility mutation messages are intentionally not included in phase one.
+
+message CellInfo {
+    int64 cell_id = 1;
+    int32 grid_x = 2;
+    int32 grid_y = 3;
+    int32 status = 4;
+    int64 occupied_by = 5;
+    int32 region_id = 6;
+    repeated corepb.Item unlock_need = 7;
+    int64 unlock_end_time = 10;
+    int32 unlock_secs = 11;
+    bool can_share_unlock = 12;
+    repeated corepb.Item share_cost = 13;
+}
+
+message FeedMachineDetail {
+    int32 feed_count = 1;
+    int32 consume_rate = 2;
+    int64 remaining_secs = 4;
+    bool is_owner = 7;
+    int32 status = 8;
+}
+
+message FacilityInfo {
+    int64 instance_id = 1;
+    int32 facility_id = 2;
+    int32 module_type = 3;
+    int32 position_x = 4;
+    int32 position_y = 5;
+    int32 rotation = 6;
+    int32 level = 7;
+    int32 width = 8;
+    int32 height = 9;
+    int32 capacity = 10;
+    repeated int64 occupied_cell_ids = 11;
+    int32 state = 12;
+    int32 upgrade_state = 13;
+    int64 upgrade_end_time = 14;
+    gamepb.animalpb.RanchDetail ranch = 20;
+    FeedMachineDetail feed_machine = 21;
+    bytes order_board = 22;
+}
+
+message BuildingItemInfo {
+    int64 inst_id = 1;
+    int32 facility_id = 2;
+    int32 level = 3;
+    int32 upgrade_state = 5;
+    int64 upgrade_end_time = 6;
+    int64 added_at = 7;
+    bool is_new = 8;
+}
+
+message SpeedUpInfo {
+    int64 item_id = 1;
+    int64 own_count = 2;
+    int32 secs_per_item = 3;
+}
+
+message AllCellsRequest {
+}
+
+message AllCellsReply {
+    int32 grid_width = 1;
+    int32 grid_height = 2;
+    repeated CellInfo cells = 3;
+    repeated FacilityInfo facilities = 4;
+    repeated BuildingItemInfo building_items = 5;
+    bool has_ready_upgrade = 6;
+    int32 region_occupied_count = 7;
+    int32 region_quota_count = 8;
+    SpeedUpInfo region_speed_up = 9;
+}
+
+// ============ 自家设施写操作（2026-11-17 二期，自固定上游 6ac7a3d 选取）============
+
+message BuildingUpgradeInfo {
+    int64 inst_id = 1;
+    int32 state = 2;
+    int64 end_time = 3;
+    int32 target_facility_id = 4;
+    int32 target_level = 5;
+}
+
+message UpgradeBuildingRequest {
+    int64 inst_id = 1;
+}
+
+message UpgradeBuildingReply {
+    BuildingUpgradeInfo upgrade = 1;
+}
+
+message CompleteBuildingUpgradeRequest {
+    int64 inst_id = 1;
+}
+
+message CompleteBuildingUpgradeReply {
+    FacilityInfo facility = 1;
+    BuildingItemInfo item = 2;
+}
+
+message AddFeedRequest {
+    int64 instance_id = 1;
+    int32 add_count = 2;
+    bool use_gold = 3;
+    int64 host_gid = 4;
+}
+
+message AddFeedReply {
+    FeedMachineDetail detail = 1;
+    repeated corepb.Item consumed = 2;
+}
+
+message FacilityDetailInfo {
+    int64 instance_id = 1;
+    string name = 2;
+    string description = 3;
+    int32 base_facility_id = 4;
+    int32 module_type = 5;
+    repeated corepb.Item upgrade_cost = 6;
+    int32 level = 7;
+    int32 facility_id = 8;
+    int32 position_x = 9;
+    int32 position_y = 10;
+    int32 rotation = 11;
+    int32 width = 12;
+    int32 height = 13;
+    int32 capacity = 14;
+    gamepb.animalpb.RanchDetail ranch = 20;
+    FeedMachineDetail feed_machine = 21;
+    bytes order_board = 22;
+    EmptyFacilityDetail empty_detail = 99;
+}
+
+message EmptyFacilityDetail {}
+
+message GetFacilityDetailRequest {
+    int64 instance_id = 1;
+    int64 host_gid = 2;
+}
+
+message GetFacilityDetailReply {
+    FacilityDetailInfo info = 1;
+}

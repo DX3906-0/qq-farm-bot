@@ -103,11 +103,20 @@ function registerAdminBagRoutes({
       if (!itemId)
         return res.status(400).json({ ok: false, error: "缺少 itemId" });
 
-      const usedItemId = toNum(itemId);
-      const usedCount = Math.max(1, toNum(count) || 1);
+      const usedItemId = Number(itemId);
+      const rawCount = count === undefined ? 1 : count;
+      const usedCount = Number(rawCount);
+      if (!Number.isSafeInteger(usedItemId) || usedItemId <= 0
+        || !['number', 'string'].includes(typeof rawCount) || !/^\d+$/.test(String(rawCount))
+        || !Number.isSafeInteger(usedCount) || usedCount <= 0) {
+        return res.status(400).json({ ok: false, error: '物品编号和使用数量必须为有效正整数', sent: false, resultState: 'not_sent' });
+      }
       const usedItemName = getItemName(usedItemId);
       const used = await provider.useItem(accountId, usedItemId, usedCount, uid);
-      if (used?.resultState !== 'completed') throw Object.assign(new Error('使用结果未确认，请只刷新核对'), { resultState: 'unknown', sent: true, outcomeUnknown: true });
+      if (used?.resultState !== 'completed' || Number(used.usedCount) !== usedCount
+        || used.usedItemId != null && Number(used.usedItemId) !== usedItemId) {
+        throw Object.assign(new Error('使用回包未确认本次数量，请只刷新核对'), { resultState: 'unknown', sent: true, outcomeUnknown: true });
+      }
       const newItems = Array.isArray(used.rewards) ? used.rewards : [];
 
       emitRealtimeLog({
@@ -125,6 +134,7 @@ function registerAdminBagRoutes({
           items: Array.isArray(used?.rewards) ? used.rewards : newItems,
           rewards: Array.isArray(used?.rewards) ? used.rewards : newItems,
           resultState: used?.resultState,
+          usedItemId,
           usedItemName,
           usedCount,
         },

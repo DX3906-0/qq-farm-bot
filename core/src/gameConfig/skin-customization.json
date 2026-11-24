@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "source": {
+    "kind": "official-asset-bundle",
+    "manifestUrl": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/config.943e2.json",
+    "manifestSha256": "5978d8f698a93dfc462a463a9b54a72e218c9be44ca1b11d6db9df7f97cbb23b",
+    "gameJsSha256": "3ce682493dde4b8ab56d621eeb27f4aa1b50e802a077997e5fc1bbee8f49072b",
+    "module": "chunks:///_virtual/SkinDecoratePartHelper.ts",
+    "moduleOffset": 6601754,
+    "files": {
+      "SkinPartCfg": {"url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/import/04/04661f8a-57b3-4d78-ba1b-7080457f8738.32eb3.json", "sha256": "84b10e185a27e46bcd6041c3a5327d65c4e3a776aeaa349c0ce7eb9d29fab657"},
+      "SkinCfg": {"url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/import/4c/4c017ffc-b3d1-44b4-b3db-e325f46d99d9.606c2.json", "sha256": "07a31900b628af32e74165a6fb2fb54647acb561631a3712d6a5744eec2f417c"},
+      "SkinPartSetCfg": {"url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/import/b2/b2f1dc89-66bc-4804-ac61-abb3b1ca600f.afba2.json", "sha256": "1e6488efb1b07b3c7a1d4a049b878548ab2dcf2ec72fa176bb22c58b8f252f78"},
+      "SkinPartPresetCfg": {"url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/import/b5/b56d028a-0619-4641-9fe2-649693853507.4a82f.json", "sha256": "4708448f1e00a7ee22b45472c3e39bbc2681917105c92a27158e39fa2d041e59"},
+      "SkinSlotTypeCfg": {"url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/import/ee/ee692430-a999-47aa-975e-ca8209d30bc9.076f4.json", "sha256": "bc9458e6e505a4a8f2edf1f511e7cb44c11943fae082fadd536d762f94ae959f"}
+    }
+  },
+  "houses": [
+    {"skinId": 201012, "slotType": 1, "name": "缤纷奶茶小屋", "enabled": true, "slotTypes": [1, 2, 3, 4, 5, 6, 7], "defaultPresetId": 1001, "defaultPartIds": [210001, 210002, 210003, 210004, 210005, 210006, 210007]}
+  ],
+  "slots": [
+    {"slotType": 1, "name": "屋顶", "layer": 7}, {"slotType": 2, "name": "门", "layer": 3},
+    {"slotType": 3, "name": "窗", "layer": 4}, {"slotType": 4, "name": "墙面", "layer": 2},
+    {"slotType": 5, "name": "地板", "layer": 1}, {"slotType": 6, "name": "桌椅", "layer": 5},
+    {"slotType": 7, "name": "装饰", "layer": 6}
+  ],
+  "parts": [
+    {"partId": 210001, "skinId": 201012, "slotType": 1, "name": "基础屋顶", "iconRes": "gui/texture/skinDecorationDetail/img_wuding01/spriteFrame", "sortOrder": 1, "enabled": true},
+    {"partId": 210002, "skinId": 201012, "slotType": 2, "name": "基础木门", "iconRes": "gui/texture/skinDecorationDetail/img_men01/spriteFrame", "sortOrder": 2, "enabled": true},
+    {"partId": 210003, "skinId": 201012, "slotType": 3, "name": "基础款窗", "iconRes": "gui/texture/skinDecorationDetail/img_chuang01/spriteFrame", "sortOrder": 3, "enabled": true},
+    {"partId": 210004, "skinId": 201012, "slotType": 4, "name": "基础墙面", "iconRes": "gui/texture/skinDecorationDetail/img_qiangmian01/spriteFrame", "sortOrder": 4, "enabled": true},
+    {"partId": 210005, "skinId": 201012, "slotType": 5, "name": "基础地板", "iconRes": "gui/texture/skinDecorationDetail/img_diban01/spriteFrame", "sortOrder": 5, "enabled": true},
+    {"partId": 210006, "skinId": 201012, "slotType": 6, "name": "基础桌椅", "iconRes": "gui/texture/skinDecorationDetail/img_zhuoyi01/spriteFrame", "sortOrder": 6, "enabled": true},
+    {"partId": 210007, "skinId": 201012, "slotType": 7, "name": "无装饰", "iconRes": "", "sortOrder": 7, "enabled": true},
+    {"partId": 210011, "skinId": 201012, "slotType": 1, "name": "椰风屋顶", "iconRes": "gui/texture/skinDecorationDetail/img_wuding02/spriteFrame", "sortOrder": 8, "enabled": true},
+    {"partId": 210012, "skinId": 201012, "slotType": 2, "name": "冰雪木门", "iconRes": "gui/texture/skinDecorationDetail/img_men02/spriteFrame", "sortOrder": 9, "enabled": true},
+    {"partId": 210013, "skinId": 201012, "slotType": 3, "name": "冰雪款窗", "iconRes": "gui/texture/skinDecorationDetail/img_chuang02/spriteFrame", "sortOrder": 10, "enabled": true},
+    {"partId": 210014, "skinId": 201012, "slotType": 4, "name": "浅砖墙面", "iconRes": "gui/texture/skinDecorationDetail/img_qiangmian02/spriteFrame", "sortOrder": 11, "enabled": true},
+    {"partId": 210015, "skinId": 201012, "slotType": 5, "name": "花砖地板", "iconRes": "gui/texture/skinDecorationDetail/img_diban02/spriteFrame", "sortOrder": 12, "enabled": true},
+    {"partId": 210016, "skinId": 201012, "slotType": 6, "name": "海贝桌椅", "iconRes": "gui/texture/skinDecorationDetail/img_zhuoyi02/spriteFrame", "sortOrder": 13, "enabled": true},
+    {"partId": 210017, "skinId": 201012, "slotType": 7, "name": "珍奶装饰", "iconRes": "gui/texture/skinDecorationDetail/img_zhuangshi02/spriteFrame", "sortOrder": 14, "enabled": true},
+    {"partId": 210021, "skinId": 201012, "slotType": 1, "name": "森野屋顶", "iconRes": "gui/texture/skinDecorationDetail/img_wuding03/spriteFrame", "sortOrder": 15, "enabled": true},
+    {"partId": 210022, "skinId": 201012, "slotType": 2, "name": "青藤木门", "iconRes": "gui/texture/skinDecorationDetail/img_men03/spriteFrame", "sortOrder": 16, "enabled": true},
+    {"partId": 210023, "skinId": 201012, "slotType": 3, "name": "焦糖款窗", "iconRes": "gui/texture/skinDecorationDetail/img_chuang03/spriteFrame", "sortOrder": 17, "enabled": true},
+    {"partId": 210024, "skinId": 201012, "slotType": 4, "name": "苔石墙面", "iconRes": "gui/texture/skinDecorationDetail/img_qiangmian03/spriteFrame", "sortOrder": 18, "enabled": true},
+    {"partId": 210025, "skinId": 201012, "slotType": 5, "name": "人字地板", "iconRes": "gui/texture/skinDecorationDetail/img_diban03/spriteFrame", "sortOrder": 19, "enabled": true},
+    {"partId": 210026, "skinId": 201012, "slotType": 6, "name": "青柠桌椅", "iconRes": "gui/texture/skinDecorationDetail/img_zhuoyi03/spriteFrame", "sortOrder": 20, "enabled": true},
+    {"partId": 210027, "skinId": 201012, "slotType": 7, "name": "叶语装饰", "iconRes": "gui/texture/skinDecorationDetail/img_zhuangshi03/spriteFrame", "sortOrder": 21, "enabled": true},
+    {"partId": 210031, "skinId": 201012, "slotType": 1, "name": "可可屋顶", "iconRes": "gui/texture/skinDecorationDetail/img_wuding04/spriteFrame", "sortOrder": 22, "enabled": true},
+    {"partId": 210032, "skinId": 201012, "slotType": 2, "name": "暖光木门", "iconRes": "gui/texture/skinDecorationDetail/img_men04/spriteFrame", "sortOrder": 23, "enabled": true},
+    {"partId": 210033, "skinId": 201012, "slotType": 3, "name": "绿意款窗", "iconRes": "gui/texture/skinDecorationDetail/img_chuang04/spriteFrame", "sortOrder": 24, "enabled": true},
+    {"partId": 210034, "skinId": 201012, "slotType": 4, "name": "杏仁墙面", "iconRes": "gui/texture/skinDecorationDetail/img_qiangmian04/spriteFrame", "sortOrder": 25, "enabled": true},
+    {"partId": 210035, "skinId": 201012, "slotType": 5, "name": "茶木地板", "iconRes": "gui/texture/skinDecorationDetail/img_diban04/spriteFrame", "sortOrder": 26, "enabled": true},
+    {"partId": 210036, "skinId": 201012, "slotType": 6, "name": "莓果桌椅", "iconRes": "gui/texture/skinDecorationDetail/img_zhuoyi04/spriteFrame", "sortOrder": 27, "enabled": true},
+    {"partId": 210037, "skinId": 201012, "slotType": 7, "name": "茶语装饰", "iconRes": "gui/texture/skinDecorationDetail/img_zhuangshi04/spriteFrame", "sortOrder": 28, "enabled": true},
+    {"partId": 210041, "skinId": 201012, "slotType": 1, "name": "蜜熊屋顶", "iconRes": "gui/texture/skinDecorationDetail/img_wuding05/spriteFrame", "sortOrder": 29, "enabled": true},
+    {"partId": 210042, "skinId": 201012, "slotType": 2, "name": "蜜熊木门", "iconRes": "gui/texture/skinDecorationDetail/img_men05/spriteFrame", "sortOrder": 30, "enabled": true},
+    {"partId": 210043, "skinId": 201012, "slotType": 3, "name": "蜜熊窗", "iconRes": "gui/texture/skinDecorationDetail/img_chuang05/spriteFrame", "sortOrder": 31, "enabled": true},
+    {"partId": 210044, "skinId": 201012, "slotType": 4, "name": "蜜熊墙面", "iconRes": "gui/texture/skinDecorationDetail/img_qiangmian05/spriteFrame", "sortOrder": 32, "enabled": true},
+    {"partId": 210045, "skinId": 201012, "slotType": 5, "name": "蜜熊地板", "iconRes": "gui/texture/skinDecorationDetail/img_diban05/spriteFrame", "sortOrder": 33, "enabled": true},
+    {"partId": 210046, "skinId": 201012, "slotType": 6, "name": "蜜熊桌椅", "iconRes": "gui/texture/skinDecorationDetail/img_zhuoyi05/spriteFrame", "sortOrder": 34, "enabled": true},
+    {"partId": 210047, "skinId": 201012, "slotType": 7, "name": "蜜熊装饰", "iconRes": "gui/texture/skinDecorationDetail/img_zhuangshi05/spriteFrame", "sortOrder": 35, "enabled": true},
+    {"partId": 210048, "skinId": 201012, "slotType": 7, "name": "人气装饰", "iconRes": "gui/texture/skinDecorationDetail/img_zhuangshi06/spriteFrame", "sortOrder": 35, "enabled": true}
+  ]
+}

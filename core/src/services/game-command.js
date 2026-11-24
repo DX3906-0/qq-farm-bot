@@ -29,6 +29,10 @@ function unknown(message = '操作结果未确认，请只刷新核对，不要�
     return requestError(message, { errorCode: 'GAME_RESULT_UNKNOWN', retryable: false, sent: true,
         resultState: 'unknown', outcomeUnknown: true, refreshRequired: true, causeCode: cause?.errorCode || cause?.code });
 }
+function blockedUnknown(message = '上次操作结果未确认，本次没有发送新请求；请只刷新核对，不要重复提交') {
+    return requestError(message, { errorCode: 'GAME_PRIOR_RESULT_UNKNOWN', retryable: false, sent: false,
+        resultState: 'unknown', outcomeUnknown: false, priorOutcomeUnknown: true, refreshRequired: true });
+}
 function captureSession(options = {}) {
     const context = { ...getRequestContext(), ...options, priority: 'foreground' };
     context.deadline = Math.min(Date.now() + 60000, Number.isFinite(context.deadline) ? context.deadline : Infinity);
@@ -86,7 +90,7 @@ function createGameCommandScope(name, dependencies = {}) {
     function reserve(session, key) {
         validateSession(session);
         const state = ledger(session.accountId);
-        if (state[token(key)]) throw unknown('此操作有未确认记录，禁止重放，请只刷新核对');
+        if (state[token(key)]) throw blockedUnknown('此操作有未确认记录，本次未发送新请求；禁止重放，请只刷新核对');
         if (Object.keys(state).length >= 128) throw validation('未确认操作记录过多，请先核对已有结果', 'GAME_LEDGER_FULL');
         const next = { ...state, [token(key)]: { phase: 'pending', at: Date.now() } };
         try { save(session.accountId, next); }
@@ -115,7 +119,11 @@ function createGameCommandScope(name, dependencies = {}) {
         if (!Request || !Reply) throw validation(`协议未加载：${method}`, 'GAME_PROTO_UNAVAILABLE');
         const payload = Request.encode(Request.fromObject(input)).finish();
         if (options.write && !options.key) throw validation('缺少单次操作标识');
-        if (options.write) reserve(session, options.key);
+        if (options.write) {
+            reserve(session, options.key);
+            if (!session.commandWrites) session.commandWrites = new Set();
+            session.commandWrites.add(options.key);
+        }
         let response;
         try {
             response = await runWithRequestContext(session.context, () => network.sendMsgAsync(service, method, payload,
@@ -147,9 +155,13 @@ function createGameCommandScope(name, dependencies = {}) {
         const release = await gate.acquire('foreground', { ...session.context, validate: () => validateSession(session) });
         try { return await operation(session); }
         catch (cause) {
-            // A post-write read or validation failure still leaves the durable pending record.
-            if (Object.values(ledger(session.accountId)).some(entry => entry.phase !== 'completed') && cause.resultState !== 'unknown') {
-                throw unknown('操作链路未全部确认，请只刷新核对，不要重放', cause);
+            // Only writes reserved by THIS operation can turn a later read/validation
+            // failure into a post-write unknown. Older records or another SKU must
+            // not make a new pre-write rejection pretend that a game write was sent.
+            const pendingThisOperation = [...(session.commandWrites || [])]
+                .some(key => ledger(session.accountId)[token(key)]?.phase === 'pending');
+            if (pendingThisOperation && cause.resultState !== 'unknown') {
+                throw unknown('本次操作链路未全部确认，请只刷新核对，不要重放', cause);
             }
             throw cause;
         }
@@ -158,4 +170,4 @@ function createGameCommandScope(name, dependencies = {}) {
     return { rpc, execute, blocked, confirm, completed, confirmOnce };
 }
 
-module.exports = { createGameCommandScope, captureSession, validateSession, validation, unknown, positiveId, quantity, own };
+module.exports = { createGameCommandScope, captureSession, validateSession, validation, unknown, blockedUnknown, positiveId, quantity, own };

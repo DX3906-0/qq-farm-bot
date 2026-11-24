@@ -10,6 +10,9 @@ const { createGameCommandScope } = require('./game-command');
 const { createRequestGate, getRequestContext, runWithRequestContext, throwIfRequestCancelled, requestError } = require('../utils/request-priority');
 
 const SERVICE = 'gamepb.solartermspb.SolarTermsV2Service';
+// User reviewed this exact reference dataset and confirmed its answers. Any source
+// update changes the digest and is skipped until reviewed again.
+const USER_CONFIRMED_REFERENCE_ANSWER_SHA256 = 'f470c32cd5f7c6f433619b431ccc7ac5cd219b9fa893b964406bf5772315cadd';
 const configSources = Object.freeze({
     repository: 'liyangpengs/qq-farm-bot',
     commit: 'a459b0ab787c75ab7cfe8cd16899dbd1f6d7fca7',
@@ -290,9 +293,11 @@ async function autoAnswerSolarQuizzes(input = {}, options = {}) {
         }
     }
     const available = calendar.events.filter(event => event.canAnswer && (!approval || event.id === input.id));
-    const eligible = available.filter(event => (event.answerSource?.answerOriginVerified === true || approval)
+    const eligible = available.filter(event => (event.answerSource?.answerOriginVerified === true || approval
+        || (event.answerSource?.kind === 'upstream-live-reference'
+            && event.answerSource.sha256 === USER_CONFIRMED_REFERENCE_ANSWER_SHA256))
         && Number.isInteger(event.answerIndex) && event.answerIndex >= 0 && event.answerIndex < event.options.length);
-    if (!eligible.length) return { skipped: true, reason: approval ? 'not_answerable' : 'no_independently_verified_answer',
+    if (!eligible.length) return { skipped: true, reason: approval ? 'not_answerable' : 'no_verified_or_user_confirmed_answer',
         candidateCount: available.length, results: [], count: 0 };
     const results = [];
     for (const event of eligible) {
@@ -301,7 +306,8 @@ async function autoAnswerSolarQuizzes(input = {}, options = {}) {
             expectedStartTime: event.startTime, expectedEndTime: event.endTime }, { ...options, priority: 'background' });
         results.push({ ...result, id: event.id, name: event.name, optionIndex: event.answerIndex,
             selectedOption: event.options[event.answerIndex], answerOriginVerified: event.answerSource?.answerOriginVerified === true,
-            answerProvenance: approval ? 'user-confirmed-upstream-reference-once' : 'independently-verified-config' });
+            answerProvenance: approval ? 'user-confirmed-upstream-reference-once'
+                : event.answerOriginVerified === true ? 'independently-verified-config' : 'user-confirmed-reference-dataset' });
         if (result.correct !== true) break;
     }
     return { accountId: calendar.accountId, results, count: results.length };

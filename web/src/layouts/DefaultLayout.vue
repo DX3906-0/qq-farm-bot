@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import MysteryMerchantBanner from '@/components/shop/MysteryMerchantBanner.vue'
 import Sidebar from '@/components/Sidebar.vue'
 import TopAccountMenu from '@/components/TopAccountMenu.vue'
-import { cancelContentMotion, primeContentCompositor, useContentMotion } from '@/composables/useContentMotion'
-import { menuRoutes, warmMenuCode } from '@/router/menu'
+import BaseButton from '@/components/ui/BaseButton.vue'
+import WorkspaceTravelOverlay from '@/components/WorkspaceTravelOverlay.vue'
+import { cancelContentMotion, createWorkspaceTravel, primeContentCompositor, useContentMotion } from '@/composables/useContentMotion'
+import { menuForRoute, workspaceForRoute, workspaceMenuRoutes, workspaceSummaryPath, workspaceSwitchPath, warmMenuCode } from '@/router/menu'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
 import { LOCAL_UI_READONLY } from '@/config/localReadonly'
@@ -17,10 +19,21 @@ const headerLogoFailed = ref(false)
 const { currentAccountId } = storeToRefs(useAccountStore())
 const router = useRouter()
 const route = useRoute()
-const pageContext = computed(() => menuRoutes.find(item => item.name === route.name) || menuRoutes[0]!)
+const workspace = computed(() => workspaceForRoute(route))
+const workspaceLabel = computed(() => workspace.value === 'ranch' ? '牧场' : '农场')
+const switchPath = computed(() => workspaceSwitchPath(route))
+const switchIcon = computed(() => workspace.value === 'ranch' ? 'i-carbon-growth' : 'i-carbon-sprout')
+const summaryPath = computed(() => workspaceSummaryPath(workspace.value))
+const pageContext = computed(() => menuForRoute(route) || workspaceMenuRoutes(workspace.value)[0]!)
 const pageViewport = ref<HTMLElement | null>(null)
 const pageMotion = useContentMotion(() => pageViewport.value)
 let navigationEpoch = 0
+const travelController = createWorkspaceTravel(() => {
+  void nextTick(() => document.querySelector<HTMLElement>('[data-workspace-switch]')?.focus({ preventScroll: true }))
+})
+const workspaceTravel = travelController.active
+function cancelWorkspaceTravel() { travelController.cancel() }
+function onTravelArrived(id: number) { travelController.arrived(id) }
 let pendingNavigation: {
   to: object
   releaseGuard: (allowed?: boolean) => void
@@ -37,26 +50,35 @@ const removeBefore = router.beforeEach(() => {
   navigationEpoch++
   cancelContentMotion('navigation')
   releaseNavigation()
+  cancelWorkspaceTravel()
 })
-const removeResolve = router.beforeResolve((to, from) => {
+const removeResolve = router.beforeResolve(async (to, from) => {
   // Lazy imports and authorization have already finished. Query-only updates
   // stay in place; entering/leaving this layout is not an internal page motion.
   if (to.path === from.path || !pageViewport.value || to.matched[0] !== from.matched[0])
     return
   const epoch = navigationEpoch
+  if (workspaceForRoute(to) !== workspaceForRoute(from)) {
+    // Leave/auth/lazy guards have succeeded. Never hide an unsaved-settings
+    // confirmation with the journey, and never wait for a game scene RPC.
+    travelController.begin(epoch, workspaceForRoute(to), to.path)
+    await nextTick()
+    if (!document.hidden) await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+    return epoch === navigationEpoch && workspaceTravel.value?.id === epoch
+  }
   let releaseGuard!: (allowed?: boolean) => void
   let painted!: () => void
   const guard = new Promise<boolean | void>((resolve) => { releaseGuard = resolve })
   const paint = new Promise<void>((resolve) => { painted = resolve })
   const pending = { to, releaseGuard, painted }
   pendingNavigation = pending
-  const order = (name: unknown) => menuRoutes.findIndex(item => item.name === name)
+  const order = (path: string) => workspaceMenuRoutes(workspaceForRoute({ path })).findIndex(item => `/${item.path}` === path)
   void pageMotion.change(() => {
     releaseGuard()
     // Only wait for route commit/DOM flush, never for the visual animation.
     return paint
   }, {
-    direction: order(to.name) < order(from.name) ? -1 : 1,
+    direction: order(to.path) < order(from.path) ? -1 : 1,
     fromKey: from.path, toKey: to.path,
     valid: () => epoch === navigationEpoch,
     onAbort: () => {
@@ -72,6 +94,14 @@ const removeResolve = router.beforeResolve((to, from) => {
   return guard
 })
 const removeAfter = router.afterEach((to, _from, failure) => {
+  const travel = workspaceTravel.value
+  if (travel) {
+    if (failure || to.path !== travel.path) cancelWorkspaceTravel()
+    else void nextTick(() => {
+      if (workspaceTravel.value?.id !== travel.id) return
+      travelController.painted(travel.id, to.path)
+    })
+  }
   if (pendingNavigation?.to !== to)
     return
   if (failure) pageMotion.cancel('superseded')
@@ -80,10 +110,12 @@ const removeAfter = router.afterEach((to, _from, failure) => {
 const removeError = router.onError(() => {
   pageMotion.cancel('superseded')
   releaseNavigation()
+  cancelWorkspaceTravel()
 })
 watch(currentAccountId, () => {
   cancelContentMotion('context')
   releaseNavigation()
+  cancelWorkspaceTravel()
 }, { flush: 'sync' })
 watch(sidebarOpen, (open) => {
   if (open) cancelContentMotion('overlay')
@@ -91,9 +123,10 @@ watch(sidebarOpen, (open) => {
 
 onMounted(() => {
   appStore.fetchLoginPageConfig()
-  const index = menuRoutes.findIndex(item => item.name === router.currentRoute.value.name)
-  // Warm at most adjacent navigation code, not account/game responses.
-  for (const item of menuRoutes.slice(Math.max(0, index - 1), index + 2))
+  const items = workspaceMenuRoutes(workspace.value)
+  const index = items.findIndex(item => item.name === router.currentRoute.value.name)
+  // Warm only adjacent code in this workspace, never account/game responses.
+  for (const item of items.slice(Math.max(0, index - 1), index + 2))
     warmMenuCode(`/${item.path}`)
   void primeContentCompositor(() => pageViewport.value)
 })
@@ -101,6 +134,7 @@ onBeforeUnmount(() => {
   navigationEpoch++
   cancelContentMotion('unmount')
   releaseNavigation()
+  travelController.dispose()
   removeBefore(); removeResolve(); removeAfter(); removeError()
 })
 
@@ -110,7 +144,7 @@ watch(() => loginPageConfig.value.logoUrl, () => {
 </script>
 
 <template>
-  <div class="w-screen flex overflow-hidden bg-gray-50 dark:bg-gray-900" style="height: 100dvh;">
+  <div class="w-screen flex overflow-hidden bg-gray-50 dark:bg-gray-900" style="height: 100dvh;" :data-game-workspace="workspace" :inert="workspaceTravel ? true : undefined">
     <!-- Mobile Sidebar Overlay -->
     <div
       v-if="sidebarOpen"
@@ -121,10 +155,10 @@ watch(() => loginPageConfig.value.logoUrl, () => {
     <Sidebar />
 
     <main class="relative h-full min-h-0 min-w-0 flex flex-1 flex-col overflow-hidden">
-      <header class="glass-panel relative z-30 mx-2 mt-2 h-16 flex shrink-0 items-center justify-between rounded-lg px-4 md:mx-4 md:mt-4 md:px-5">
-        <div class="min-w-0 flex items-center gap-3">
+      <header class="glass-panel relative z-30 mx-2 mt-2 h-16 flex shrink-0 items-center justify-between gap-1 rounded-lg px-2 sm:gap-3 sm:px-4 md:mx-4 md:mt-4 md:px-5">
+        <div class="min-w-0 flex flex-1 items-center gap-3">
           <button
-            class="h-11 w-11 flex items-center justify-center rounded-lg text-gray-500 transition lg:hidden hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+            class="h-11 w-11 flex flex-none items-center justify-center rounded-lg text-gray-500 transition lg:hidden hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
             type="button"
             aria-label="打开导航"
             :aria-expanded="sidebarOpen"
@@ -142,21 +176,27 @@ watch(() => loginPageConfig.value.logoUrl, () => {
             >
             <div v-else class="i-carbon-sprout text-base text-white" />
           </div>
-          <div class="truncate text-base text-gray-900 font-semibold md:text-lg dark:text-gray-100 lg:hidden">
-            {{ loginPageConfig.title || 'QQ农场智能助手' }}
+          <div class="min-w-0 truncate text-base text-gray-900 font-semibold md:text-lg dark:text-gray-100 lg:hidden">
+            <span class="hidden sm:inline">{{ loginPageConfig.title || 'QQ农场智能助手' }}</span><span class="sm:hidden">{{ workspaceLabel }}</span>
           </div>
           <div class="layout-page-context hidden min-w-0 items-center gap-2 lg:flex" aria-label="当前页面">
-            <span :class="pageContext.icon" aria-hidden="true" /><span>{{ pageContext.label }}</span>
+            <span :class="pageContext.icon" aria-hidden="true" /><span>{{ workspaceLabel }} · {{ pageContext.label }}</span>
           </div>
         </div>
 
-        <span v-if="LOCAL_UI_READONLY" class="layout-readonly-status"><span class="i-carbon-view" aria-hidden="true" />本地浏览 · 无账号</span>
+        <nav class="layout-workspace-actions flex flex-none items-center gap-2" aria-label="工作区切换">
+          <BaseButton :to="summaryPath" size="sm" variant="text" class="hidden md:inline-flex" aria-label="查看总概览">总概览</BaseButton>
+          <BaseButton :to="switchPath" size="sm" variant="secondary" class="shrink-0 whitespace-nowrap px-2 sm:px-3" data-workspace-switch :aria-label="workspace === 'ranch' ? '返回农场工作区' : '前往牧场工作区'" @pointerenter="warmMenuCode(switchPath)" @focus="warmMenuCode(switchPath)">
+            <span :class="switchIcon" aria-hidden="true" /><span class="hidden min-[380px]:inline">{{ workspace === 'ranch' ? '回农场' : '去牧场' }}</span>
+          </BaseButton>
+        </nav>
+        <span v-if="LOCAL_UI_READONLY" class="layout-readonly-status" title="本地浏览 · 无账号"><span class="i-carbon-view" aria-hidden="true" /><span class="hidden sm:inline">本地浏览 · 无账号</span><span class="sm:hidden">仅浏览</span></span>
         <TopAccountMenu v-else />
       </header>
 
       <!-- Main Content Area -->
       <div class="min-h-0 flex flex-1 flex-col overflow-hidden">
-        <MysteryMerchantBanner />
+        <MysteryMerchantBanner v-if="workspace === 'farm' && route.name !== 'overview'" />
         <div ref="pageViewport" class="custom-scrollbar page-viewport min-h-0 flex flex-1 flex-col overflow-y-auto p-3 pb-[calc(1rem+env(safe-area-inset-bottom))] md:p-6 sm:p-4 md:pb-6 sm:pb-[calc(1rem+env(safe-area-inset-bottom))]" data-page-viewport>
           <RouterView v-slot="{ Component, route }">
             <!-- Painted snapshots provide the exit/entry. Real old components
@@ -169,9 +209,17 @@ watch(() => loginPageConfig.value.logoUrl, () => {
       </div>
     </main>
   </div>
+  <Teleport to="body">
+    <Transition name="workspace-travel">
+      <WorkspaceTravelOverlay v-if="workspaceTravel" :key="workspaceTravel.id" :destination="workspaceTravel.destination" :request-id="workspaceTravel.id" @arrived="onTravelArrived" />
+    </Transition>
+  </Teleport>
 </template>
 
 <style scoped>
+.workspace-travel-enter-active,.workspace-travel-leave-active { transition: opacity 160ms ease; }
+.workspace-travel-enter-from,.workspace-travel-leave-to { opacity: 0; }
+@media (prefers-reduced-motion: reduce) { .workspace-travel-enter-active,.workspace-travel-leave-active { transition: none; } }
 .layout-page-context { color: var(--theme-text); font-size: 14px; font-weight: 500; }
 .layout-page-context > span:first-child { color: var(--muted-text); font-size: 18px; }
 .layout-readonly-status { display: inline-flex; flex-shrink: 0; align-items: center; gap: 6px; color: var(--muted-text); font-size: 12px; }

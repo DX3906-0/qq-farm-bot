@@ -152,7 +152,7 @@ export function createReadCoordinator() {
 
 const safeReadPaths = new Set([
   '/api/dog/info', '/api/dog/protect-logs', '/api/dog/capital-mode',
-  '/api/lands', '/api/seeds', '/api/farm/unified-harvest', '/api/bag/seeds',
+  '/api/lands', '/api/ranch/operations', '/api/seeds', '/api/farm/unified-harvest', '/api/bag/seeds',
   '/api/shop/seed', '/api/shop/pet', '/api/shop/decoration', '/api/shop/mall', '/api/shop/mystery',
   '/api/activity/star', '/api/activity/qixi',
   // 节令小札/荷风游记：活动页读取与「领取后刷新」都走这里，纳入只读合并避免切页重复请求。

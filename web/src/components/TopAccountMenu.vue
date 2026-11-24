@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { workspaceForRoute } from '@/router/menu'
 import api from '@/api'
 import AccountModal from '@/components/AccountModal.vue'
 import AccountCareerModal from '@/components/AccountCareerModal.vue'
@@ -11,6 +13,8 @@ import type { Account } from '@/stores/account'
 import { getPlatformClass, getPlatformLabel, useAccountStore } from '@/stores/account'
 import { useStatusStore } from '@/stores/status'
 
+const route = useRoute()
+const settingsPath = computed(() => route && workspaceForRoute(route) === 'ranch' ? '/ranch/settings' : '/settings')
 const accountStore = useAccountStore()
 const statusStore = useStatusStore()
 const { accounts, currentAccount, currentAccountId, equippedAvatarFrame, avatarFrameAccountId } = storeToRefs(accountStore)
@@ -259,7 +263,7 @@ async function handleAccountSaved() {
   <div class="relative">
     <button
       ref="trigger"
-      class="max-w-[min(76vw,280px)] flex items-center gap-3 rounded-xl px-3 py-2 text-left transition hover:bg-gray-100/70 dark:hover:bg-gray-700/50"
+      class="max-w-[min(42vw,220px)] flex min-w-0 items-center gap-2 rounded-xl px-1.5 py-2 text-left transition hover:bg-gray-100/70 dark:hover:bg-gray-700/50 sm:max-w-[min(76vw,280px)] sm:gap-3 sm:px-3"
       @click="toggleDropdown"
     >
       <div class="account-avatar relative h-9 w-9 shrink-0 cursor-pointer" :class="{ 'has-frame': !!currentFrame }" :title="currentFrame ? `查看角色生涯 · ${currentFrame.name}` : avatarFrameLoadMessage || '查看角色生涯'" @click="openCareer">
@@ -376,7 +380,7 @@ async function handleAccountSaved() {
             <span>添加账号</span>
           </button>
           <router-link
-            to="/settings"
+            :to="settingsPath"
             class="w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors hover:bg-gray-100/50 dark:hover:bg-gray-700/50"
             :style="{ color: 'var(--theme-primary)' }"
             @click="closeDropdown"

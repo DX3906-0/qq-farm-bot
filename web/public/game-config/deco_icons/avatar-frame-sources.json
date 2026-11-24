@@ -34,11 +34,13 @@
         "sourceTexture": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "cacheFile": "gamecaches\\extraRes\\17929921095747.png",
           "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
         },
         "sourcePack": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "cacheFile": "gamecaches\\extraRes\\17929921093125.json",
           "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
         },
         "rect": {
@@ -81,11 +83,13 @@
         "sourceTexture": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "cacheFile": "gamecaches\\extraRes\\17929921095747.png",
           "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
         },
         "sourcePack": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "cacheFile": "gamecaches\\extraRes\\17929921093125.json",
           "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
         },
         "rect": {
@@ -128,11 +132,13 @@
         "sourceTexture": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "cacheFile": "gamecaches\\extraRes\\17929921095747.png",
           "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
         },
         "sourcePack": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "cacheFile": "gamecaches\\extraRes\\17929921093125.json",
           "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
         },
         "rect": {
@@ -175,11 +181,13 @@
         "sourceTexture": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "cacheFile": "gamecaches\\extraRes\\17929921095747.png",
           "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
         },
         "sourcePack": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "cacheFile": "gamecaches\\extraRes\\17929921093125.json",
           "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
         },
         "rect": {
@@ -222,11 +230,13 @@
         "sourceTexture": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/1a/1a9b74cbe.00f19.png",
+          "cacheFile": "gamecaches\\extraRes\\17929921095747.png",
           "sha256": "e48416cd295584e5975bbd62115e73f9d0cbd22f902c2e56972a8eb50e056c37"
         },
         "sourcePack": {
           "kind": "official-local-cache",
           "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/import/04/040ef8cc0.f87ad.json",
+          "cacheFile": "gamecaches\\extraRes\\17929921093125.json",
           "sha256": "6c6715231997a8bc11fb169b499dfd0798383e259d6712d63fc1877dc9b955ec"
         },
         "rect": {
@@ -264,6 +274,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/b1/b18bd5f5-6e8f-4793-95e3-735b71ef43e2.fe646.png",
+        "cacheFile": "gamecaches\\extraRes\\1786808824096103.png",
         "sha256": "3ffd4dbd82337d4a3da6592ae10ecd6dfb36d9343be650492c978e2225a808a8",
         "guid": "b18bd5f5-6e8f-4793-95e3-735b71ef43e2",
         "nativeHash": "fe646",
@@ -308,6 +319,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/82/820e117c-6eda-42b6-a8a7-9b9da3bca020.538c4.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992292364981.png",
         "sha256": "34b4b406100d0cc08195e01e29fe2a161206aed351f47764097e6c65cfbbf5e5",
         "guid": "820e117c-6eda-42b6-a8a7-9b9da3bca020",
         "nativeHash": "538c4",
@@ -330,6 +342,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/84/8454f9ac-415f-442f-a022-9458e8efaae5.c7286.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992292370982.png",
         "sha256": "654ecbc2002e219bf5ce6e3b0adf99a9eee5d4345e6f92b2e038a4075c233cb3",
         "guid": "8454f9ac-415f-442f-a022-9458e8efaae5",
         "nativeHash": "c7286",
@@ -352,6 +365,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/15/1506a19a-d4bd-4b7b-94c5-5ec63b2ce2f6.2feca.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992292376983.png",
         "sha256": "9fadadcc066d9905a77ecf1fd522c801aa1518750231581287103ac3b8b1d51b",
         "guid": "1506a19a-d4bd-4b7b-94c5-5ec63b2ce2f6",
         "nativeHash": "2feca",
@@ -374,6 +388,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/bf/bf170e2e-166b-4049-ab85-bea3f4ffc134.22847.png",
+        "cacheFile": "gamecaches\\extraRes\\178774554661817.png",
         "sha256": "a9efe5270c57a42c9ab1132a31c82c6d34eb9b20d0b134fb62f8ac103e6cd544",
         "guid": "bf170e2e-166b-4049-ab85-bea3f4ffc134",
         "nativeHash": "22847",
@@ -396,6 +411,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/67/67c0168f-8dd8-4a25-9fc6-806494afaa67.2c432.png",
+        "cacheFile": "gamecaches\\extraRes\\178671603028419.png",
         "sha256": "d961a9a6d65337b696386e96093e9b95594d16ccd9f51200ee25b6c6683c888a",
         "guid": "67c0168f-8dd8-4a25-9fc6-806494afaa67",
         "nativeHash": "2c432",
@@ -418,6 +434,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/78/78cdf94b-caf2-4bb2-aca9-d7fa42446810.3d294.png",
+        "cacheFile": "gamecaches\\extraRes\\178825783814934.png",
         "sha256": "847f033c240602382f2e2c7cede602391fd8b129e8ba208a28b3f2190bbe792f",
         "guid": "78cdf94b-caf2-4bb2-aca9-d7fa42446810",
         "nativeHash": "3d294",
@@ -440,6 +457,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/08/081fc717-e366-4e6a-a219-46bf06631d18.38557.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992125886476.png",
         "sha256": "2f2731ad3b41cccce7125cfae93d6b879f25a0ef9993a74290d17b4c0a24d661",
         "guid": "081fc717-e366-4e6a-a219-46bf06631d18",
         "nativeHash": "38557",
@@ -462,6 +480,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/ad/ad69ed82-d42b-4ba7-83dc-5c33d0de66b0.5d302.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992115631226.png",
         "sha256": "84f5cae33c4b2ebe203e467190064b723a19c8ec4b30c64cf3974529fb5e2eab",
         "guid": "ad69ed82-d42b-4ba7-83dc-5c33d0de66b0",
         "nativeHash": "5d302",
@@ -484,6 +503,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/84/84a57d35-3f05-45af-8e53-accf0ecbd97d.e15d9.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992292442984.png",
         "sha256": "9de5a6b0d6837188de87fb2b2874f5bb9c59889c4e70a700e9c5f2141f15176a",
         "guid": "84a57d35-3f05-45af-8e53-accf0ecbd97d",
         "nativeHash": "e15d9",
@@ -506,6 +526,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/03/0396de0e-605d-42ee-9a97-fa1ae70fa1fb.dccef.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992186847735.png",
         "sha256": "e6b800579a06e9ff1431afa7e2a6a8aa1ef0a9ecb747e4adfd9408dfb4db22b6",
         "guid": "0396de0e-605d-42ee-9a97-fa1ae70fa1fb",
         "nativeHash": "dccef",
@@ -528,6 +549,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/c4/c48738ce-559e-4a54-a599-5f363b822b6c.384f0.png",
+        "cacheFile": "gamecaches\\extraRes\\17929922949531000.png",
         "sha256": "7bf386263aa2f2435788bee48a5ebde932abdead11f74675a16e546ec3120ade",
         "guid": "c48738ce-559e-4a54-a599-5f363b822b6c",
         "nativeHash": "384f0",
@@ -550,6 +572,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/6e/6e224619-7ade-4ce8-ace3-3511af8f82f0.dcb54.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992294892998.png",
         "sha256": "2652e1b826600d0bf22d09dc427231c98da991ff5ceeadcd513d43091218c66b",
         "guid": "6e224619-7ade-4ce8-ace3-3511af8f82f0",
         "nativeHash": "dcb54",
@@ -572,6 +595,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/fc/fcb96ba1-1344-467c-ab8f-fb68e96418e1.c0685.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992294830997.png",
         "sha256": "ac03749d7eee01949273e86a68d560da79dda5731c0b01ae40d3fe1a1bc70443",
         "guid": "fcb96ba1-1344-467c-ab8f-fb68e96418e1",
         "nativeHash": "c0685",
@@ -594,6 +618,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/bf/bf878342-abc3-4c78-868e-f2a2fabed6a9.1186c.png",
+        "cacheFile": "gamecaches\\extraRes\\178716187967742.png",
         "sha256": "c309de3d96393e38added2210929b25c71e37846aab5eeb539dfc88fd90ae81a",
         "guid": "bf878342-abc3-4c78-868e-f2a2fabed6a9",
         "nativeHash": "1186c",
@@ -616,6 +641,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/3b/3b1d8ad5-d0b7-4f5e-9c9f-89e33c06d248.4124a.png",
+        "cacheFile": "gamecaches\\extraRes\\17929922949661001.png",
         "sha256": "9e36a28a4f3d9589f0727f104f6394e201fbab6a502ebaf9185a5c0d69e754b1",
         "guid": "3b1d8ad5-d0b7-4f5e-9c9f-89e33c06d248",
         "nativeHash": "4124a",
@@ -638,6 +664,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/4a/4a551a86-9210-4a2c-8c60-b2f3f5a94d8c.017f8.png",
+        "cacheFile": "gamecaches\\extraRes\\17929922950191002.png",
         "sha256": "abb383ffa0f09517e0d80a80a0f6d6690cf11636c364a0ca9184aff70cb14a1d",
         "guid": "4a551a86-9210-4a2c-8c60-b2f3f5a94d8c",
         "nativeHash": "017f8",
@@ -660,6 +687,7 @@
       "source": {
         "kind": "official-local-cache",
         "url": "https://cdn-resource.nqf.qq.com/release/remote/extraRes/native/08/0832f221-3604-4a70-bcf4-761ba83e0b6b.6a955.png",
+        "cacheFile": "gamecaches\\extraRes\\1792992294935999.png",
         "sha256": "931dd30591f63fab703c5ade9e9ae33e61c3eef8d48c48ec5941a9bbc6874e2e",
         "guid": "0832f221-3604-4a70-bcf4-761ba83e0b6b",
         "nativeHash": "6a955",

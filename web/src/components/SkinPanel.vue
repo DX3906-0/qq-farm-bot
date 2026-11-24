@@ -23,6 +23,31 @@ interface SkinSlot {
   equippedSkinId: number
   resultUnknown?: boolean
 }
+interface SkinPartItem {
+  partId: number
+  skinId: number
+  parentSlotType: number
+  partSlotType: number
+  name: string
+  image: string
+  owned: boolean
+  enabled: boolean
+  isDefault: boolean
+  isNew: boolean
+  selected: boolean
+}
+interface SkinCustomization {
+  skinId: number
+  slotType: number
+  name: string
+  image: string
+  equipped: boolean
+  stateKnown: boolean
+  stateError?: string
+  resultUnknown: boolean
+  partIds: number[]
+  groups: Array<{ partSlotType: number, label: string, selectedPartId: number, parts: SkinPartItem[] }>
+}
 
 const accountStore = useAccountStore()
 
@@ -36,6 +61,9 @@ const toast = ref('')
 const stateReady = ref(false)
 const warnings = ref<string[]>([])
 const confirmItem = ref<SkinItem | null>(null)
+const customizations = ref<SkinCustomization[]>([])
+const partImageErrors = ref<Record<number, boolean>>({})
+const confirmPart = ref<{ part: SkinPartItem, house: SkinCustomization, expectedPartIds: number[] } | null>(null)
 let disposed = false
 let accountEpoch = 0
 let readRevision = 0
@@ -74,6 +102,92 @@ const grouped = computed(() => {
     }))
 })
 
+function canApplyPart(house: SkinCustomization, part: SkinPartItem) {
+  return !!accountId.value && stateReady.value && !loading.value && !pending.value && house.equipped
+    && house.stateKnown && !house.resultUnknown && part.enabled === true && part.owned === true && !part.selected
+    && accountStore.skinMutationState(accountId.value, house.slotType) === 'idle'
+}
+function applyEquippedState(equipped: any[]) {
+  const current = new Map(equipped.map(row => [Number(row.slotType), row]))
+  for (const item of items.value) item.equipped = Number(current.get(item.slotType)?.skinId) === item.skinId
+  for (const slot of slots.value) slot.equippedSkinId = Number(current.get(slot.slotType)?.skinId) || 0
+  for (const house of customizations.value) {
+    const row = current.get(house.slotType)
+    house.equipped = Number(row?.skinId) === house.skinId
+    if (!house.equipped) continue
+    const allParts = house.groups.flatMap(group => group.parts)
+    if (!Array.isArray(row.partIds) || row.partIds.some((id: unknown) => !allParts.some(part => part.partId === Number(id)))) {
+      house.stateKnown = false
+      house.stateError = '当前小屋搭配尚未完整返回，请刷新核对'
+      continue
+    }
+    house.partIds = row.partIds.map(Number).filter((id: number) => !allParts.find(part => part.partId === id)?.isDefault)
+    for (const group of house.groups) {
+      group.selectedPartId = house.partIds.find(id => group.parts.some(part => part.partId === id))
+        || group.parts.find(part => part.isDefault)!.partId
+      for (const part of group.parts) part.selected = part.partId === group.selectedPartId
+    }
+  }
+}
+function requestPart(house: SkinCustomization, part: SkinPartItem) {
+  if (!canApplyPart(house, part)) return
+  confirmItem.value = null
+  preview.value = null
+  confirmPart.value = { part: { ...part }, house: { ...house }, expectedPartIds: [...house.partIds] }
+}
+function closePartConfirmation() { if (!pending.value) confirmPart.value = null }
+async function confirmPartEquip() {
+  const action = confirmPart.value
+  if (!action || !canApplyPart(action.house, action.part)) return
+  const id = accountId.value, epoch = accountEpoch
+  const target = { ...action.part }, house = action.house
+  const expectedAfter = action.expectedPartIds.filter(partId => !house.groups.find(group => group.partSlotType === target.partSlotType)?.parts.some(part => part.partId === partId))
+  if (!target.isDefault) expectedAfter.push(target.partId)
+  const sameIds = (ids: any) => Array.isArray(ids) && ids.length === expectedAfter.length
+    && new Set(ids.map(Number)).size === ids.length
+    && [...ids].map(Number).sort((a, b) => a - b).every((value, index) => value === [...expectedAfter].sort((a, b) => a - b)[index])
+  switchingId.value = target.partId
+  accountStore.setSkinMutationState(id, house.slotType, 'pending')
+  readRevision++
+  readController?.abort()
+  loading.value = false
+  let finalState: 'unknown' | 'idle' = 'unknown'
+  try {
+    const { data } = await api.post('/api/skins/parts/equip', {
+      skinId: house.skinId, partId: target.partId, expectedPartIds: action.expectedPartIds, confirmed: true,
+    }, { timeout: 70000, headers: { 'x-account-id': id } })
+    if (data?.ok !== true || resultIsUnknown(data) || resultIsUnknown(data.data)) throw { response: { data } }
+    const result = data.data
+    if (result?.accountId !== id) throw new Error('部件回复的账号未确认')
+    if (result.skipped === true && result.reason === 'already_in_target_state') {
+      finalState = 'idle'
+      if (currentContext(id, epoch)) { stateReady.value = false; showFeedback('服务端已是此搭配，请刷新查看') }
+      return
+    }
+    if (result.resultState !== 'completed' || result.confirmation !== 'SkinsEquipped' || result.method !== 'EquipSkinPart'
+      || Number(result.skinId) !== house.skinId || Number(result.partId) !== target.partId || Number(result.slotType) !== house.slotType
+      || Number(result.operate) !== (target.isDefault ? 2 : 1) || !sameIds(result.partIds)
+      || !Array.isArray(result.equipped) || new Set(result.equipped.map((row: any) => Number(row.slotType))).size !== result.equipped.length
+      || !sameIds(result.equipped.find((row: any) => Number(row.slotType) === house.slotType && Number(row.skinId) === house.skinId)?.partIds?.filter((partId: number) => !house.groups.some(group => group.parts.some(part => part.partId === Number(partId) && part.isDefault))))) {
+      throw new Error('当前装备未确认目标小屋搭配')
+    }
+    finalState = 'idle'
+    if (!currentContext(id, epoch)) return
+    applyEquippedState(result.equipped)
+    showFeedback(`已${target.isDefault ? '恢复默认' : '应用'}「${target.name}」`)
+  } catch (error: any) {
+    const result = operationFailure(error, '部件结果未确认')
+    finalState = result.outcomeUnknown ? 'unknown' : 'idle'
+    if (currentContext(id, epoch)) {
+      if (finalState === 'unknown') stateReady.value = false
+      showFeedback(finalState === 'unknown' ? `${result.error}；仅刷新核对，不重复提交。` : result.error)
+    }
+  } finally {
+    accountStore.setSkinMutationState(id, house.slotType, finalState)
+    if (currentContext(id, epoch)) { switchingId.value = 0; confirmPart.value = null }
+  }
+}
+
 function showFeedback(message: string) {
   clearTimeout(toastTimer)
   toast.value = message
@@ -107,6 +221,21 @@ function load(): Promise<void> {
         const worn = nextItems.filter(item => Number(item.slotType) === Number(slot.slotType) && item.equipped === true)
         return worn.length > 1 || worn.length === 1 && Number(worn[0]!.skinId) !== Number(slot.equippedSkinId)
       })) throw new Error('当前装扮列表存在冲突，请刷新核对，不猜测当前外观')
+    const nextCustomizations = (payload.customizations === undefined ? [] : payload.customizations) as SkinCustomization[]
+    if (!Array.isArray(nextCustomizations) || new Set(nextCustomizations.map(house => house.skinId)).size !== nextCustomizations.length
+      || nextCustomizations.some(house => !validId(house.skinId) || !validId(house.slotType)
+        || typeof house.equipped !== 'boolean' || typeof house.stateKnown !== 'boolean'
+        || !Array.isArray(house.partIds) || house.partIds.some(id => !validId(id))
+        || new Set(house.partIds).size !== house.partIds.length || !Array.isArray(house.groups)
+        || new Set(house.groups.map(group => group.partSlotType)).size !== house.groups.length
+        || house.groups.some(group => !validId(group.partSlotType) || !validId(group.selectedPartId) || !Array.isArray(group.parts)
+          || group.parts.some(part => !validId(part.partId) || Number(part.skinId) !== Number(house.skinId)
+            || Number(part.parentSlotType) !== Number(house.slotType) || Number(part.partSlotType) !== Number(group.partSlotType)
+            || typeof part.owned !== 'boolean' || typeof part.isDefault !== 'boolean' || typeof part.selected !== 'boolean')))) {
+      throw new Error('小屋部件状态不完整，请刷新核对')
+    }
+    customizations.value = nextCustomizations
+    partImageErrors.value = {}
     slots.value = nextSlots
     items.value = nextItems
     ownedCount.value = nextItems.length
@@ -168,9 +297,7 @@ async function confirmEquip() {
       || equipped.find(row => Number(row.slotType) === target.slotType)?.skinId !== target.skinId) throw new Error('当前装备未确认目标装扮')
     finalState = 'idle'
     if (!currentContext(id, epoch)) return
-    const current = new Map(equipped.map(row => [Number(row.slotType), Number(row.skinId)]))
-    for (const entry of items.value) entry.equipped = current.get(entry.slotType) === entry.skinId
-    for (const entry of slots.value) entry.equippedSkinId = current.get(entry.slotType) || 0
+    applyEquippedState(equipped)
     showFeedback(`已确认换上「${target.name}」`)
   }
   catch (e: any) {
@@ -200,9 +327,12 @@ watch(accountId, () => {
   stateReady.value = false
   slots.value = []
   items.value = []
-  ownedCount.value = 0
-  warnings.value = []
-  switchingId.value = 0
+    ownedCount.value = 0
+    customizations.value = []
+    confirmPart.value = null
+    partImageErrors.value = {}
+    warnings.value = []
+    switchingId.value = 0
   confirmItem.value = null
   preview.value = null
   toast.value = ''
@@ -266,6 +396,29 @@ onBeforeUnmount(() => {
       读取中…
     </div>
 
+    <details v-for="house in customizations" :key="house.skinId" class="skin-customization ui-card" :data-customization-skin-id="house.skinId">
+      <summary><span>{{ house.name }} · 自定义组件</span><span class="skin-customization-status">{{ house.equipped ? '小屋使用中' : '搭配已保存 · 小屋未穿戴' }}</span></summary>
+      <div class="skin-customization-body">
+        <div class="skin-customization-intro">
+          <p>屋顶、门窗、墙面、地板、桌椅和装饰可以分别搭配。切换一个部位，其余部件保持不变。</p>
+          <BaseButton v-if="!house.equipped" variant="secondary" size="sm" :disabled="pending || !stateReady || !items.find(item => item.skinId === house.skinId) || !canEquip(items.find(item => item.skinId === house.skinId)!)" @click="requestEquip(items.find(item => item.skinId === house.skinId)!)">换上小屋</BaseButton>
+        </div>
+        <p v-if="!house.equipped" class="ui-notice">先换上这件小屋，再应用组件；展开查看不会改变当前外观。</p>
+        <p v-if="!house.stateKnown || house.resultUnknown" class="ui-notice">{{ house.stateError || '小屋搭配存在未确认状态，请刷新核对，不重复提交。' }}</p>
+        <section v-for="group in house.groups" :key="group.partSlotType" class="skin-part-group">
+          <h4>{{ group.label }}<span>{{ group.parts.filter(part => part.owned && !part.isDefault).length }} 款已获得</span></h4>
+          <div class="skin-parts-grid">
+            <button v-for="part in group.parts" :key="part.partId" type="button" class="skin-part-card" :data-part-id="part.partId" :data-selected="part.selected" :disabled="!canApplyPart(house, part)" @click="requestPart(house, part)">
+              <img v-if="part.image && !partImageErrors[part.partId]" :src="part.image" :alt="part.name" loading="lazy" width="64" height="64" @error="partImageErrors[part.partId] = true">
+              <span v-else class="skin-part-fallback">{{ part.isDefault && group.label === '装饰' ? '无装饰' : part.name.slice(0, 1) }}</span>
+              <strong>{{ part.name }}</strong>
+              <small>{{ part.selected ? (house.equipped ? '使用中' : '已保存') : part.isDefault ? '恢复默认' : part.owned ? '可应用' : '未拥有' }}</small>
+            </button>
+          </div>
+        </section>
+      </div>
+    </details>
+
     <div v-for="g in grouped" :key="g.slotType" class="rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-gray-800">
       <div class="mb-2 flex items-center gap-2">
         <span class="text-sm font-medium text-gray-900 dark:text-white">{{ g.label }}</span>
@@ -304,6 +457,7 @@ onBeforeUnmount(() => {
       {{ toast }}
     </div>
 
+    <ConfirmModal :show="!!confirmPart" :title="confirmPart?.part.isDefault ? '确认恢复默认部件' : '确认应用部件'" :message="confirmPart ? `将${confirmPart.house.groups.find(group => group.partSlotType === confirmPart?.part.partSlotType)?.label || '此部位'}改为「${confirmPart.part.name}」。\n其余搭配保持不变，确认当前装备后才显示成功。` : ''" :loading="pending" @confirm="confirmPartEquip" @cancel="closePartConfirmation" @close="closePartConfirmation" />
     <ConfirmModal :show="!!confirmItem" title="确认更换装扮" :message="confirmItem ? `将当前${confirmItem.partName || '槽位'}更换为「${confirmItem.name}」。\n只提交一次，读取当前装备确认后才标记成功。` : ''" :loading="pending" @confirm="confirmEquip" @close="closeConfirmation" @cancel="closeConfirmation" />
     <!-- 放大预览：图标原始只有 100x100，放大后看细节 -->
     <div
@@ -340,3 +494,28 @@ onBeforeUnmount(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.skin-customization { overflow: hidden; color: var(--theme-text); }
+.skin-customization summary { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 16px; cursor: pointer; font-size: 14px; font-weight: 600; list-style: none; }
+.skin-customization summary::-webkit-details-marker { display: none; }
+.skin-customization summary::after { content: '+'; margin-left: auto; color: var(--muted-text); font-size: 18px; }
+.skin-customization[open] summary::after { content: '−'; }
+.skin-customization-status { color: var(--muted-text); font-size: 12px; font-weight: 400; }
+.skin-customization-body { display: grid; gap: 16px; padding: 0 16px 16px; border-top: 1px solid var(--surface-border); }
+.skin-customization-intro { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding-top: 14px; }
+.skin-customization-intro p { flex: 1; min-width: 180px; margin: 0; color: var(--muted-text); font-size: 13px; line-height: 1.6; }
+.skin-part-group h4 { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.skin-part-group h4 span { color: var(--muted-text); font-size: 12px; font-weight: 400; }
+.skin-parts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+.skin-part-card { display: flex; flex-direction: column; align-items: center; gap: 5px; min-height: 125px; padding: 10px 8px; border: 1px solid var(--surface-border); border-radius: var(--radius-control); background: var(--surface-1); color: var(--theme-text); cursor: pointer; }
+.skin-part-card img { width: 64px; height: 64px; object-fit: contain; }
+.skin-part-card strong { font-size: 12px; font-weight: 500; line-height: 1.4; }
+.skin-part-card small { color: var(--muted-text); font-size: 11px; }
+.skin-part-card[data-selected='true'] { border-color: var(--theme-primary); background: color-mix(in srgb, var(--theme-primary) 8%, var(--surface-1)); }
+.skin-part-card:disabled { cursor: default; }
+.skin-part-card:disabled:not([data-selected='true']) { opacity: .65; }
+.skin-part-card:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.skin-part-fallback { display: grid; place-items: center; width: 64px; height: 64px; border-radius: var(--radius-control); background: var(--surface-2); color: var(--muted-text); font-size: 14px; }
+@media (max-width: 520px) { .skin-parts-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } .skin-customization summary { padding: 12px; } .skin-customization-body { padding: 0 12px 12px; } }
+</style>

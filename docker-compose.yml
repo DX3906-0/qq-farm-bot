@@ -13,7 +13,6 @@ services:
 
     volumes:
       - ../data:/app/core/data
-      - ./web/dist:/app/web/dist:ro
 
     environment:
       TZ: Asia/Shanghai

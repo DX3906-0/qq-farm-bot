@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
 import type { CollectionItem } from '@/stores/collection'
+import { computed, ref, watch } from 'vue'
 
 const props = defineProps<{
   item: CollectionItem
@@ -12,12 +12,40 @@ const emit = defineEmits<{
   (e: 'display', item: CollectionItem): void
 }>()
 
-const imgFailed = ref(false)
+const imageIndex = ref(0)
+
+/** 图片只影响展示：旧接口 image 为空时，沿用真实资源名，不按藏品 ID 猜编号。 */
+const imageCandidates = computed(() => {
+  const image = typeof props.item.image === 'string' ? props.item.image.trim() : ''
+  const resource = typeof props.item.iconRes === 'string'
+    ? props.item.iconRes.trim().replace(/\/(?:spriteFrame|texture)\/?$/, '')
+    : ''
+  const resourceKey = resource.startsWith('gui/texture/collectIcon/')
+    ? resource.split('/').pop() || ''
+    : ''
+  const keys = [props.item.iconKey, resourceKey]
+    .filter((key): key is string => typeof key === 'string' && /^icon_collect_\w+$/.test(key))
+  return [...new Set([image, ...keys.map(key => `/game-config/deco_icons/${key}.png`)].filter(Boolean))]
+})
+const imageSrc = computed(() => imageCandidates.value[imageIndex.value] || '')
+
+// 换藏品或获得新地址后重新加载；拥有数/星级更新不会重试已失败的图。
+watch([() => props.item.collectionId, () => imageCandidates.value.join('\n')], () => {
+  imageIndex.value = 0
+}, { flush: 'sync' })
+
+function onImageError(event: Event) {
+  const image = event.currentTarget as HTMLImageElement | null
+  // 上一个地址的延迟错误不能把当前图片也判为失败。
+  if (image?.getAttribute('src') !== imageSrc.value)
+    return
+  imageIndex.value++
+}
 
 const MAX_STAR = 5
 
 /** 稀有度配色：1 普通 / 2 精良 / 3 稀有 / 4 史诗 */
-type RarityStyle = { label: string, border: string, badge: string }
+interface RarityStyle { label: string, border: string, badge: string }
 
 const RARITY_FALLBACK: RarityStyle = {
   label: '普通',
@@ -40,7 +68,7 @@ const maxed = computed(() => star.value >= MAX_STAR)
 const canUpgrade = computed(() => props.item.canUpgrade === true && !maxed.value)
 const activated = computed(() => props.item.activated ?? star.value > 0)
 
-const showImage = computed(() => !!props.item.image && !imgFailed.value)
+const showImage = computed(() => !!imageSrc.value)
 
 /** 稀有度色条（用配置里的 rarity_color 覆盖默认色） */
 const accentColor = computed(() => {
@@ -73,11 +101,12 @@ const accentColor = computed(() => {
 
       <img
         v-if="showImage"
-        :src="item.image"
+        :key="`${item.collectionId}:${imageSrc}`"
+        :src="imageSrc"
         :alt="item.name"
         class="max-h-20 max-w-20 object-contain"
         loading="lazy"
-        @error="imgFailed = true"
+        @error="onImageError"
       >
       <!-- 图标缺失占位：用稀有度色做底 + 名称首字，避免图裂 -->
       <div

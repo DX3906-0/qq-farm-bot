@@ -29,11 +29,13 @@ function petDeferred() {
 }
 async function petFlush() { for (let i = 0; i < 40; i += 1) await Promise.resolve(); }
 
-function petHarness() {
+function petHarness(options = {}) {
   let now = 1000000, timerId = 0;
   const timers = new Map(), scheduled = new Map(), cache = new Map(), calls = [];
+  const stateFiles = options.stateFiles || new Map();
+  const actor = options.accountId || 'fixture';
   const h = {
-    calls, scheduled, types: petTypes, logs: [],
+    calls, scheduled, types: petTypes, logs: [], stateFiles,
     config: { enabled: true, dogId: 90001, leadSeconds: 60 },
     automation: { pet_food_auto_feed: true },
     user: { ticket: 0, coupon: 0, goldBean: 0 },
@@ -63,6 +65,11 @@ function petHarness() {
     throw new Error(`禁止未知 RPC ${method}`);
   };
   const mocks = {
+    'node:fs': { existsSync: file => stateFiles.has(file), readFileSync: file => stateFiles.get(file) },
+    'node:process': { env: { FARM_ACCOUNT_ID: actor } },
+    'node:crypto': require('node:crypto'),
+    '../config/runtime-paths': { getDataFile: file => file },
+    './json-db': { writeJsonFileAtomic: (file, value) => stateFiles.set(file, JSON.stringify(value)) },
     '../config/gameConfig': { getItemById: id => ({ name: String(id) }), getItemImageById: () => '' },
     '../config/config': { PlantPhase: { MATURE: 3 } },
     '../utils/network': { sendMsgAsync: rpc, getUserState: () => h.user },
@@ -210,6 +217,83 @@ test('神秘商人：真实超时/断线/畸形响应保留错误，不伪装成
   }
 });
 
+test('pet VM：狗粮缺商品/不可买/异常币种或价格均记录真实跳过原因，不购买', async () => {
+  for (const [change, reason] of [
+    [h => { h.goods = null; }, '当前商城未返回狗粮礼包'],
+    [h => { h.goods.is_available = false; }, '狗粮礼包当前不可购买'],
+    [h => { h.goods.price.id = 1001; }, '狗粮礼包价格币种不在当前允许范围'],
+    [h => { h.goods.price.count = 0; }, '狗粮礼包未返回有效价格'],
+  ]) {
+    const h = petHarness(); change(h);
+    const result = await h.food.checkAndFeedPetFood();
+    assert.equal(result.skipped, true); assert.equal(h.writes().length, 0);
+    assert.ok(h.logs.some(args => args[2]?.reason === reason), reason);
+  }
+});
+test('pet VM：真实狗粮定时入口把 require/异步失败交回调度器，不静默吞错', async () => {
+  const source = petFs.readFileSync(petPath.join(__dirname, '../src/core/worker.js'), 'utf8');
+  const begin = source.indexOf('function stopPetFoodTimer()'), end = source.indexOf('// 神秘商人', begin);
+  assert.ok(begin >= 0 && end > begin);
+  for (const kind of ['require', 'async']) {
+    const callbacks = new Map();
+    const start = petVm.runInNewContext(source.slice(begin, end) + '\nstartPetFoodTimer', {
+      isRunning: true, loginReady: true, loginInitializationEpoch: 1, friendSyncPaused: 0,
+      getDiagnosticSnapshot: () => ({ connectionEpoch: 2 }), runWithRequestContext: (ctx, callback) => callback(),
+      log() {}, getAutomation: () => ({ pet_food_auto_feed: true }),
+      require: name => {
+        assert.equal(name, '../services/pet-food-automation');
+        if (kind === 'require') throw new Error('fixture require failure');
+        return { checkAndFeedPetFood: async () => { throw new Error('fixture async failure'); } };
+      },
+      workerScheduler: {
+        clear: name => callbacks.delete(name),
+        setTimeoutTask: (name, delay, callback) => callbacks.set(name, callback),
+        setIntervalTask: (name, delay, callback, options) => { assert.equal(options.preventOverlap, true); callbacks.set(name, callback); },
+      },
+    });
+    start();
+    for (const name of ['pet_food_initial', 'pet_food_interval']) await assert.rejects(callbacks.get(name)(), /fixture/);
+  }
+});
+test('pet VM：真实商品Message未下发可买字段的默认false不阻止购买，显式false仍跳过', async () => {
+  const h = petHarness();
+  const MallGoods = petRoot.lookupType('gamepb.mallpb.MallGoods');
+  h.goods = MallGoods.decode(MallGoods.encode(MallGoods.fromObject({ goods_id: 1006, price: { id: 1002, count: 33 }, reward_items: [{ id: 90004, count: 1 }] })).finish());
+  assert.equal(h.goods.is_available, false); assert.equal(Object.hasOwn(h.goods, 'is_available'), false);
+  assert.equal((await h.food.checkAndFeedPetFood()).fed, 1);
+  assert.deepEqual(h.writes().map(call => call.method), ['Purchase', 'AddFood']);
+  const closed = petHarness(); closed.goods = MallGoods.decode(MallGoods.encode(MallGoods.fromObject({ goods_id: 1006, is_available: false, price: { id: 1002, count: 33 } })).finish());
+  assert.equal(Object.hasOwn(closed.goods, 'is_available'), true);
+  assert.equal((await closed.food.checkAndFeedPetFood()).reason, 'buy_none'); assert.equal(closed.writes().length, 0);
+});
+test('pet VM：未知购粮记录跨worker重建仍阻断force，另一账号不受影响', async () => {
+  const stateFiles = new Map(), h = petHarness({ stateFiles, accountId: 'A' });
+  h.rpc = method => method === 'Purchase' ? { body: {} } : undefined;
+  await assert.rejects(h.food.checkAndFeedPetFood(), error => error.outcomeUnknown === true);
+  const recreated = petHarness({ stateFiles, accountId: 'A' });
+  await assert.rejects(recreated.food.checkAndFeedPetFood({ force: true }), error => error.outcomeUnknown === true);
+  assert.equal(recreated.calls.length, 0);
+  const other = petHarness({ stateFiles, accountId: 'B' });
+  assert.equal((await other.food.checkAndFeedPetFood()).fed, 1);
+});
+test('pet VM：未知喂食保留记录，不能在下次检查或重建后再次消耗', async () => {
+  const stateFiles = new Map(), h = petHarness({ stateFiles }); h.bag = [{ id: 90004, count: 2 }];
+  h.rpc = method => method === 'AddFood' ? { body: {} } : undefined;
+  await assert.rejects(h.food.checkAndFeedPetFood(), error => error.outcomeUnknown === true);
+  const recreated = petHarness({ stateFiles }); recreated.bag = [{ id: 90004, count: 1 }];
+  await assert.rejects(recreated.food.checkAndFeedPetFood({ force: true }), error => error.outcomeUnknown === true);
+  assert.equal(recreated.writes().length, 0); assert.equal(recreated.calls.length, 0);
+});
+test('pet VM：账号代际验证失效时未发购粮，成功喂食恢复后仍保留冷却', async () => {
+  const h = petHarness(); let active = true;
+  h.rpc = method => { if (method === 'GetMallListBySlotType') active = false; };
+  await assert.rejects(h.food.checkAndFeedPetFood({ detached: true, validate: () => active }), error => error.sent === false);
+  assert.equal(h.writes().length, 0);
+  const stateFiles = new Map(), good = petHarness({ stateFiles });
+  assert.equal((await good.food.checkAndFeedPetFood()).fed, 1);
+  assert.equal(petHarness({ stateFiles }).food.getPetFoodAutomationState().lastFeedAt, 1000000);
+  assert.equal((await petHarness({ stateFiles }).food.checkAndFeedPetFood()).reason, 'cooldown');
+});
 test('pet VM：背包异步读取，自动买→刷新→喂在同一锁，重复调用只买喂一次', async () => {
   const h = petHarness(), bagGate = petDeferred();
   let firstBag = true;
@@ -228,8 +312,9 @@ test('pet VM：背包异步读取，自动买→刷新→喂在同一锁，重�
 test('pet VM：购买无物品不伪报成功、不喂食', async () => {
   const h = petHarness();
   h.rpc = method => method === 'Purchase' ? { body: { goods_id: 1006, success: true, reward_items: [] } } : undefined;
-  const result = await h.food.checkAndFeedPetFood({ force: true });
-  assert.equal(result.skipped, true); assert.equal(result.reason, 'buy_none');
+  await assert.rejects(h.food.checkAndFeedPetFood({ force: true }), error => error.outcomeUnknown === true);
+  assert.equal(h.food.getPetFoodAutomationState().blocked, true);
+  await assert.rejects(h.food.checkAndFeedPetFood({ force: true }), error => error.outcomeUnknown === true);
   assert.deepEqual(h.writes().map(call => call.method), ['Purchase']);
 });
 
@@ -487,10 +572,10 @@ test('pet VM：自动购买截止时间不重试/不发 feed，后续自动检�
   const job = h.food.checkAndFeedPetFood({ timeoutMs: 10 });
   const rejected = assert.rejects(job, error => error.outcome === 'unknown' && error.method === 'Purchase');
   await petFlush(); h.tick(10); await rejected;
-  const retry = h.food.checkAndFeedPetFood();
+  const retry = assert.rejects(h.food.checkAndFeedPetFood(), error => error.outcomeUnknown === true);
   await petFlush(); assert.deepEqual(h.writes().map(call => call.method), ['Purchase']);
   gate.resolve({ body: { goods_id: 1006, reward_items: [{ id: 90004, count: 1 }] } });
-  assert.equal((await retry).reason, 'cooldown');
+  await retry;
   assert.deepEqual(h.writes().map(call => call.method), ['Purchase']);
 });
 
@@ -581,7 +666,8 @@ test('pet VM：正数奖励之外的 success/count/default false 不充当购买
     petTypes.PurchaseResponse.decode(petTypes.PurchaseResponse.encode({ reward_items: [] }).finish()),
   ]) {
     const h = petHarness(); h.rpc = method => method === 'Purchase' ? { body } : undefined;
-    assert.equal((await h.food.checkAndFeedPetFood()).reason, 'buy_none');
+    if (Object.hasOwn(body, 'success') && body.success === false) assert.equal((await h.food.checkAndFeedPetFood()).reason, 'buy_none');
+    else await assert.rejects(h.food.checkAndFeedPetFood(), error => error.outcomeUnknown === true);
     assert.deepEqual(h.writes().map(call => call.method), ['Purchase']);
     assert.ok(!h.logs.some(args => args[2]?.method === 'Purchase' && args[2]?.result === 'ok'));
   }

@@ -48,6 +48,13 @@ function registerAdminShopPurchaseRoutes({
         return res.status(400).json({ ok: false, error: "参数不完整" });
       }
 
+      // Verified live forage SKU. Its existing Shop4 command ledger must not be
+      // bypassed through the legacy, unscoped purchase route after reclassification.
+      if (Number(goodsId) === 2129) {
+        return res.status(409).json({ ok: false, error: '牧草必须通过受控种子商品入口核对，旧通用购买不能绕过已有待确认记录',
+          errorCode: 'SHOP_CONTROLLED_PURCHASE_REQUIRED', sent: false, resultState: 'not_sent',
+          outcomeUnknown: false, retryable: false, refreshRequired: true });
+      }
       const buyResult = await provider.buyGoods(accountId, goodsId, num, price);
       res.json({
         ok: true,

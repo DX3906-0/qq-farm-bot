@@ -76,6 +76,8 @@ const {
     createScheduler,
     getSchedulerRegistrySnapshot
 } = require('../services/scheduler');
+const { runAccountOperation } = require('../services/account-operation-coordinator');
+const ranchAutomation = require('../services/ranch-automation');
 const {
     performDailyShare,
     getShareDailyState
@@ -232,6 +234,8 @@ function isTransientNetworkError(err) {
 
 let farmTaskRunning = false;
 let nextFarmRunAt = 0;
+let ranchTaskRunning = false;
+let nextRanchRunAt = 0;
 let lastStatusHash = '';
 let lastStatusSentAt = 0;
 let onSellGain = null;
@@ -269,7 +273,8 @@ const MAX_API_CONTROLS = 100;
 const apiControls = new Map();
 const SAFE_API_READS = new Set([
     'getLands', 'getSeeds', 'getBag', 'getBagSeeds', 'getSkins', 'getPetOverview',
-    'getUnifiedHarvest', 'getFriends', 'getSchedulers', 'getTransportDiagnostics',
+    'getUnifiedHarvest', 'getFriends', 'getSchedulers', 'getDecorationShop', 'getTransportDiagnostics',
+    'getRanchPendingOperations', 'getRanchSceneAccessInfo',
 ]);
 
 function isSafeApiRead(msg) {
@@ -334,6 +339,12 @@ async function dispatchApiCall(msg) {
 
 function getTransportDiagnostics() {
     const native = getDiagnosticSnapshot?.() || {};
+    const remoteValue = native.remoteGeneration;
+    const remoteEpoch = (typeof remoteValue === 'number'
+        || (typeof remoteValue === 'string' && /^\d+$/.test(remoteValue))) ? Number(remoteValue) : null;
+    const remoteGeneration = Number.isSafeInteger(remoteEpoch) && remoteEpoch >= 0 ? remoteEpoch : null;
+    const remoteGenerationSource = ['gateway', 'process'].includes(native.remoteGenerationSource)
+        ? native.remoteGenerationSource : 'unknown';
     // 只复制已知诊断字段，禁止扩散连接状态中的凭据、token 或原始帧。
     const pick = (source, keys) => Object.fromEntries(keys.filter(key =>
         ['number', 'boolean'].includes(typeof source?.[key])).map(key => [key, source[key]]));
@@ -350,8 +361,9 @@ function getTransportDiagnostics() {
         'businessLimit', 'businessNoResponseSince', 'healthBackoffUntil', 'connectionEpoch',
     ]);
     return {
-        ...pick(native, ['connectionEpoch', 'connected', 'detached', 'pending', 'pendingWrites', 'quiescing', 'oldestPendingStartedAt']),
-        sessionEpoch: native.connectionEpoch, currentGid: Number(native.gid ?? getUserState().gid) || 0,
+        ...pick(native, ['connectionEpoch', 'connected', 'loggedIn', 'detached', 'pending', 'pendingWrites', 'quiescing', 'oldestPendingStartedAt']),
+        sessionEpoch: native.connectionEpoch, remoteGeneration, remoteGenerationSource,
+        currentGid: Number(native.gid ?? getUserState().gid) || 0,
         queue, reads, health, healthBackoff: { active: remainingMs > 0, remainingMs },
         apiControls: { active: apiControls.size, maxActive: MAX_API_CONTROLS },
         // 该快照只含有界本地状态，不发送Enter/Leave；真实原始阶段与本次请求发送状态分开。
@@ -895,9 +907,17 @@ async function runStarActivityAutoClaims() {
                 }
                 if (solarAutoAnswerEnabled) {
                     const result = await solar.autoAnswerSolarQuizzes();
-                    if (result.skipped) log('活动', '节令自动答题已跳过：没有独立核验的可靠答案，保留唯一答题机会', {
-                        module: 'activity', event: 'solar_quiz_auto', result: 'skipped', reason: result.reason
-                    });
+                    for (const answer of result.results || []) {
+                        const details = {
+                            module: 'activity', event: 'solar_quiz_auto',
+                            result: answer.correct === true ? 'success' : 'wrong',
+                            termId: answer.id, title: answer.name, selectedOption: answer.selectedOption,
+                            answerProvenance: answer.answerProvenance,
+                            retryable: false,
+                        };
+                        if (answer.correct === true) log('活动', `节令自动答题正确：${answer.name}`, details);
+                        else logWarn('活动', `节令自动答题已提交但答案错误：${answer.name}；本题不再重试`, details);
+                    }
                 }
             } catch (err) {
                 log('活动', `节令问答检查未完成: ${err.message}`, { module: 'activity', event: 'solar_quiz_check', result: 'error' });
@@ -1448,20 +1468,33 @@ function stopPetFoodTimer() {
 }
 
 async function runPetFoodAutoFeed() {
-    if (!loginReady || friendSyncPaused) return;
-    if (getAutomation().pet_food_auto_feed !== true) return;
+    if (!isRunning || !loginReady) return { skipped: true, reason: 'login_not_ready' };
+    if (friendSyncPaused) return { skipped: true, reason: 'friend_sync_paused' };
+    if (getAutomation().pet_food_auto_feed !== true) return { skipped: true, reason: 'disabled' };
+    const epoch = loginInitializationEpoch;
+    const connectionEpoch = getDiagnosticSnapshot?.().connectionEpoch;
     const { checkAndFeedPetFood } = require('../services/pet-food-automation');
-    await checkAndFeedPetFood();
+    // 后台任务不继承已结束页面请求的 signal/deadline 或旧宠物事务；
+    // 新事务仍按当前账号/登录代际验证，停止或换连接后不再发送下一步。
+    return runWithRequestContext({ priority: 'background', signal: undefined, deadline: undefined }, async () => {
+        const result = await checkAndFeedPetFood({ detached: true, validate: () => isRunning && loginReady
+            && !friendSyncPaused && epoch === loginInitializationEpoch
+            && connectionEpoch === getDiagnosticSnapshot?.().connectionEpoch });
+        if (result?.skipped && !['disabled', 'cooldown', 'above_threshold'].includes(result.reason)) {
+            log('宠物', `自动狗粮检查未产生操作：${result.reason}`, {
+                module: 'pet', event: 'pet_food_auto_check', result: 'skipped', reason: result.reason,
+                protectSeconds: result.protectSeconds,
+            });
+        }
+        return result;
+    });
 }
 
 function startPetFoodTimer() {
     stopPetFoodTimer();
-    workerScheduler.setTimeoutTask('pet_food_initial', 20000, () => {
-        runPetFoodAutoFeed().catch(() => null);
-    });
-    workerScheduler.setIntervalTask('pet_food_interval', 10 * 60 * 1000, () => {
-        runPetFoodAutoFeed().catch(() => null);
-    }, { preventOverlap: true });
+    // 将 Promise 交回调度器：require/入口同步异常也必须落到任务失败日志，不能静默吞掉。
+    workerScheduler.setTimeoutTask('pet_food_initial', 20000, runPetFoodAutoFeed);
+    workerScheduler.setIntervalTask('pet_food_interval', 10 * 60 * 1000, runPetFoodAutoFeed, { preventOverlap: true });
 }
 
 // 神秘商人可能在登录后的任意时间出现；登录后先检查，并持续短周期探测。
@@ -1560,6 +1593,8 @@ function resetUnifiedSchedule() {
     nextFarmRunAt = now + farmDelay;
     nextHelpRunAt = now + helpDelay;
     nextStealRunAt = now + stealDelay;
+    // 正常班次沿用农场间隔；配置同步不能缩短已有的牧场安全退避。
+    nextRanchRunAt = ranchAutomation.resetSchedule();
 }
 
 // ==================== 农场 Tick ====================
@@ -1574,12 +1609,18 @@ async function runFarmTick(autoConfig) {
     );
 
     try {
-        await runWithRequestPriority('farm', async () => {
+        await runAccountOperation('farm-tick', () => runWithRequestPriority('farm', async () => {
             if (autoConfig.farm) await checkFarm();
             if (autoConfig.task) await checkAndClaimTasks();
             if (autoConfig.fertilizer_gift) await openFertilizerGiftPacksSilently();
-        });
-    } catch { } finally {
+        }), { priority: 'farm', timeoutMs: 60000 });
+    } catch (error) {
+        if (!isTransientNetworkError(error)) {
+            log('系统', `农场巡查协调失败: ${error.message}`, {
+                module: 'system', event: '农场巡查协调', result: 'error',
+            });
+        }
+    } finally {
         nextFarmRunAt = Date.now() + nextDelay;
         farmTaskRunning = false;
     }
@@ -1592,7 +1633,10 @@ let nextHelpRunAt = 0;
 
 async function runHelpTick(autoConfig) {
     if (helpTaskRunning || friendSyncPaused) return;
-    if (!autoConfig.friend_help && !autoConfig.friend_golden_bug) return;
+    if (!autoConfig.friend_help && !autoConfig.friend_golden_bug) {
+        nextHelpRunAt = Date.now() + Math.max(30000, Number(CONFIG.helpCheckIntervalMin) || 30000);
+        return;
+    }
     helpTaskRunning = true;
 
     const nextDelay = randomIntervalMs(
@@ -1663,6 +1707,40 @@ async function runStealTick(autoConfig) {
     }
 }
 
+// ==================== 牧场 Tick ====================
+
+async function runRanchTick() {
+    if (ranchTaskRunning || friendSyncPaused) return;
+    const state = ranchAutomation.getRoutineState();
+    if (!state.enabled) {
+        const delay = Math.min(ranchAutomation.normalIntervalMs(),
+            Number.isFinite(state.quotaResetAt) ? Math.max(1000, state.quotaResetAt - Date.now()) : Infinity);
+        nextRanchRunAt = ranchAutomation.resetSchedule(delay);
+        return;
+    }
+    ranchTaskRunning = true;
+    try {
+        await runWithRequestPriority('background', () => ranchAutomation.run({
+            farmDeadline: () => {
+                const auto = getAutomation();
+                return auto.farm || auto.task || auto.fertilizer_gift ? nextFarmRunAt || Infinity : Infinity;
+            },
+        }));
+    }
+    catch (error) {
+        // ranchAutomation 已按 unknown/明确失败分类记录；这里只避免未处理拒绝中断统一调度器。
+        if (!isTransientNetworkError(error) && error?.errorCode !== 'RANCH_AUTOMATION_YIELD') {
+            log('系统', `牧场巡查结束: ${error.message}`, {
+                module: 'ranch', event: '牧场巡查', result: error?.resultState === 'unknown' ? 'unknown' : 'error',
+            });
+        }
+    }
+    finally {
+        nextRanchRunAt = ranchAutomation.getRoutineState().nextCheckAt || ranchAutomation.resetSchedule();
+        ranchTaskRunning = false;
+    }
+}
+
 // ==================== 统一调度器 ====================
 
 /**
@@ -1686,20 +1764,37 @@ function isGatewayHealthyBackoffActive() {
 async function runUnifiedTick() {
     if (!unifiedSchedulerRunning || !loginReady || friendSyncPaused) return;
 
-    // 网关亚健康退避：不发任何业务请求，让连接只剩心跳自愈
-    if (isGatewayHealthyBackoffActive()) return;
-
     const now = Date.now();
+    // 网关亚健康退避：滚动所有已到期班次，避免nearest停在过去造成100ms空转。
+    if (isGatewayHealthyBackoffActive()) {
+        const retryAt = Math.max(now + 1000, Number(gatewayHealthBackoffUntil) || 0);
+        nextFarmRunAt = Math.max(Number(nextFarmRunAt) || 0, retryAt);
+        nextHelpRunAt = Math.max(Number(nextHelpRunAt) || 0, retryAt);
+        nextStealRunAt = Math.max(Number(nextStealRunAt) || 0, retryAt);
+        const ranchDelay = Math.max(retryAt - now, Number(nextRanchRunAt) - now || 0);
+        nextRanchRunAt = ranchAutomation.resetSchedule(ranchDelay);
+        return;
+    }
+
     const shouldFarm = now >= nextFarmRunAt;
     const shouldHelp = now >= nextHelpRunAt;
     const shouldSteal = now >= nextStealRunAt;
+    const shouldRanch = now >= nextRanchRunAt;
 
-    if (!shouldFarm && !shouldHelp && !shouldSteal) return;
+    if (!shouldFarm && !shouldHelp && !shouldSteal && !shouldRanch) return;
 
     const autoConfig = getAutomation();
     if (shouldFarm) await runFarmTick(autoConfig);
     if (shouldHelp) await runHelpTick(autoConfig);
     if (shouldSteal) await runStealTick(autoConfig);
+    if (shouldRanch) {
+        // 帮助/偷菜的耗时可能耗尽农场下一班；进入牧场前以最新配置补一次已到期的实际工作。
+        const latestAuto = getAutomation();
+        if (Date.now() >= nextFarmRunAt && (latestAuto.farm || latestAuto.task || latestAuto.fertilizer_gift)) {
+            await runFarmTick(latestAuto);
+        }
+        await runRanchTick();
+    }
 }
 
 function scheduleUnifiedNextTick() {
@@ -1717,7 +1812,8 @@ function scheduleUnifiedNextTick() {
     const nearest = Math.min(
         Number(nextFarmRunAt) || now + 3000,
         Number(nextHelpRunAt) || now + 30000,
-        Number(nextStealRunAt) || now + 25000
+        Number(nextStealRunAt) || now + 25000,
+        Number(nextRanchRunAt) || now + ranchAutomation.normalIntervalMs()
     );
     const waitMs = Math.max(100, nearest - now);
 
@@ -1738,6 +1834,8 @@ function stopUnifiedScheduler() {
     farmTaskRunning = false;
     helpTaskRunning = false;
     stealTaskRunning = false;
+    ranchTaskRunning = false;
+    nextRanchRunAt = ranchAutomation.resetSchedule(60000);
     workerScheduler.clear('unified_next_tick');
 }
 
@@ -2408,7 +2506,7 @@ async function startBot(config) {
         // 恢复今日已用捣乱预算（虫/草共享 99），跨 worker 重启保留，避免重连后预算归零叠加超放
         initLocalBadCount(accountId);
         // 恢复今日「帮忙经验已满」状态（跨重启保留），否则手动一键务农被服务端拒绝时
-        // 本地以为还能帮，只能给笼统提示（2026-10-22 账号乙实测）
+        // 本地以为还能帮，只能给笼统提示（2026-10-22 希恩斯实测）
         require('../services/friend-operation-limits').restoreHelpExpLimit(accountId);
 
         // QQ 好友列表接口（GetGameFriends）按「已知 GID」拉取：抓包登录只在抓包那一刻
@@ -2635,15 +2733,91 @@ async function handleApiCall(msg) {
         || method === 'fetchFriendsDogInfo'
         || method === 'syncFriendsFromGids'
         || method === 'recoverLegacyFriendVisit';
+    const isRanchSceneOperation = ['upgradeRanchGlobalLogin', 'getRanchOverview', 'getRanchFriend', 'getRanchFriends', 'getRanchCatalog', 'getRanchBag', 'getRanchCanCatalog', 'getRanchTasks', 'getRanchBook', 'getRanchShare', 'getRanchMarket', 'getRanchActivities', 'operateRanchMugeActivity', 'prepareRanchAction', 'operateRanch'].includes(method);
+    const pausesAutomation = isFriendSync || isRanchSceneOperation;
 
-    if (isFriendSync) friendSyncPaused += 1;
+    if (pausesAutomation) friendSyncPaused += 1;
 
     try {
         throwIfRequestCancelled(getRequestContext());
-        if (isFriendSync) log('系统', '好友同步操作开始，已暂停其他自动化进程', {
-            module: 'system', event: '好友同步暂停', method
+        if (pausesAutomation) log('系统', isRanchSceneOperation ? '牧场场景操作开始，已暂停自动化进程' : '好友同步操作开始，已暂停其他自动化进程', {
+            module: 'system', event: isRanchSceneOperation ? '牧场场景暂停' : '好友同步暂停', method
         });
         switch (method) {
+            case 'getRanchFriends':
+                result = await require('../services/ranch-friends').getRanchFriendRoster();
+                break;
+            case 'upgradeRanchGlobalLogin':
+                result = await require('../services/scene-session').upgradeGlobalLogin(args[0]);
+                break;
+            case 'getRanchSceneAccessInfo': {
+                result = await require('../services/scene-session').getSceneAccessInfo();
+                const diagnostic = getDiagnosticSnapshot();
+                const gid = Number(getUserState().gid);
+                if (diagnostic.connected !== true || diagnostic.loggedIn !== true || diagnostic.detached === true
+                    || diagnostic.remoteGenerationSource !== 'gateway' || !Number.isSafeInteger(gid) || gid <= 0
+                    || !Number.isSafeInteger(diagnostic.connectionEpoch) || diagnostic.connectionEpoch < 0
+                    || !/^\d+$/.test(String(diagnostic.remoteGeneration ?? ''))) {
+                    throw Object.assign(new Error('当前游戏连接未确认，不能报价会话升级'), {
+                        errorCode: 'SCENE_UPGRADE_SCOPE_MISMATCH', sent: false, resultState: 'not_sent',
+                    });
+                }
+                result.sessionScope = {
+                    accountId: String(process.env.FARM_ACCOUNT_ID || ''), gid,
+                    connectionEpoch: Number(diagnostic.connectionEpoch),
+                    remoteGeneration: String(diagnostic.remoteGeneration), remoteGenerationSource: 'gateway',
+                };
+                break;
+            }
+            case 'getRanchOverview':
+                result = await require('../services/ranch-readonly').getRanchOverview();
+                break;
+            case 'getRanchFriend':
+                result = await require('../services/ranch-friends').getRanchFriendOverview(args[0]);
+                break;
+            case 'getRanchPendingOperations':
+                result = require('../services/ranch-manual').getRanchOperationsSnapshot(String(process.env.FARM_ACCOUNT_ID || ''));
+                break;
+            case 'getRanchCatalog':
+                result = await require('../services/ranch-manual').getRanchCatalog(
+                    String(process.env.FARM_ACCOUNT_ID || ''), args[0]);
+                break;
+            case 'getRanchBag':
+                result = await require('../services/ranch-manual').getRanchBag(String(process.env.FARM_ACCOUNT_ID || ''));
+                break;
+            case 'getRanchCanCatalog':
+                result = await require('../services/ranch-manual').getRanchCanCatalog(String(process.env.FARM_ACCOUNT_ID || ''), args[0]);
+                break;
+            case 'getRanchMarket':
+                result = await require('../services/ranch-market').getRanchMarket(String(process.env.FARM_ACCOUNT_ID || ''));
+                break;
+            case 'getRanchActivities':
+                result = await require('../services/ranch-market').getRanchActivities(String(process.env.FARM_ACCOUNT_ID || ''), args[0] || '');
+                break;
+            case 'operateRanchMugeActivity':
+                require('../services/ranch-market').invalidateRanchActivitiesCache();
+                result = await require('../services/ranch-muge').operateRanchMugeActivity(
+                    String(process.env.FARM_ACCOUNT_ID || ''), args[0], args[1] || {});
+                break;
+            case 'getRanchTasks':
+            case 'getRanchBook':
+            case 'getRanchShare':
+                result = await require('../services/ranch-progression').getRanchProgressView(
+                    String(process.env.FARM_ACCOUNT_ID || ''),
+                    method === 'getRanchTasks' ? 'tasks' : method === 'getRanchBook' ? 'book' : 'share');
+                break;
+            case 'prepareRanchAction':
+                result = await require('../services/ranch-manual').quoteRanchAction(
+                    String(process.env.FARM_ACCOUNT_ID || ''), args[0], args[1]);
+                break;
+            case 'operateRanch':
+                result = await require('../services/ranch-manual').operateRanchAction(
+                    String(process.env.FARM_ACCOUNT_ID || ''), args[0], args[1], args[2]);
+                break;
+            case 'acknowledgeRanchOperation':
+                result = require('../services/ranch-manual').acknowledgeRanchOperation(
+                    String(process.env.FARM_ACCOUNT_ID || ''), args[0]);
+                break;
             case 'getLands':
                 result = await getLandsDetail();
                 checkReadCancelled();
@@ -2724,6 +2898,9 @@ async function handleApiCall(msg) {
                 break;
             case 'equipSkin':
                 result = await require('../services/skin').equipSkin(args[0], args[1], args[2] || {});
+                break;
+            case 'equipSkinPart':
+                result = await require('../services/skin').equipSkinPart(args[0], args[1], args[2] || {});
                 break;
             case 'getAvatarFrames':
                 result = await require('../services/avatar-frame').getAvatarFrames();
@@ -2860,6 +3037,12 @@ async function handleApiCall(msg) {
                 result = await getShopInfo(args[0]);
                 break;
             }
+            case 'getDecorationShop':
+                result = await require('../services/decoration-shop').getDecorationShop();
+                break;
+            case 'buyDecorationGoods':
+                result = await require('../services/decoration-shop').buyDecorationGoods(args[0], args[1], args[2]);
+                break;
             case 'buyGoods': {
                 const { buyGoods } = require('../services/farm');
                 result = await buyGoods(args[0], args[1], args[2]);
@@ -3221,10 +3404,10 @@ async function handleApiCall(msg) {
         error = typeof err === 'string' ? err : err.message;
         errorMeta = apiErrorMeta(err);
     } finally {
-        if (isFriendSync) {
+        if (pausesAutomation) {
             friendSyncPaused -= 1;
-            if (friendSyncPaused === 0) log('系统', '好友同步操作完成，已恢复自动化进程', {
-                module: 'system', event: '好友同步恢复', method
+            if (friendSyncPaused === 0) log('系统', isRanchSceneOperation ? '牧场场景已恢复，自动化进程可继续' : '好友同步操作完成，已恢复自动化进程', {
+                module: 'system', event: isRanchSceneOperation ? '牧场场景恢复' : '好友同步恢复', method
             });
         }
     }
@@ -3370,6 +3553,10 @@ function syncStatus() {
         friendRemainSec: Math.max(helpRemainSec, stealRemainSec)
     };
     stats.automation = getAutomation();
+    stats.ranchAutomation = ranchAutomation.getRoutineState();
+    if (stats.automation.pet_food_auto_feed === true) {
+        stats.petFoodAutomation = require('../services/pet-food-automation').getPetFoodAutomationState();
+    }
     stats.preferredSeed = getPreferredSeed();
     stats.levelProgress = levelProgress;
     stats.configRevision = appliedConfigRevision;

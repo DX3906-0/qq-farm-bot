@@ -182,6 +182,21 @@ const SAFE_READ_METHODS = Object.freeze([
   ['gamepb.shoppb.ShopService', 'ShopInfo'],
   ['gamepb.shoppb.ShopService', 'ShopProfiles'],
   ['gamepb.mallpb.MallService', 'GetMallListBySlotType'],
+  // 牧场一期只读；场景切换 PlayerSceneLogin 明确不在安全读白名单。
+  ['gamepb.homesteadpb.HomesteadService', 'AllCells'],
+  ['gamepb.animalpb.AnimalService', 'GetRanchDetail'],
+  ['gamepb.animalpb.RanchService', 'GetRanchOpTimes'],
+  ['gamepb.itempb.ItemService', 'GetBag'],
+  ['gamepb.homesteadpb.HomesteadService', 'GetFacilityDetail'],
+  ['gamepb.paypb.PayService', 'GetRechargeInfo'],
+  ['gamepb.taskpb.TaskService', 'TaskInfo'],
+  ['gamepb.illustratedpb.IllustratedService', 'GetIllustratedListV2'],
+  ['gamepb.illustratedpb.IllustratedService', 'GetIllustratedLevelListV2'],
+  ['gamepb.illustratedpb.IllustratedService', 'GetRanchWeightScoreV2'],
+  ['gamepb.userpb.UserService', 'BatchGetBasicInfo'],
+  ['gamepb.sharepb.ShareService', 'CheckCanShare'],
+  ['gamepb.shoppb.ShopService', 'RotationShopInfo'],
+  ['gamepb.activitypb.ActivityService', 'List'],
 ].map(pair => Object.freeze(pair)));
 const CRITICAL_METHODS = Object.freeze([
   ['gamepb.userpb.UserService', 'Login'],

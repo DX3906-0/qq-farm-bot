@@ -72,7 +72,7 @@ function pumpCommands() {
 }
 
 function withPetCommand(operation, options = {}) {
-  const inherited = options.lease || commandContext.getStore();
+  const inherited = options.lease || (options.detached === true ? null : commandContext.getStore());
   if (inherited) {
     try { assertLease(inherited); return Promise.resolve(operation(inherited)); }
     catch (error) { return Promise.reject(error); }
@@ -334,6 +334,8 @@ async function feedDog(foodIdInput, countInput = 1, options = {}) {
     if (!snapshot.dogs.some(dog => dog.owned === true)) throw new Error('未确认拥有宠物，不能喂食');
     if (snapshot.foodSeconds + duration * count > snapshot.protectSeconds) throw new Error('喂食后将超过30天上限');
     if (options.validate && options.validate() !== true) return { skipped: true, reason: 'disabled' };
+    lease.assertCurrent();
+    if (typeof options.onBeforeWrite === 'function') options.onBeforeWrite();
     const payload = types.AddFoodRequest.encode(types.AddFoodRequest.create({ item_id: foodId, count })).finish();
     return lease.write('gamepb.dogpb.DogService', 'AddFood', payload, response => {
       const reply = decodeDogReply(types.AddFoodReply, response);

@@ -300,8 +300,37 @@ const DEFAULT_AUTOMATION = {
     milk_tea_share_rewards: false,
     milk_tea_fund_rewards: false,
     // 商城点券礼包（同奶茶活动窗口）
-    mall_coupon_gift_buy: false
+    mall_coupon_gift_buy: false,
+    // 牧场 scene2 自动化（三期3A自家 + 3B好友）：总开关与每个写动作默认全部关闭。
+    ranch: false,
+    ranch_harvest: false,
+    ranch_produce: false,
+    ranch_clean: false,
+    ranch_sell: false,
+    ranch_grass: false,
+    ranch_grass_buy: false,
+    ranch_feed_normal: false,
+    ranch_feed_organic: false,
+    ranch_fill_cans: false,
+    ranch_complete_upgrade: false,
+    ranch_place: false,
+    ranch_cub_buy: false,
+    ranch_daily_tasks_claim: false,
+    ranch_growth_tasks_claim: false,
+    ranch_daily_share_claim: false,
+    ranch_activity_claim: false,
+    // 好友牧场3B：独立开关且全部默认关闭；主开关ranch仍是总门禁。
+    ranch_friend_steal: false,
+    ranch_friend_clean: false,
+    ranch_friend_stroke: false,
+    ranch_friend_mosquito: false,
+    ranch_check_minutes: 30
 };
+
+function normalizeRanchCheckMinutes(value, fallback = 30) {
+    const number = Math.floor(Number(value));
+    return Number.isFinite(number) ? Math.max(5, Math.min(120, number)) : fallback;
+}
 
 /** 默认间隔配置（秒） */
 const DEFAULT_INTERVALS = {
@@ -723,6 +752,7 @@ function cloneAccountConfig(config = DEFAULT_ACCOUNT_CONFIG) {
             auto[key] = srcAuto[key];
         }
     }
+    auto.ranch_check_minutes = normalizeRanchCheckMinutes(auto.ranch_check_minutes);
 
     const friendBlacklist = Array.isArray(config.friendBlacklist) ? config.friendBlacklist : [];
     const knownFriendGids = normalizeKnownFriendGids(config.knownFriendGids);
@@ -899,6 +929,8 @@ function normalizeAccountConfig(raw, fallbackConfig = accountFallbackConfig) {
             } else if (key === 'qixi_dew_use_on_friend_limit') {
                 const n = Math.floor(Number(value));
                 cfg.automation[key] = Number.isFinite(n) ? Math.max(0, Math.min(1000, n)) : cfg.automation[key];
+            } else if (key === 'ranch_check_minutes') {
+                cfg.automation[key] = normalizeRanchCheckMinutes(value, cfg.automation[key]);
             } else {
                 cfg.automation[key] = !!value;
             }
@@ -1550,6 +1582,8 @@ function applyConfigSnapshot(patch = {}, opts = {}) {
             } else if (key === 'qixi_dew_use_on_friend_limit') {
                 const n = Math.floor(Number(value));
                 cfg.automation[key] = Number.isFinite(n) ? Math.max(0, Math.min(1000, n)) : cfg.automation[key];
+            } else if (key === 'ranch_check_minutes') {
+                cfg.automation[key] = normalizeRanchCheckMinutes(value, cfg.automation[key]);
             } else {
                 cfg.automation[key] = !!value;
             }

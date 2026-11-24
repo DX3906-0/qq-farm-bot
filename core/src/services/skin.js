@@ -17,6 +17,11 @@ const { createGameCommandScope, captureSession, validateSession, validation, unk
 const { getItemById, getItemImageById } = require('../config/gameConfig');
 const { log, logWarn } = require('../utils/utils');
 const { util: protobufUtil } = require('protobufjs');
+const fs = require('node:fs');
+const { getResourcePath } = require('../config/runtime-paths');
+const customizationConfig = JSON.parse(fs.readFileSync(getResourcePath('gameConfig', 'skin-customization.json'), 'utf8'));
+const customParts = new Map(customizationConfig.parts.map(part => [part.partId, part]));
+const customHouses = new Map(customizationConfig.houses.map(house => [house.skinId, house]));
 
 const SERVICE = 'gamepb.skinpb.SkinService';
 const EQUIP_METHOD = 'Equip';
@@ -178,9 +183,79 @@ function decodeSkins(values, uniqueSlots = false) {
     return skins;
 }
 
+async function readOwnedState(session) {
+    const reply = await scope.rpc(session, SERVICE, 'SkinsOwned', 'SkinsOwnedRequest', 'SkinsOwnedReply', {}, { allowEmpty: true });
+    const skins = decodeSkins(reply.skins || []);
+    const rawParts = reply.parts || [];
+    if (!Array.isArray(rawParts)) throw validation('装扮部件库结构无效', 'SKIN_INCOMPLETE_REPLY');
+    const parts = rawParts.map(part => ({ partId: positiveId(part?.id, '装扮部件编号'), isNew: part.is_new === true }));
+    if (new Set(parts.map(part => part.partId)).size !== parts.length) throw validation('装扮部件库编号重复', 'SKIN_STATE_CONFLICT');
+    return { skins, parts };
+}
 async function readOwned(session) {
     const reply = await scope.rpc(session, SERVICE, 'SkinsOwned', 'SkinsOwnedRequest', 'SkinsOwnedReply', {}, { allowEmpty: true });
     return decodeSkins(reply.skins || []);
+}
+function nonDefaultParts(house, ids) {
+    const defaults = new Set(house.defaultPartIds);
+    const values = (ids || []).map(id => positiveId(id, '部件编号'));
+    const selected = new Map();
+    for (const id of values) {
+        const part = customParts.get(id);
+        if (!part || part.skinId !== house.skinId || !house.slotTypes.includes(part.slotType)) {
+            throw validation('当前搭配含未登记或不匹配的部件，请先核对配置', 'SKIN_PART_STATE_UNKNOWN');
+        }
+        if (selected.has(part.slotType)) throw validation('当前搭配的同一部位有重复部件', 'SKIN_STATE_CONFLICT');
+        selected.set(part.slotType, id);
+    }
+    return values.filter(id => !defaults.has(id)).sort((a, b) => a - b);
+}
+function samePartIds(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    const a = [...left].map(Number).sort((x, y) => x - y), b = [...right].map(Number).sort((x, y) => x - y);
+    return new Set(a).size === a.length && a.every((id, index) => Number.isSafeInteger(id) && id > 0 && id === b[index]);
+}
+function partImage(part) {
+    const mapped = getItemImageById(part.partId);
+    if (mapped) return mapped;
+    const info = getItemById(part.partId) || {};
+    for (const res of [info.icon_res, part.iconRes]) {
+        const key = String(res || '').replace(/\/(?:spriteFrame|texture)\/?$/, '').split('/').pop();
+        if (key && /^[a-zA-Z0-9_-]+$/.test(key) && fs.existsSync(getResourcePath('gameConfig', 'deco_icons', `${key}.png`))) return `/game-config/deco_icons/${key}.png`;
+    }
+    return '';
+}
+function buildCustomizations(session, owned, equipped) {
+    const granted = new Map(owned.parts.map(part => [part.partId, part]));
+    // 官方 PartSkinsOwnedCom 同时从 parts 与主体的 part_ids 恢复拥有状态。
+    for (const skin of owned.skins) for (const id of skin.partIds) if (!granted.has(id)) granted.set(id, { partId: id, isNew: false });
+    return [...customHouses.values()].filter(house => house.enabled && owned.skins.some(skin => skin.skinId === house.skinId))
+        .map(house => {
+            const body = owned.skins.find(skin => skin.skinId === house.skinId);
+            const current = equipped.find(skin => skin.slotType === body.slotType);
+            const active = current?.skinId === house.skinId;
+            const stored = active ? current.partIds : body.partIds;
+            let partIds = [], stateKnown = true, stateError = '';
+            try { partIds = nonDefaultParts(house, stored); }
+            catch (error) { stateKnown = false; stateError = error.message; }
+            const defaults = new Set(house.defaultPartIds);
+            const selected = new Map(house.defaultPartIds.map(id => [customParts.get(id).slotType, id]));
+            if (stateKnown) for (const id of partIds) selected.set(customParts.get(id).slotType, id);
+            const resultUnknown = scope.blocked(session, `skin:${body.slotType}`);
+            const groups = house.slotTypes.map(partSlotType => ({
+                partSlotType, label: customizationConfig.slots.find(slot => slot.slotType === partSlotType)?.name || `部位${partSlotType}`,
+                selectedPartId: selected.get(partSlotType),
+                parts: customizationConfig.parts.filter(part => part.skinId === house.skinId && part.slotType === partSlotType)
+                    .sort((a, b) => a.sortOrder - b.sortOrder || a.partId - b.partId).map(part => ({
+                        partId: part.partId, skinId: house.skinId, parentSlotType: body.slotType, partSlotType,
+                        name: part.name, image: partImage(part), enabled: part.enabled, isDefault: defaults.has(part.partId),
+                        owned: defaults.has(part.partId) || granted.has(part.partId), isNew: granted.get(part.partId)?.isNew === true,
+                        selected: stateKnown && selected.get(partSlotType) === part.partId,
+                    })),
+            }));
+            return { skinId: house.skinId, slotType: body.slotType, name: body.name, image: body.image,
+                equipped: active, stateKnown, stateError, resultUnknown, partIds, groups };
+        });
 }
 
 async function readEquipped(session) {
@@ -268,13 +343,67 @@ async function equipSkin(skinId, slotType, expected = {}) {
     });
 }
 
+/** 自定义部件不是普通 Skin 槽位。官方只支持一次装备或一次卸载；
+ * 主体必须已经穿戴，不自动夹带主体换装、消红点或重试。 */
+async function equipSkinPart(skinId, partId, expected = {}) {
+    const id = positiveId(skinId, '小屋编号'), targetId = positiveId(partId, '部件编号');
+    const house = customHouses.get(id), target = customParts.get(targetId);
+    if (!house?.enabled || !target?.enabled || target.skinId !== id || !house.slotTypes.includes(target.slotType)) {
+        throw validation('部件配置不存在、已关闭或与当前小屋不匹配', 'SKIN_PART_INVALID');
+    }
+    if (expected.confirmed !== true || !Array.isArray(expected.expectedPartIds)) throw validation('请先读取并确认当前小屋搭配');
+    return scope.execute(async session => {
+        const owned = await readOwnedState(session);
+        const body = owned.skins.find(skin => skin.skinId === id && skin.slotType === house.slotType);
+        if (!body) throw validation('当前账号尚未拥有此小屋', 'SKIN_NOT_OWNED');
+        if (BigInt(body.expireTime) > 0n && BigInt(body.expireTime) * 1000n <= BigInt(Date.now())) throw validation('小屋已过期', 'SKIN_EXPIRED');
+        const key = `skin:${body.slotType}`;
+        if (scope.blocked(session, key)) throw unknown('小屋槽位存在未确认操作，禁止重放');
+        const before = await readEquipped(session);
+        const currentBody = before.skins.find(skin => skin.slotType === body.slotType);
+        if (currentBody?.skinId !== id) throw validation('请先换上缤纷奶茶小屋，再应用部件', 'SKIN_PARENT_NOT_EQUIPPED');
+        const beforeIds = nonDefaultParts(house, currentBody.partIds);
+        if (!samePartIds(beforeIds, expected.expectedPartIds)) throw validation('小屋搭配已变化，请刷新后重新确认', 'SKIN_STATE_CHANGED');
+        const defaults = new Set(house.defaultPartIds);
+        const granted = new Set([...owned.parts.map(part => part.partId), ...body.partIds]);
+        if (!defaults.has(targetId) && !granted.has(targetId)) throw validation('当前账号尚未拥有该部件', 'SKIN_PART_NOT_OWNED');
+        const previous = beforeIds.find(part => customParts.get(part).slotType === target.slotType);
+        if (previous === targetId || defaults.has(targetId) && previous == null) {
+            return { skipped: true, reason: 'already_in_target_state', accountId: session.accountId, skinId: id, partId: targetId, slotType: body.slotType };
+        }
+        const operate = defaults.has(targetId) ? 2 : 1;
+        const ids = operate === 2 ? [previous] : [targetId];
+        const expectedAfter = beforeIds.filter(part => customParts.get(part).slotType !== target.slotType);
+        if (operate === 1) expectedAfter.push(targetId);
+        expectedAfter.sort((a, b) => a - b);
+        const reply = await scope.rpc(session, SERVICE, 'EquipSkinPart', 'EquipSkinPartRequest', 'EquipSkinPartReply',
+            { ids: ids.map(String), operate: String(operate) }, { write: true, key, allowEmpty: true });
+        const actualReply = (reply.part_ids || []).map(part => positiveId(part, '回包部件编号'));
+        if (!samePartIds(actualReply, expectedAfter)) throw unknown('部件回包未确认完整搭配，不重复提交');
+        const after = await readEquipped(session);
+        const actualBody = after.skins.find(skin => skin.slotType === body.slotType);
+        if (actualBody?.skinId !== id || !samePartIds(nonDefaultParts(house, actualBody.partIds), expectedAfter)) {
+            throw unknown('部件已提交，但当前装备未确认目标搭配，请仅刷新核对');
+        }
+        validateSession(session);
+        scope.confirm(session, key);
+        log('装扮', `${operate === 2 ? '恢复默认' : '更换'}部件已确认：${target.name}`, {
+            module: 'skin', event: '自定义部件', result: 'ok', skinId: id, partId: targetId, operate,
+        });
+        return { accountId: session.accountId, skinId: id, partId: targetId, slotType: body.slotType,
+            partSlotType: target.slotType, operate, partIds: expectedAfter, equipped: after.skins,
+            resultState: 'completed', confirmation: 'SkinsEquipped', method: 'EquipSkinPart', retryable: false };
+    });
+}
+
 /**
  * 面板主入口：一次返回「已拥有 + 当前装备 + 槽位标签 + 效果」，
  * 前端按槽位分组渲染、高亮当前装备即可。
  */
 async function getSkinOverview() {
     const session = captureSession();
-    const owned = await readOwned(session);
+    const ownedState = await readOwnedState(session);
+    const owned = ownedState.skins;
     const current = await readEquipped(session);
     const equipped = current.skins;
     const activeSetEffects = current.activeSetEffects;
@@ -313,6 +442,7 @@ async function getSkinOverview() {
         }));
 
     return { accountId: session.accountId, source, slots, items, equipped, activeSetEffects,
+        customizations: buildCustomizations(session, ownedState, equipped),
         effectSelection: null, effectParams, warnings, stateKnown: true, ownedCount: items.length };
 }
 
@@ -322,6 +452,7 @@ module.exports = {
     getSkinsEquipped,
     getSkinEffectTypeParams,
     equipSkin,
+    equipSkinPart,
     markSkinsViewed,
     normalizeSkinItem,
     source,

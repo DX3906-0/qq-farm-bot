@@ -301,7 +301,7 @@ async function runDueStealPlans() {
   if (!Array.isArray(plans) || plans.length === 0) return 0;
 
   // 「仅偷取指定好友」白名单是**准入**（谁能被偷），预约偷取只是**排期**（什么时候偷），
-  // 排期不能绕过准入。否则会出现"白名单只放了小果+账号乙，小脆骨却因预约计划被偷"
+  // 排期不能绕过准入。否则会出现"白名单只放了小果+希恩斯，小脆骨却因预约计划被偷"
   // （2026-10-24 用户反馈）。白名单为空数组 = 不限制，此时预约计划照常全量执行。
   const stealOnlyGids = new Set(
     (getAutomation(accountId)?.friend_steal_only_gids || [])

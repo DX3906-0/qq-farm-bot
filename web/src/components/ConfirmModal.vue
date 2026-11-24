@@ -14,9 +14,10 @@ const props = withDefaults(defineProps<{
   isAlert?: boolean
   type?: ModalType
   confirmationCode?: string
+  confirmDisabled?: boolean
 }>(), {
   title: '确认操作', message: '确定要执行此操作吗？', confirmText: '确定', cancelText: '取消',
-  loading: false, isAlert: false, type: 'primary', confirmationCode: '',
+  loading: false, isAlert: false, type: 'primary', confirmationCode: '', confirmDisabled: false,
 })
 const emit = defineEmits<{
   (e: 'confirm'): void
@@ -38,7 +39,7 @@ function finishHidden() {
   restoreFocus()
 }
 const presence = createModalPresenceMotion(() => dialog.value, finishHidden)
-const confirmDisabled = computed(() => props.loading || leaving.value)
+const confirmDisabled = computed(() => props.loading || leaving.value || props.confirmDisabled)
 const iconClass = computed(() => props.type === 'danger'
   ? 'i-carbon-warning-alt' : props.type === 'success' ? 'i-carbon-checkmark'
     : props.isAlert ? 'i-carbon-information' : 'i-carbon-help')
@@ -161,6 +162,7 @@ function confirm() {
       <div class="confirm-modal-content">
         <h3 :id="`${dialogId}-title`" class="confirm-modal-title">{{ title }}</h3>
         <p :id="`${dialogId}-message`" class="confirm-modal-message">{{ message }}</p>
+        <slot />
         <p v-if="loading" class="confirm-modal-progress" role="status">请求处理中，请等待结果；已发送的请求不会因关闭窗口而取消。</p>
       </div>
       <div class="confirm-modal-actions" :class="{ 'is-alert': isAlert }">

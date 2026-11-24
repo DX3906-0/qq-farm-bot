@@ -3,6 +3,7 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { getDataFile } = require('../config/runtime-paths');
 const { writeJsonFileAtomic } = require('./json-db');
+const { assertSceneOperationAvailable } = require('./account-operation-coordinator');
 const { requestError } = require('../utils/request-priority');
 
 const accounts = new Map();
@@ -53,7 +54,7 @@ function readSavedState(state) {
     const gid = Number(record?.gid);
     if (record?.version !== 1 || record.accountId !== state.accountId || !['active', 'unknown', 'left'].includes(record.phase)
       || !Number.isSafeInteger(gid) || gid < 0 || !Number.isFinite(record.updatedAt)
-      || (record.phase === 'left' && (epoch == null || !['leave_confirmed', 'not_entered', 'transport_epoch_changed'].includes(record.proof)))) {
+      || (record.phase === 'left' && (epoch == null || !['leave_confirmed', 'not_entered', 'transport_epoch_changed', 'home_scene_confirmed'].includes(record.proof)))) {
       throw sessionError('好友访问安全状态记录不完整', 'VISIT_STATE_RECORD_INVALID');
     }
     state.recoveryAttempt = record.recoveryAttempt && typeof record.recoveryAttempt === 'object' ? record.recoveryAttempt : null;
@@ -143,6 +144,28 @@ function observeFriendVisitTransport(accountId, epoch) {
   drain(state);
 }
 
+function reconcileFriendVisitAtHome(accountId, evidence) {
+  const state = accountState(String(accountId || ''));
+  const current = evidence || {};
+  const diagnostic = current.diagnostic || {};
+  const gid = Number(current.gid);
+  const epoch = visitEpoch(diagnostic.remoteGeneration);
+  const priorEpoch = state.unknown?.epoch ?? state.unknown?.observedEpoch;
+  if (!state.unknown || state.active || state.queue.length || state.storageError
+    || current.activeSceneId !== 1 || current.accountId !== state.accountId
+    || !Number.isSafeInteger(gid) || gid <= 0 || Number(current.currentGid) !== gid
+    || String(diagnostic.accountId || '') !== state.accountId
+    || diagnostic.connected !== true || diagnostic.loggedIn !== true
+    || diagnostic.detached === true || diagnostic.quiescing === true
+    || diagnostic.remoteGenerationSource !== 'gateway' || epoch == null
+    || priorEpoch == null || epoch !== priorEpoch) return false;
+  // 只接受同一账号/用户/真实网关代际下，服务端明确报告的当前HOME场景；不发送Leave、不借用IPC代际。
+  persistState(state, 'left', { gid: 0, epoch }, null, 'home_scene_confirmed');
+  state.unknown = null;
+  drain(state);
+  return true;
+}
+
 function blockedSessionError(state) {
   return sessionError('好友访问状态未知，等待真实游戏连接代际改变', 'VISIT_STATE_UNKNOWN', {
     sent: false, outcomeUnknown: false, resultState: 'unknown', holdUntilTransportEpochChanged: true,
@@ -151,7 +174,18 @@ function blockedSessionError(state) {
 }
 
 function acquireFriendVisitSession(gid, options = {}) {
+  // 牧场场景租约持有期间禁止新的好友 Enter；已有访问会在牧场切场前被快照门禁拦截。
+  try { assertSceneOperationAvailable('好友访问'); }
+  catch (error) { return Promise.reject(error); }
   const accountId = String(options.accountId ?? process.env.FARM_ACCOUNT_ID ?? '');
+  const ranchVisit = require('./ranch-friend-session').getRanchFriendSessionSnapshot(accountId);
+  if (ranchVisit?.resultState && ranchVisit.resultState !== 'idle') {
+    return Promise.reject(sessionError('好友牧场访问尚未确认离场，暂不能进入好友农场', 'VISIT_RANCH_FRIEND_BUSY', {
+      sent: false, outcomeUnknown: false, resultState: 'unknown',
+      holdUntilTransportEpochChanged: ranchVisit.holdUntilTransportEpochChanged === true,
+      friendGid: ranchVisit.hostGid,
+    }));
+  }
   const state = accountState(accountId);
   observeFriendVisitTransport(accountId, options.epoch);
   const timeoutMs = Math.min(DEFAULT_TIMEOUT_MS, Math.max(1, Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS));
@@ -323,5 +357,6 @@ function getFriendVisitSessionSnapshot(accountId = process.env.FARM_ACCOUNT_ID |
 module.exports = {
   acquireFriendVisitSession, releaseFriendVisitSession, markFriendVisitSessionUnknown,
   observeFriendVisitTransport, getFriendVisitSessionSnapshot, confirmFriendVisitSessionLeft,
+  reconcileFriendVisitAtHome,
   getLegacyFriendVisitRecoveryPlan, beginLegacyFriendVisitRecovery, finishLegacyFriendVisitRecovery,
 };

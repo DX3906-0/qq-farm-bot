@@ -5,7 +5,7 @@ const { getRequestContext, requestError } = require('../utils/request-priority')
 const SAFE_TOPLEVEL_READ = new Set([
     'getLands', 'getSeeds', 'getBag', 'getBagSeeds',
     'getPetOverview', 'getUnifiedHarvest', 'getFriends', 'getSchedulers',
-    'getTransportDiagnostics',
+    'getDecorationShop', 'getTransportDiagnostics', 'getRanchPendingOperations', 'getRanchSceneAccessInfo',
 ]);
 const READ_RPC_TIMEOUT_MS = 65000;
 const COMPOSITE_READ_RPC_TIMEOUT_MS = 90000;
@@ -307,6 +307,10 @@ function createWorkerManager(deps) {
      */
     function startWorker(account, options = {}) {
         if (shuttingDown || !account || !account.id) return false;
+        if (require('../services/account-maintenance-hold').isAccountMaintenanceHeld(account.id)) {
+            log('系统', '账号处于维护停运状态，未启动', { accountId: String(account.id), event: 'maintenance_hold' });
+            return false;
+        }
         if (workers[account.id]) return false;
 
         log('系统', `正在启动账号: ${  account.name}`, {

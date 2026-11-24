@@ -31,9 +31,9 @@ const router = useRouter()
 const { currentAccountId, currentAccount } = storeToRefs(accountStore)
 const { status } = storeToRefs(statusStore)
 const {
-  seeds,
+  displaySeeds: seeds,
   pets,
-  decorations,
+  displayDecorations: decorations,
   mallGoods,
   mallCategories,
   mysteryOffer,
@@ -52,6 +52,7 @@ const {
 
 const tab = ref<'seed' | 'pet' | 'decoration' | 'mall' | 'mystery'>('seed')
 const ascending = ref(true)
+let shopUiEpoch = 0
 const shopContent = ref<HTMLElement | null>(null)
 const { select: selectShopTab, selected: selectedShopTab } = useSlidingTabs(tab, () => shopContent.value,
   () => ['seed', 'pet', 'decoration', 'mall', 'mystery'], () => currentAccountId.value)
@@ -97,6 +98,8 @@ const quantityModal = ref({
   show: false,
   item: null as any,
   mode: 'shop' as 'shop' | 'mall',
+  accountId: '',
+  epoch: 0,
   currencyLabel: '',
   balance: 0,
   maxQuantity: 99,
@@ -133,7 +136,7 @@ const {
 })
 
 const sortedSeeds = computed(() => {
-  return [...seeds.value].sort((a, b) => ascending.value ? a.seedLevel - b.seedLevel : b.seedLevel - a.seedLevel)
+  return [...seeds.value].sort((a, b) => ascending.value ? (a.seedLevel ?? 0) - (b.seedLevel ?? 0) : (b.seedLevel ?? 0) - (a.seedLevel ?? 0))
 })
 
 const activeError = computed(() => {
@@ -177,14 +180,23 @@ const activeEmptyMessage = computed(() => {
 })
 
 function openConfirm(title: string, message: string, action: () => Promise<void>) {
+  if (confirmLoading.value || !currentAccountId.value) return
+  const accountId = String(currentAccountId.value)
+  const epoch = shopUiEpoch
   confirmTitle.value = title
   confirmMessage.value = message
-  pendingAction.value = action
+  pendingAction.value = async () => {
+    if (epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) {
+      toast.error('账号已切换，本次操作已取消')
+      return
+    }
+    await action()
+  }
   showConfirm.value = true
 }
 
 async function runConfirmedAction() {
-  if (!pendingAction.value)
+  if (!pendingAction.value || confirmLoading.value)
     return
   confirmLoading.value = true
   try {
@@ -247,44 +259,73 @@ function syncTabFromRouteQuery() {
     tab.value = queryTab as typeof tab.value
 }
 
-async function buyGoods(item: any, quantity = 1) {
-  if (!currentAccountId.value)
+async function buyGoods(item: any, quantity = 1, accountId = String(currentAccountId.value || '')) {
+  if (!accountId || String(currentAccountId.value || '') !== accountId || item.catalogOnly || item.canBuy === false
+    || item.priceKnown === false || item.currencyKnown === false || item.resultUnknown)
     return
-  const result = await shopStore.buyGoods(currentAccountId.value, item.id, quantity, item.price)
+  const epoch = shopUiEpoch
+  try {
+    const result = item.isForage || Number(item.shopId) === 4
+      ? await shopStore.buySeedGoods(accountId, item, quantity)
+      : await shopStore.buyGoods(accountId, item.id, quantity, item.price)
+    if (epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) return
+    if (result?.ok && result.data?.getItems?.some((row: any) => Number(row.id) === Number(item.itemId) && Number(row.count) > 0)) {
+      toast.success(`已购买 ${item.name} x${quantity}`)
+      await shopStore.refreshAll(accountId)
+    }
+    else toast.error(result?.error || '未确认获得物品，请只刷新核对，不要重复购买')
+  }
+  catch (error: any) {
+    if (epoch === shopUiEpoch && String(currentAccountId.value || '') === accountId)
+      toast.error(error?.response?.data?.error || error.message || '购买结果未确认，请刷新核对')
+  }
+}
+
+async function buyDecoration(item: any, accountId: string) {
+  const epoch = shopUiEpoch
+  const result = await shopStore.buyDecorationGoods(accountId, item)
+  if (result?.canceled || epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) return
   if (result?.ok) {
-    toast.success(`已购买 ${item.name} x${quantity}`)
-    await refreshAll()
+    toast.success(`已${item.isFree ? '领取' : '购买'} ${item.name}`)
+    await shopStore.refreshAll(accountId)
   }
-  else {
-    toast.error(result?.error || '购买失败')
-  }
+  else toast.error(result?.error || '装扮购买结果未确认，请刷新核对')
+}
+
+function confirmBuyDecoration(item: any) {
+  if (!currentAccountId.value || item.canBuy !== true || !canAffordDecoration(item) || item.priceKnown !== true || item.currencyKnown !== true || currentLevel.value < Number(item.requiredLevel || 0)) return
+  const accountId = String(currentAccountId.value)
+  const offer = { ...item }
+  const priceText = item.isFree ? '免费' : `${formatCurrencyAmountByLabel(item.price, item.currencyName || '')} ${item.currencyName}`
+  openConfirm('确认购买装扮', `确定${item.isFree ? '领取' : '购买'} ${item.name} 吗？\n价格：${priceText}\n面板不会自动替换当前穿戴。`,
+    () => buyDecoration(offer, accountId))
 }
 
 async function buyMallGoods(item: any, quantity = 1) {
-  if (!currentAccountId.value)
-    return
-  const result = await shopStore.buyMallGoods(currentAccountId.value, item.goodsId, quantity)
+  const accountId = String(currentAccountId.value || '')
+  const epoch = shopUiEpoch
+  if (!accountId) return
+  const result = await shopStore.buyMallGoods(accountId, item.goodsId, quantity)
+  if (epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) return
   if (result?.ok) {
     toast.success(`已购买 ${item.name} x${quantity}`)
-    await refreshAll()
+    await shopStore.refreshAll(accountId)
   }
-  else {
-    toast.error(result?.error || '购买失败')
-  }
+  else toast.error(result?.error || '购买失败')
 }
 
 async function buyMysteryGoods(item: any) {
-  if (!currentAccountId.value)
-    return
-  const result = await shopStore.buyMysteryShopGoods(currentAccountId.value, item.npcId)
+  const accountId = String(currentAccountId.value || '')
+  const epoch = shopUiEpoch
+  if (!accountId) return
+  const result = await shopStore.buyMysteryShopGoods(accountId, item.npcId)
+  if (epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) return
   if (result?.ok) {
     const count = Number(result.data?.reward?.count || item.itemCount || 0)
     toast.success(`已从神秘商人处购买 ${item.itemName} x${count}`)
-    await shopStore.fetchMysteryShop(currentAccountId.value)
+    await shopStore.fetchMysteryShop(accountId)
   }
-  else {
-    toast.error(result?.error || '购买失败')
-  }
+  else toast.error(result?.error || '购买失败')
 }
 
 function confirmBuyMysteryGoods(item: any) {
@@ -298,16 +339,16 @@ function confirmBuyMysteryGoods(item: any) {
 }
 
 async function abandonMysteryMerchant() {
-  if (!currentAccountId.value)
-    return
-  const result = await shopStore.abandonMysteryShop(currentAccountId.value)
+  const accountId = String(currentAccountId.value || '')
+  const epoch = shopUiEpoch
+  if (!accountId) return
+  const result = await shopStore.abandonMysteryShop(accountId)
+  if (epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId) return
   if (result?.ok) {
     toast.success('已请离神秘商人')
-    await shopStore.fetchMysteryShop(currentAccountId.value)
+    await shopStore.fetchMysteryShop(accountId)
   }
-  else {
-    toast.error(result?.error || '请离失败')
-  }
+  else toast.error(result?.error || '请离失败')
 }
 
 function confirmAbandonMysteryMerchant() {
@@ -328,10 +369,14 @@ function getShopMaxQuantity(item: any, balance: number) {
 }
 
 function openQuantityModal(item: any, mode: 'shop' | 'mall', currencyLabel: string, balance: number) {
+  if (confirmLoading.value || !currentAccountId.value || item.catalogOnly || item.canBuy === false
+    || item.priceKnown === false || item.currencyKnown === false || item.resultUnknown || item.price == null) return
   quantityModal.value = {
     show: true,
-    item,
+    item: { ...item },
     mode,
+    accountId: String(currentAccountId.value),
+    epoch: shopUiEpoch,
     currencyLabel,
     balance,
     maxQuantity: getShopMaxQuantity(item, balance),
@@ -340,23 +385,30 @@ function openQuantityModal(item: any, mode: 'shop' | 'mall', currencyLabel: stri
 
 async function runQuantityPurchase(quantity: number) {
   const target = quantityModal.value.item
-  if (!target)
+  const accountId = quantityModal.value.accountId
+  const epoch = quantityModal.value.epoch
+  const mode = quantityModal.value.mode
+  if (!target || confirmLoading.value || epoch !== shopUiEpoch || String(currentAccountId.value || '') !== accountId)
     return
   confirmLoading.value = true
   try {
-    if (quantityModal.value.mode === 'mall')
+    if (mode === 'mall')
       await buyMallGoods(target, quantity)
     else
-      await buyGoods(target, quantity)
-    closeQuantityModal()
+      await buyGoods(target, quantity, accountId)
   }
   finally {
     confirmLoading.value = false
+    if (epoch === shopUiEpoch && quantityModal.value.accountId === accountId) closeQuantityModal()
   }
 }
 
 function confirmBuySeedGoods(item: any) {
-  openQuantityModal(item, 'shop', '金币', currentGold.value)
+  if (item.currencyKnown === false || item.resultUnknown) return
+  const currencyLabel = item.currencyName || '金币'
+  const balance = Number(item.currencyId) === 1005 ? userGoldBean.value
+    : Number(item.currencyId) === 1002 ? currentCoupon.value : currentGold.value
+  openQuantityModal(item, 'shop', currencyLabel, balance)
 }
 
 function confirmBuyGoods(item: any, currencyLabel: string) {
@@ -384,10 +436,16 @@ function confirmBuyMallGoods(item: any) {
 }
 
 watch(currentAccountId, () => {
+  shopUiEpoch++
+  showConfirm.value = false
+  pendingAction.value = null
+  quantityModal.value.show = false
+  quantityModal.value.item = null
+  quantityModal.value.accountId = ''
   shopStore.clearShopData()
   refreshAll()
   refreshMysteryAutoBuyStatus()
-})
+}, { flush: 'sync' })
 
 watch(
   () => route.query.tab,
@@ -446,7 +504,7 @@ onMounted(() => {
         <div class="grid grid-cols-[repeat(auto-fill,minmax(156px,1fr))] gap-3">
           <SeedGoodsCard
             v-for="item in sortedSeeds"
-            :key="item.id"
+            :key="`${item.id ?? 'catalog'}:${item.itemId}`"
             :item="item"
             :current-level="currentLevel"
             :can-afford="canAffordGoods(item)"
@@ -484,12 +542,13 @@ onMounted(() => {
         <div class="grid grid-cols-[repeat(auto-fill,minmax(156px,1fr))] gap-3">
           <DecorationGoodsCard
             v-for="item in decorations"
-            :key="item.id"
+            :key="`${item.id ?? 'unknown'}:${item.itemId}`"
             :item="item"
+            :current-level="currentLevel"
             :can-afford="canAffordDecoration(item)"
             :status-label="getDecorationStatusLabel(item)"
             :hint="getDecorationHint(item)"
-            @buy="confirmBuyGoods($event, '金豆豆')"
+            @buy="confirmBuyDecoration"
           />
         </div>
       </div>

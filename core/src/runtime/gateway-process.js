@@ -42,6 +42,7 @@ const SOCK_PATH = process.env.FARM_GATEWAY_SOCK || '/tmp/qq-farm-gateway.sock';
 
 /** 隔离实例只托管微信2号；主网关重启后也不得重新抢占委托账号。 */
 function gatewayOwnsAccount(accountId, requireActive = true) {
+    if (requireActive && require('../services/account-maintenance-hold').isAccountMaintenanceHeld(accountId)) return false;
     const { readGatewayDelegation } = require('./gateway-routing');
     const delegation = readGatewayDelegation();
     if (ISOLATED_WX_GATEWAY) {
@@ -323,7 +324,7 @@ function armOperationTimeout(account, op, at) {
 function requestKind(service, method) {
     if (service === 'gamepb.userpb.UserService' && method === 'Heartbeat') return 'heartbeat';
     if (service === 'gamepb.acepb.AceService' && method === 'AntiData') return 'ace';
-    if (service === 'gamepb.userpb.UserService' && method === 'Login') return 'login';
+    if (service === 'gamepb.userpb.UserService' && ['Login', 'PlayerLogin'].includes(method)) return 'login';
     return 'business';
 }
 
@@ -474,7 +475,7 @@ async function drainSendQueue(account) {
 }
 
 function sendMsg(account, service, method, bodyBytes, callback = {}) {
-    const kind = requestKind(service, method);
+    const kind = callback.loginScene === true ? 'login-scene' : requestKind(service, method);
     const op = {
         service, method, body: bodyBytes || Buffer.alloc(0), callback, kind,
         socket: account.ws, runtime: account.tsdkRuntime, epoch: account.connectionEpoch,
@@ -764,7 +765,10 @@ function buildLoginDeviceInfo(deviceProtocol) {
 
 function decodeLoginReply(account, decryptedBody) {
     const reply = types.LoginReply.decode(decryptedBody);
-    const b = reply && reply.basic;
+    return applyLoginBasic(account, reply && reply.basic);
+}
+
+function applyLoginBasic(account, b, { bindSecurity = true } = {}) {
     const gid = b && toNum(b.gid);
     if (!Number.isSafeInteger(gid) || gid <= 0) {
         throw new Error('登录回复缺少有效 GID，未建立游戏会话');
@@ -777,7 +781,7 @@ function decodeLoginReply(account, decryptedBody) {
     account.userState.exp = toNum(b.exp);
     account.userState.openId = String(b.open_id || '');
     account.userState.avatar = String(b.avatar_url || '');
-    if (account.tsdkRuntime && account.userState.openId) {
+    if (bindSecurity && account.tsdkRuntime && account.userState.openId) {
         account.tsdkRuntime.bindUser(account.userState.openId);
         account.initialGamePackInfo = account.tsdkRuntime.getEncryptedInitInfo();
     }
@@ -785,6 +789,52 @@ function decodeLoginReply(account, decryptedBody) {
 }
 
 async function sendLogin(account, onLoginSuccess) {
+    const profile = process.env.FARM_LOGIN_PROFILE || 'player';
+    if (!['legacy', 'player'].includes(profile)) throw new Error('未知登录协议配置，未发送登录请求');
+    if (profile === 'player') {
+        const protocol = require('../services/player-login-protocol');
+        const socket = account.ws;
+        const epoch = account.connectionEpoch;
+        const current = () => {
+            if (account.ws !== socket || account.connectionEpoch !== epoch || account.networkStopped || gatewayShuttingDown) {
+                throw new Error('全局登录期间连接已变化，拒绝沿用旧回复');
+            }
+        };
+        const request = protocol.buildRequest(types, buildLoginDeviceInfo(account.deviceProtocol), 'player', {
+            sharer_id: toLong(0), sharer_open_id: '', share_cfg_id: toLong(0),
+            scene_id: '1256', game_scene_id: 1,
+            report_data: { callback: '', cd_extend_info: '', click_id: '', clue_token: '',
+                minigame_channel: 'other', minigame_platid: 2, req_id: '', trackid: '' },
+        });
+        const response = await new Promise((resolve, reject) => {
+            sendMsg(account, request.service, request.method, request.body,
+                { resolve, reject, playerLogin: true, timeoutMs: WORKER_REQUEST_TIMEOUT_MS }).catch(reject);
+        });
+        current();
+        const login = protocol.validateLoginReply('player', request.replyDecoder(response.body));
+        // Prepare security binding for the scene request without publishing a GID
+        // or a login event before the required HOME reply is confirmed.
+        const openId = String(login.basic.open_id || '');
+        if (account.tsdkRuntime && openId) {
+            account.tsdkRuntime.bindUser(openId);
+            account.initialGamePackInfo = account.tsdkRuntime.getEncryptedInitInfo();
+        }
+        if (!types.PlayerSceneLoginRequest || !types.PlayerSceneLoginReply) throw new Error('全局场景登录协议未加载');
+        const homeBody = types.PlayerSceneLoginRequest.encode(types.PlayerSceneLoginRequest.create({ global_scene_id: 1 })).finish();
+        const homeResponse = await new Promise((resolve, reject) => {
+            sendMsg(account, 'gamepb.globalscenepb.GlobalSceneService', 'PlayerSceneLogin', homeBody,
+                { resolve, reject, loginScene: true, timeoutMs: WORKER_REQUEST_TIMEOUT_MS }).catch(reject);
+        });
+        current();
+        const confirmed = protocol.confirmHomeScene(login, types.PlayerSceneLoginReply.decode(homeResponse.body));
+        if (!confirmed.canBroadcastLoggedIn) throw new Error('全局登录尚未完成HOME确认');
+        applyLoginBasic(account, login.basic, { bindSecurity: false });
+        account.loginProfile = 'player';
+        account.globalSceneId = 1;
+        account.unlockedSceneIds = [...login.globalScene.unlockedSceneIds];
+        onLoginSuccess();
+        return;
+    }
     const body = types.LoginRequest.encode(types.LoginRequest.create({
         sharer_id: toLong(0),
         sharer_open_id: '',
@@ -847,6 +897,10 @@ function connect(account, code) {
     const plat = account.platform || CONFIG.platform;
     const url = `${CONFIG.serverUrl}?platform=${plat}&os=${CONFIG.os}&ver=${CONFIG.clientVersion}&code=${account.savedCode}&openID=`;
     closeCurrentWs(account, { terminate: true });
+    account.userState.gid = 0;
+    account.loginProfile = null;
+    account.unlockedSceneIds = [];
+    account.globalSceneId = 0;
     // 记录本次建连时间：风控熔断据此判断会话是"短命被踢"还是"稳定健康"
     account.connectionEpoch += 1;
     account.connectedAt = Date.now();
@@ -986,7 +1040,7 @@ function handleMessage(account, buffer, socket = account.ws, epoch = account.con
         const errorCode = toNum(meta.error_code);
         if (errorCode) {
             const error = requestError(`${meta.service_name || op.service}.${meta.method_name || op.method} 错误: code=${errorCode} ${meta.error_message || ''}`, errorCode, op);
-            error.stage = cb.isLogin ? 'game_login' : 'game_request';
+            error.stage = cb.isLogin || cb.playerLogin || cb.loginScene ? 'game_login' : 'game_request';
             error.outcomeUnknown = false;
             error.resultState = 'failed';
             error.serverSeq = account.serverSeq;
@@ -2047,6 +2101,10 @@ async function handleWorkerFrame(sock, frame) {
             connected: !!(current?.ws && current.ws.readyState === current.ws.OPEN && current.userState.gid),
             ...gatewayHealthStatus(current),
             credentialDirectory: ISOLATED_WX_GATEWAY ? 'wx-gateway' : 'wx-login',
+            clientVersion: CONFIG.clientVersion,
+            loginProfile: current?.loginProfile || null,
+            loginHomeConfirmed: current?.loginProfile === 'player' && Number(current.userState.gid) > 0,
+            loginUnlockedSceneIds: current?.unlockedSceneIds || [],
             temporaryFailures: current?.wxTempFailCount || 0,
             retryAfter: current?.wxRetryAfter || 0,
             errorStage: current?.wxLastCodeError?.stage || '',

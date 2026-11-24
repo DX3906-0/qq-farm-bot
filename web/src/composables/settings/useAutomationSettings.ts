@@ -108,6 +108,29 @@ export const defaultAutomation = {
   milk_tea_share_rewards: false,
   milk_tea_fund_rewards: false,
   mall_coupon_gift_buy: false,
+  // 牧场 scene2 自家与好友自动化：全部默认关闭。
+  ranch: false,
+  ranch_harvest: false,
+  ranch_produce: false,
+  ranch_clean: false,
+  ranch_sell: false,
+  ranch_grass: false,
+  ranch_grass_buy: false,
+  ranch_feed_normal: false,
+  ranch_feed_organic: false,
+  ranch_fill_cans: false,
+  ranch_complete_upgrade: false,
+  ranch_place: false,
+  ranch_cub_buy: false,
+  ranch_daily_tasks_claim: false,
+  ranch_growth_tasks_claim: false,
+  ranch_daily_share_claim: false,
+  ranch_activity_claim: false,
+  ranch_friend_steal: false,
+  ranch_friend_clean: false,
+  ranch_friend_stroke: false,
+  ranch_friend_mosquito: false,
+  ranch_check_minutes: 30,
 }
 
 export function useAutomationSettings({
@@ -200,6 +223,7 @@ export function useAutomationSettings({
 
       localAutomationSettings.value.automation.fertilizer_land_types = normalizeFertilizerLandTypes(localAutomationSettings.value.automation.fertilizer_land_types)
       localAutomationSettings.value.automation.qixi_friend_priority = normalizeQixiFriendPriority(localAutomationSettings.value.automation.qixi_friend_priority)
+      localAutomationSettings.value.automation.ranch_check_minutes = normalizeRanchCheckMinutes(localAutomationSettings.value.automation.ranch_check_minutes)
       if (localAutomationSettings.value.automation.fertilizer_smart_seconds === undefined) {
         localAutomationSettings.value.automation.fertilizer_smart_seconds = 300
       }
@@ -237,6 +261,13 @@ export function useAutomationSettings({
     return Math.max(1, Math.min(1440, Math.round(minutes)))
   }
 
+  function normalizeRanchCheckMinutes(value: unknown) {
+    const minutes = Number(value)
+    if (!Number.isFinite(minutes))
+      return 30
+    return Math.max(5, Math.min(120, Math.round(minutes)))
+  }
+
   async function saveAutomationSettings() {
     if (LOCAL_UI_READONLY || disposed || !currentAccountId.value || automationSaving.value)
       return false
@@ -245,6 +276,7 @@ export function useAutomationSettings({
     try {
       localAutoCodeRefresh.value.intervalMinutes = normalizeAutoCodeRefreshInterval(localAutoCodeRefresh.value.intervalMinutes)
       localAutomationSettings.value.automation.qixi_friend_priority = normalizeQixiFriendPriority(localAutomationSettings.value.automation.qixi_friend_priority)
+      localAutomationSettings.value.automation.ranch_check_minutes = normalizeRanchCheckMinutes(localAutomationSettings.value.automation.ranch_check_minutes)
       const fullSettings = copySettings({
         automation: localAutomationSettings.value.automation,
         autoCodeRefresh: localAutoCodeRefresh.value,

@@ -24,6 +24,22 @@ export interface AutomationConfig {
   land_upgrade?: boolean
   friend?: boolean
   task?: boolean
+  ranch?: boolean
+  ranch_harvest?: boolean
+  ranch_produce?: boolean
+  ranch_clean?: boolean
+  ranch_sell?: boolean
+  ranch_grass?: boolean
+  ranch_grass_buy?: boolean
+  ranch_feed_normal?: boolean
+  ranch_feed_organic?: boolean
+  ranch_complete_upgrade?: boolean
+  ranch_place?: boolean
+  ranch_friend_steal?: boolean
+  ranch_friend_clean?: boolean
+  ranch_friend_stroke?: boolean
+  ranch_friend_mosquito?: boolean
+  ranch_check_minutes?: number
   star_passport_claim?: boolean
   star_record_claim?: boolean
   solar_terms_claim?: boolean

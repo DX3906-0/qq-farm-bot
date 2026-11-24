@@ -23,6 +23,7 @@ message Task {
     int64 group = 11;                // 分组
     int64 cond_type = 12;            // 条件类型
     int64 is_show_text = 13;         // 是否显示文本
+    repeated corepb.Item extra_rewards = 14;
 }
 
 // ============ 活跃度奖励 ============
@@ -66,7 +67,10 @@ message TaskInfo {
 // ============ 请求/回复 ============
 
 // --- 获取任务信息 ---
-message TaskInfoRequest {}
+// 牧场必须显式传 2；农场旧调用保持默认值，不改变既有线上行为。
+message TaskInfoRequest {
+    int32 global_scene_id = 1;
+}
 
 message TaskInfoReply {
     TaskInfo task_info = 1;
