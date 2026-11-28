@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package gamepb.mysteryshoppb;
+
+service MysteryShopService {
+  rpc GetActiveNPC(GetActiveNPCRequest) returns (GetActiveNPCReply);
+  rpc Buy(BuyRequest) returns (BuyReply);
+  rpc Abandon(AbandonRequest) returns (AbandonReply);
+}
+
+message GetActiveNPCRequest {}
+
+message MysteryShopNPC {
+  int32 npc_id = 1;
+  int32 item_id = 2;
+  int32 item_type = 3;
+  int32 item_count = 4;
+  int32 currency_id = 5;
+  int64 price = 6;
+  int32 discount = 7;
+  bool purchased = 8;
+  int64 original_price = 9;
+}
+
+message GetActiveNPCReply {
+  bool active = 1;
+  MysteryShopNPC npc = 2;
+  int64 start_time = 3;
+  int64 end_time = 4;
+}
+
+message BuyRequest {
+  int32 npc_id = 1;
+}
+
+message MysteryShopReward {
+  int32 item_id = 1;
+  int32 count = 2;
+  int32 field_6 = 6;
+  int32 field_9 = 9;
+}
+
+message BuyReply {
+  MysteryShopReward reward = 1;
+  MysteryShopNPC npc = 2;
+}
+
+message AbandonRequest {}
+
+message AbandonReply {}
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message ActiveNPC {
+  int64 npc_id = 1;
+  int64 reward_item_id = 2;
+  int32 unknown_field_3 = 3;
+  int32 reward_count = 4;
+  int64 currency_item_id = 5;
+  int64 price = 6;             // Discounted unit price; multiply by reward_count for the order total.
+  int32 discount_percent = 7;
+  reserved 8;
+  int64 original_price = 9;    // Original unit price; multiply by reward_count for the order total.
+}

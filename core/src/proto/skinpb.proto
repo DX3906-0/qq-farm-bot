@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package gamepb.skinpb;
+
+// Official chunks:///_virtual/skinpb.ts, client 1.16.1.6_20261028.
+// game.js SHA256: 3ce682493dde4b8ab56d621eeb27f4aa1b50e802a077997e5fc1bbee8f49072b
+// EquipReply is an acknowledgement without fields. Equipment is confirmed by
+// SkinsEquipped (or the separate SkinChangeNotify), never reply.skins.
+message Skin {
+    int64 id = 1;
+    int64 skin_type = 2;
+    bool is_new = 3;
+    int64 expire_time = 4;
+    repeated int64 part_ids = 5;
+}
+
+message SkinPart {
+    int64 id = 1;
+    bool is_new = 2;
+}
+
+message SkinsOwnedRequest {}
+message SkinsOwnedReply {
+    repeated Skin skins = 1;
+    repeated SkinPart parts = 2;
+}
+
+message SkinsEquippedRequest {}
+message SkinsEquippedReply {
+    repeated Skin skins = 1;
+    repeated SkinSetEffectInfo active_set_effects = 2;
+}
+
+message SkinSetEffectInfo {
+    int64 set_id = 1;
+    int64 effect_type = 2;
+    bool is_active = 3;
+}
+
+message SkinSetEffectTypeParams {
+    int64 param1_int = 1;
+}
+
+message GetSkinEffectTypeParamsRequest {}
+message GetSkinEffectTypeParamsReply {
+    map<int64, SkinSetEffectTypeParams> effect_type_params = 1;
+}
+
+message EquipRequest {
+    int64 id = 1;
+    int64 skin_type = 2;
+}
+message EquipReply {}
+
+// Official SkinDecoratePartHelper / skinpb.ts: 1=equip non-default parts,
+// 2=remove currently equipped non-default parts. Never mix the operations.
+message EquipSkinPartRequest {
+    repeated int64 ids = 1 [packed = true];
+    int64 operate = 2;
+}
+message EquipSkinPartReply {
+    repeated int64 part_ids = 1 [packed = true]; // Full resulting non-default parts.
+}
+
+message MarkAsViewedRequest {
+    repeated int64 skin_ids = 1;
+}
+message MarkAsViewedReply {}
+
+message SkinChangeNotify {
+    int64 player_id = 1;
+    repeated Skin equip_skins = 2;
+    repeated SkinSetEffectInfo active_set_effects = 3;
+    map<int64, SkinSetEffectTypeParams> effect_type_params = 4;
+}

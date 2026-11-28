@@ -1,0 +1,9 @@
+{
+  "name": "botMonitor",
+  "version": "1.0.0",
+  "description": "QQ 农场 bot 掉线监控与告警",
+  "main": "index.js",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^2.5.0"
+  }
+}

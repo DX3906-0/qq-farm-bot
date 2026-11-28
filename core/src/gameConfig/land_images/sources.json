@@ -1,0 +1,78 @@
+{
+  "land_valid6_2x2": {
+    "kind": "github-four-cell-candidate",
+    "independentOfficialAsset": false,
+    "officialOriginVerified": false,
+    "previewOnly": false,
+    "userConfirmedApplication": true,
+    "url": "/game-config/land_images/land_valid6_2x2.png",
+    "source": {
+      "repository": "BUGDey/qq-farm-bot",
+      "commit": "669f5969ad03fe60b68df9440b02bb7a503fafa8",
+      "path": "web/public/game-config/land_images/land_valid6_2x2.png",
+      "url": "https://github.com/BUGDey/qq-farm-bot/blob/669f5969ad03fe60b68df9440b02bb7a503fafa8/web/public/game-config/land_images/land_valid6_2x2.png",
+      "gitBlob": "d9a09f5c2ed6e8ebe3be96d5f6008cf2f80c0a2d",
+      "sha256": "aa885a4ca41d548aed705b736bce36f07ba67674b8b279fcc55d739fecf2acae",
+      "size": [
+        356,
+        202
+      ],
+      "matchingRepository": "aaang99/qq-farm-bot-404",
+      "matchingCommit": "ffb66f6551ad178423236f0e8d105f33c8f2c4a4",
+      "provenance": "GitHub pixels and commit verified; official CDN/GUID and asset permission not independently verified."
+    },
+    "layout": {
+      "cellCount": 4,
+      "outerFrameCount": 1,
+      "nativeSize": [
+        356,
+        202
+      ],
+      "outputSize": [
+        356,
+        202
+      ],
+      "resampling": "none",
+      "description": "One continuous blue-crystal frame containing four inner faces; original PNG bytes copied without edits."
+    },
+    "sha256": "aa885a4ca41d548aed705b736bce36f07ba67674b8b279fcc55d739fecf2acae"
+  },
+  "land_valid6": {
+    "kind": "github-single-land-candidate",
+    "independentOfficialAsset": false,
+    "officialOriginVerified": false,
+    "previewOnly": false,
+    "userConfirmedApplication": true,
+    "url": "/game-config/land_images/land_valid6.png",
+    "source": {
+      "repository": "BUGDey/qq-farm-bot",
+      "commit": "669f5969ad03fe60b68df9440b02bb7a503fafa8",
+      "path": "web/public/game-config/land_images/land_valid6.png",
+      "url": "https://github.com/BUGDey/qq-farm-bot/blob/669f5969ad03fe60b68df9440b02bb7a503fafa8/web/public/game-config/land_images/land_valid6.png",
+      "gitBlob": "a5c7c5d3fd1786852501dfd9ba56d5846b26b168",
+      "sha256": "e5352c6190bbc11c84cc3271d9508535af7a9eb04457840d882d42703877de2e",
+      "size": [
+        112,
+        64
+      ],
+      "matchingRepository": "aaang99/qq-farm-bot-404",
+      "matchingCommit": "ffb66f6551ad178423236f0e8d105f33c8f2c4a4",
+      "provenance": "GitHub pixels and commit verified; official CDN/GUID and asset permission not independently verified."
+    },
+    "layout": {
+      "cellCount": 1,
+      "outerFrameCount": 1,
+      "nativeSize": [
+        112,
+        64
+      ],
+      "outputSize": [
+        112,
+        64
+      ],
+      "resampling": "none",
+      "description": "Blue-crystal small-land texture from the same upstream commit; original PNG bytes without edits."
+    },
+    "sha256": "e5352c6190bbc11c84cc3271d9508535af7a9eb04457840d882d42703877de2e"
+  }
+}

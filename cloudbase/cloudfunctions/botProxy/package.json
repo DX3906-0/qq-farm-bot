@@ -1,0 +1,7 @@
+{
+  "name": "botProxy",
+  "version": "1.0.0",
+  "description": "Azure 农场 bot 面板 API 国内代理",
+  "main": "index.js",
+  "dependencies": {}
+}
