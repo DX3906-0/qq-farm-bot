@@ -1,0 +1,23 @@
+{
+  "panel": "http://localhost:3007",
+  "user": "admin",
+  "pass": "",
+  "napcatBase": "http://127.0.0.1:6099",
+  "napcatSecret": "",
+  "pluginToken": "",
+  "relayToken": "",
+  "napcatDir": "",
+  "napcatAutostartBat": "",
+  "accounts": {},
+  "skipAccountIds": [],
+  "releaseAfterFix": [],
+  "releaseTargetUin": 0,
+  "relayIdlePoll": 30,
+  "relayPoll": 3,
+  "hostHibernate": true,
+  "hostIdleStopMin": 10,
+  "hostWakeCooldown": 20,
+  "powerSaveOnBattery": true,
+  "batteryPoll": 1800,
+  "batteryProbe": 30
+}

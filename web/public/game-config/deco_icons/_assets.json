@@ -1,0 +1,938 @@
+{
+ "pack_09": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_09",
+  "guid": "0214d5c8-c788-4599-b589-43abd215c5d8",
+  "hash": "ee1fb"
+ },
+ "icon_feterlize6": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize6",
+  "guid": "03357e47-8844-495b-bfea-5d4753945b45",
+  "hash": "ed6f4"
+ },
+ "img_skin_tower_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_tower_2",
+  "guid": "04351544-1e77-4851-a3f0-a6a53bc5220f",
+  "hash": "12ae5"
+ },
+ "Item_4_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_4_3",
+  "guid": "0a3a47cb-d84f-4aeb-986e-d1bc2ce3866f",
+  "hash": "2e0cd"
+ },
+ "img_skin_board_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board_2",
+  "guid": "0b5467f7-216c-4908-8c8f-e329e42386e9",
+  "hash": "8a484"
+ },
+ "normalFertilizeIcon": {
+  "bundle": "extraRes",
+  "path": "gui/texture/fertilize/normalFertilizeIcon",
+  "guid": "0c09567c-6962-48dc-a685-3a4cc66a7d21",
+  "hash": "cea9b"
+ },
+ "img_skin_board": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board",
+  "guid": "0f457fc9-2a19-45e7-a320-47a628639d80",
+  "hash": "aaab0"
+ },
+ "icon_taskPoint": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_taskPoint",
+  "guid": "1111bacf-2028-40dc-b063-125c7fe0f876",
+  "hash": "e6885"
+ },
+ "img_skin_road_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_1",
+  "guid": "16bf0355-f92d-4d49-921e-9b682d99e75e",
+  "hash": "4a214"
+ },
+ "icon_feterlize4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize4",
+  "guid": "179fe100-a42f-45e9-a9c8-95cecc0b07c0",
+  "hash": "9946f"
+ },
+ "pack_gift": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_gift",
+  "guid": "21510180-f3fc-4ac5-b61d-74390f8fcc3d",
+  "hash": "1e406"
+ },
+ "icon_harvest": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_harvest",
+  "guid": "224c83ac-3182-448c-8ceb-5b8dadcd7e18",
+  "hash": "be5d6"
+ },
+ "icon_feterlize7": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize7",
+  "guid": "242b3363-018c-46f7-81a7-7279f34f2d1a",
+  "hash": "713bd"
+ },
+ "img_skin_tower_3_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_tower_3_1",
+  "guid": "2a6fedb6-014d-4d40-8455-1e32797027ae",
+  "hash": "9bc50"
+ },
+ "img_skin_road_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_2",
+  "guid": "2e7b61f6-a786-4a7a-8bc8-d6d4d3100324",
+  "hash": "37dc2"
+ },
+ "icon_bug": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_bug",
+  "guid": "2fbc803e-5624-438a-80a0-b1a50a785c8f",
+  "hash": "4a867"
+ },
+ "icon_qing": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gotoJump/icon_qing",
+  "guid": "30fd2338-d310-46f0-8487-ab2526695439",
+  "hash": "f0ca0"
+ },
+ "img_skin_barrier_6": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_6",
+  "guid": "34db5e18-74a4-4eab-b784-5976caa1c544",
+  "hash": "c5bbf"
+ },
+ "img_skin_warehouse_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse_4",
+  "guid": "35abf539-4fb9-4295-8f55-37c706ea7dbf",
+  "hash": "e9fc0"
+ },
+ "pack_qixi_silkbag_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_qixi_silkbag_2",
+  "guid": "362d8fdc-e688-4f01-9f82-d4f07f3818de",
+  "hash": "af79e"
+ },
+ "Item_8_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_8_11",
+  "guid": "3b6e3d49-46e3-4fed-910a-ecec0e2c17b8",
+  "hash": "9644b"
+ },
+ "icon_gift1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gift/icon_gift1",
+  "guid": "3ce3e38c-3786-4947-8103-a6ecbe0d0192",
+  "hash": "09709"
+ },
+ "icon_saijiTicket": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_saijiTicket",
+  "guid": "40b8c8ab-4f2a-47e1-ab18-76852a419564",
+  "hash": "09386"
+ },
+ "img_skin_house_5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_5",
+  "guid": "449b9459-a895-4324-9cc5-453f6a9c75c6",
+  "hash": "b5b85"
+ },
+ "pack_svip_SeasonLimited": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_svip_SeasonLimited",
+  "guid": "499c1d43-419f-4da2-91cb-1789dc97f7bb",
+  "hash": "795d5"
+ },
+ "pack_03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/share/img/pack_03",
+  "guid": "4ad657a0-dfb9-43f6-8bbe-ba508884dae0",
+  "hash": "5f77a"
+ },
+ "pack_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_11",
+  "guid": "5068f5a5-85d9-4b7f-94f9-fd3f01ed4408",
+  "hash": "f0de8"
+ },
+ "pack_08": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_08",
+  "guid": "52c46b54-a1f3-4bb6-8419-aae92775c8b9",
+  "hash": "2bb92"
+ },
+ "icon_grass_eraser": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_grass_eraser",
+  "guid": "59ae44f7-2222-412c-9afc-66dcfb0b7d88",
+  "hash": "abb9b"
+ },
+ "icon_steal": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_steal",
+  "guid": "5ae27d79-9140-4387-b3c9-bd5c04f32990",
+  "hash": "217ca"
+ },
+ "icon_feterlize8": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize8",
+  "guid": "5b6e11c0-75d2-49a5-96d7-8433d6694c0e",
+  "hash": "9f1ec"
+ },
+ "img_skin_road_5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_5",
+  "guid": "5cdcde7f-6c09-48f9-bc31-c6cb6ac1d302",
+  "hash": "a45c6"
+ },
+ "img_skin_warehouse_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse_3",
+  "guid": "6065bfcf-99fd-4832-9df9-0bbe305f5579",
+  "hash": "838e5"
+ },
+ "pack_svip": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_svip",
+  "guid": "60e84e6a-1848-4e07-a3f0-cd766c10a2f9",
+  "hash": "4e853"
+ },
+ "icon_gift2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gift/icon_gift2",
+  "guid": "616e151a-ceaa-414a-aa11-0cb7bc08bf56",
+  "hash": "7faad"
+ },
+ "img_skin_warehouse_5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse_5",
+  "guid": "6234cb80-fe64-4edc-8b08-09a10342a9a8",
+  "hash": "3faba"
+ },
+ "img_skin_barrier_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_3",
+  "guid": "642b62f8-291d-4606-b751-c0cd20d8f2ac",
+  "hash": "36e03"
+ },
+ "img_skin_house_6": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_6",
+  "guid": "64e72bea-f036-4e6f-aa25-b1c2bdbe554d",
+  "hash": "7a85f"
+ },
+ "golds": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/golds",
+  "guid": "65088be3-d53f-46f9-a25d-d3d91b311959",
+  "hash": "b8ce8"
+ },
+ "exp": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/exp",
+  "guid": "6eca3ee1-0d13-4e22-945d-5c23867f5831",
+  "hash": "92844"
+ },
+ "img_skin_barrier": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier",
+  "guid": "7105a4ac-14b0-4e56-9ec2-3823fadfd8b2",
+  "hash": "3901a"
+ },
+ "img_skin_barrier_5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_5",
+  "guid": "71f73c1c-693c-4317-a26c-f7d4da14d2f3",
+  "hash": "737af"
+ },
+ "img_skin_board_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board_3",
+  "guid": "74648138-6906-4828-843d-40a6d8c4f27d",
+  "hash": "c3f03"
+ },
+ "img_skin_tower_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_tower_1",
+  "guid": "76e0f57d-00f9-475b-ab26-d1a88fb7ac91",
+  "hash": "62dcf"
+ },
+ "icon_grass": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_grass",
+  "guid": "7de2068b-fecb-4a73-a217-2008b1037174",
+  "hash": "c0a18"
+ },
+ "pack_06": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_06",
+  "guid": "7e07742d-d794-44b8-b0c1-8fb832fadfa2",
+  "hash": "99a39"
+ },
+ "pack_10": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_10",
+  "guid": "7fa08bc0-9424-4645-b7db-209c9b14ac65",
+  "hash": "1e918"
+ },
+ "dogFood2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/dogFood2",
+  "guid": "835fa5b1-79cb-4cea-bf32-2f6d77b736c5",
+  "hash": "bbfc4"
+ },
+ "icon_bug_killer": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_bug_killer",
+  "guid": "8c602d0a-f2b6-4813-a181-7fb1de8c8532",
+  "hash": "bb452"
+ },
+ "img_skin_house_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_4",
+  "guid": "8cd9f037-11e1-461a-8303-35b51975f4ca",
+  "hash": "7852a"
+ },
+ "icon_feterlize5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize5",
+  "guid": "8fe4411f-95ff-48c8-83d6-ad3f61442d5d",
+  "hash": "bfa4b"
+ },
+ "img_giftHead_bg": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gift/img_giftHead_bg",
+  "guid": "931565ce-dbda-4114-b37b-052184e94e37",
+  "hash": "5a6f7"
+ },
+ "img_skin_house_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_3",
+  "guid": "955a0c42-05f7-4e3d-aaa4-219c1e92d426",
+  "hash": "96eee"
+ },
+ "xingyunbi": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/xingyunbi",
+  "guid": "9ac44107-3c92-4f2d-8167-189c36a0dc27",
+  "hash": "fdf0d"
+ },
+ "img_skin_board_5": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board_5",
+  "guid": "9ad3f6c2-6f1f-468b-8ba3-6510d43d127d",
+  "hash": "37544"
+ },
+ "pack_04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_04",
+  "guid": "9af8ac11-9099-4859-879e-1c28f80b44bc",
+  "hash": "63104"
+ },
+ "dogFood3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/dogFood3",
+  "guid": "a04b7acf-1a3e-4674-980c-03eb29c3d1dc",
+  "hash": "30d67"
+ },
+ "icon_nangua": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gotoJump/icon_nangua",
+  "guid": "a2c8c1bc-ae98-4493-8af1-66e08e3047bc",
+  "hash": "685d7"
+ },
+ "pack_roco": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_roco",
+  "guid": "a48a3812-2d0f-42e1-ba36-a03387c4728b",
+  "hash": "a3629"
+ },
+ "goldenBean": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/goldenBean",
+  "guid": "a5bc02d5-5755-4055-bdf4-ca89f12b5dcf",
+  "hash": "a94e4"
+ },
+ "img_skin_board_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board_4",
+  "guid": "a85719a8-799d-49b7-97a1-ceacb1ef265d",
+  "hash": "ff04e"
+ },
+ "icon_gift3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/gift/icon_gift3",
+  "guid": "a9a64731-17a4-490c-a118-621619914ef8",
+  "hash": "77d83"
+ },
+ "icon_watering": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_watering",
+  "guid": "a9e1f805-5f06-4859-8bf6-ab8353e04bbb",
+  "hash": "cd1f0"
+ },
+ "icon_feterlize2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize2",
+  "guid": "af16205d-f264-4112-baf4-cae71af3fb9a",
+  "hash": "3660d"
+ },
+ "img_skin_house_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_1",
+  "guid": "b0f04d5e-f112-45e7-8a02-99064d6aa53c",
+  "hash": "d3eec"
+ },
+ "icon": {
+  "bundle": "extraRes",
+  "path": "gui/texture/marquee/icon",
+  "guid": "b23d1f10-519b-4c4c-a7a3-c50aad37b4cd",
+  "hash": "bf23f"
+ },
+ "img_skin_warehouse": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse",
+  "guid": "bbd59f59-c2e4-4c55-a789-b7565e156ca5",
+  "hash": "44d1b"
+ },
+ "img_skin_barrier_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_4",
+  "guid": "bca3ba5a-6888-43e7-96ec-86dd40eb2446",
+  "hash": "38d8a"
+ },
+ "img_skin_board_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_board_1",
+  "guid": "bd13363f-cf86-4e98-a56e-324dfdee5119",
+  "hash": "4b563"
+ },
+ "star": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/star",
+  "guid": "bd489f54-172c-44da-987a-f34588edb87c",
+  "hash": "5c483"
+ },
+ "Item_4_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_4_1",
+  "guid": "bee01c6e-011e-4fa4-bd7c-c4d423778c16",
+  "hash": "7febd"
+ },
+ "fertilizePro": {
+  "bundle": "extraRes",
+  "path": "gui/texture/fertilize/fertilizePro",
+  "guid": "c03718b9-f4e1-4e18-8878-538fa6ef765e",
+  "hash": "87cce"
+ },
+ "icon_feterlize3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize3",
+  "guid": "c3700ffc-c3f9-4ea5-a053-4d3b63de5a0f",
+  "hash": "e8ab9"
+ },
+ "img_skin_barrier_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_2",
+  "guid": "c5171d34-3481-4f3e-a829-bb02e5c340b2",
+  "hash": "e1a43"
+ },
+ "img_skin_road_6": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_6",
+  "guid": "c7f23044-675a-4093-af2b-75fd99fbe52f",
+  "hash": "9c015"
+ },
+ "pack_01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_01",
+  "guid": "caefc920-5cf6-46a8-a31b-4947c8728da7",
+  "hash": "1b1be"
+ },
+ "icon_feterlize1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_feterlize1",
+  "guid": "cb2a91eb-044e-4289-ab1b-6696c7e171a3",
+  "hash": "c706e"
+ },
+ "Item_4_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_4_4",
+  "guid": "ccf8c0ff-77b4-49d5-9583-2fcab7369b9b",
+  "hash": "78a3d"
+ },
+ "img_skin_road_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_3",
+  "guid": "d20e6a01-ff5e-4189-a2d9-936b82ff6137",
+  "hash": "1f388"
+ },
+ "img_skin_barrier_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_barrier_1",
+  "guid": "d2202dd1-abd7-4a98-9e9f-acb5747de29a",
+  "hash": "bd2af"
+ },
+ "img_skin_warehouse_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse_2",
+  "guid": "d4070e96-ffb1-45bf-a0e6-534d07549d0c",
+  "hash": "bb240"
+ },
+ "img_skin_tower_3": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_tower_3",
+  "guid": "d6eb3b9c-7182-4d7b-85ec-e9590921c35e",
+  "hash": "57758"
+ },
+ "suihua": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/suihua",
+  "guid": "d7484bd8-ffbb-4483-bebd-47457c0b4465",
+  "hash": "64e6b"
+ },
+ "icon_saijiHelu": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_saijiHelu",
+  "guid": "d817ae9c-a4ee-452f-92ba-a7c1a0d8a371",
+  "hash": "b5141"
+ },
+ "pack_05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_05",
+  "guid": "db975118-1896-4e5b-941e-974c7551d7ef",
+  "hash": "d4908"
+ },
+ "img_skin_house": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house",
+  "guid": "dc97ae50-8dbe-4e8b-90c6-cf9007cee3d5",
+  "hash": "e2db3"
+ },
+ "img_skin_road_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road_4",
+  "guid": "e1051c80-23d0-45eb-9345-01e15fc01e9c",
+  "hash": "8803d"
+ },
+ "img_skin_house_2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_house_2",
+  "guid": "e88f2012-5b3d-46e3-acef-124111a69660",
+  "hash": "7c9ef"
+ },
+ "pack_07": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_07",
+  "guid": "eab03944-5b49-4108-94d1-419adfc1fc0c",
+  "hash": "0b59b"
+ },
+ "dogFood1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/dogFood1",
+  "guid": "ec8e4ace-eade-4d8e-b40c-a9ffa9820a2f",
+  "hash": "05288"
+ },
+ "pack_12": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_12",
+  "guid": "ed3690ba-87b5-4739-9060-321a0ed6baa4",
+  "hash": "1af75"
+ },
+ "pack_13": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_13",
+  "guid": "ed5b3272-a4da-4ad8-95f9-7ca8ac305a59",
+  "hash": "987e1"
+ },
+ "icon_erase": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_erase",
+  "guid": "ef1e3181-568e-48b3-80ea-e2bd4cf3efbe",
+  "hash": "87ef5"
+ },
+ "img_skin_tower_2_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_tower_2_1",
+  "guid": "f0eecc6d-1e4b-4ffc-9f03-a1f0d95cdf96",
+  "hash": "93f33"
+ },
+ "pack_02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/pack_02",
+  "guid": "f22c4b0c-7020-4574-a22b-d6a9295dccf6",
+  "hash": "65ead"
+ },
+ "Item_8_21": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_8_21",
+  "guid": "f2c98306-e504-40e8-8009-b17c2a93bf8a",
+  "hash": "3ce08"
+ },
+ "img_skin_warehouse_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_warehouse_1",
+  "guid": "f81b0671-033c-47ed-b14b-7b12ce2ea4d6",
+  "hash": "a5fa4"
+ },
+ "img_skin_road": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDetail/img_skin_road",
+  "guid": "f87ddc95-ad3d-46c4-9637-175ed4ad2da3",
+  "hash": "d273f"
+ },
+ "icon_diamond": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_diamond",
+  "guid": "ff3c1c6f-3de4-4ed9-ae71-859d0cd73e53",
+  "hash": "8c006"
+ },
+ "icon_skin_tower_4_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_tower_4_1",
+  "guid": "02465b12-698d-486e-b94e-43abae9cdca8",
+  "hash": "dc916"
+ },
+ "icon_skin_tower_4": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_tower_4",
+  "guid": "1133e8e6-1aa3-49ed-837b-798fa0711570",
+  "hash": "5f3d2"
+ },
+ "icon_s3_book2": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3_book2",
+  "guid": "174bc0bb-98ec-4eee-aaad-57a59de2dedc",
+  "hash": "7efa7"
+ },
+ "icon_s3_petCost": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3_petCost",
+  "guid": "28a0e0b8-e3bc-4112-b661-725087d7add6",
+  "hash": "77781"
+ },
+ "icon_s3luckyStar": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3luckyStar",
+  "guid": "4ceb84f9-ad2c-41ec-a487-a5ebbf43e9b0",
+  "hash": "d1836"
+ },
+ "icon_s3_map": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3_map",
+  "guid": "6117e55d-c029-4593-81f4-d3c0782e6876",
+  "hash": "b077a"
+ },
+ "Item_8_31": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/Item_8_31",
+  "guid": "ab057b29-9fab-4ca6-91ea-079046701aec",
+  "hash": "02dff"
+ },
+ "img_avatar_S3_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/avatarDetail/img_avatar_S3_1",
+  "guid": "ad69ed82-d42b-4ba7-83dc-5c33d0de66b0",
+  "hash": "5d302"
+ },
+ "icon_s3_book1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3_book1",
+  "guid": "c07b33b4-13c3-423a-8e6e-1d3c9675027c",
+  "hash": "6bbd8"
+ },
+ "icon_s3_book0": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s3_book0",
+  "guid": "e16bdff8-0173-49fc-a908-08385fcd0fb2",
+  "hash": "c5a71"
+ },
+ "icon_skin_warehouse_10": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_warehouse_10",
+  "guid": "028b316a-3dee-4c68-95d4-eaca6ec4be3b",
+  "hash": "ed8ae"
+ },
+ "img_avatar_S4_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/avatarDetail/img_avatar_S4_1",
+  "guid": "0396de0e-605d-42ee-9a97-fa1ae70fa1fb",
+  "hash": "dccef"
+ },
+ "icon_chuang04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_chuang04",
+  "guid": "0451d383-290e-4046-9d9e-859f99445daf",
+  "hash": "89c5c"
+ },
+ "icon_s4_ticket": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s4_ticket",
+  "guid": "12f88797-1359-406c-b08d-f67722b9c33f",
+  "hash": "a581a"
+ },
+ "icon_chuang02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_chuang02",
+  "guid": "130ab59d-9dec-4a5b-a98f-1bf66a33338c",
+  "hash": "3e82c"
+ },
+ "icon_zhuangshi03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuangshi03",
+  "guid": "2236055e-e0e9-4e5a-a0c0-5e6a80753bc7",
+  "hash": "cfdb0"
+ },
+ "icon_zhuoyi03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuoyi03",
+  "guid": "229660a3-d69f-40a5-a908-2fe78d7e88d2",
+  "hash": "4d287"
+ },
+ "icon_wuding05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_wuding05",
+  "guid": "268c00d5-7146-4049-9fa6-231558981053",
+  "hash": "e5108"
+ },
+ "icon_wuding01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_wuding01",
+  "guid": "276746bb-d170-45a4-bce6-f5013d2c39c6",
+  "hash": "f0b26"
+ },
+ "icon_skin_road_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_road_11",
+  "guid": "3b115417-1501-4da7-81e8-8ab803b9c319",
+  "hash": "084b4"
+ },
+ "icon_zhuoyi05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuoyi05",
+  "guid": "3c08bc4e-4fe9-4014-af55-769cce0748cf",
+  "hash": "984b3"
+ },
+ "icon_zhuangshi06": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuangshi06",
+  "guid": "3c7b5069-de43-4fae-9cb7-133197e81119",
+  "hash": "78762"
+ },
+ "icon_wuding03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_wuding03",
+  "guid": "40ba1f88-417a-4357-88b5-49e283a172c0",
+  "hash": "fb39e"
+ },
+ "icon_skin_tower_6": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_tower_6",
+  "guid": "4c89b387-75b9-4d28-af8e-c4dec5f65b89",
+  "hash": "f16c5"
+ },
+ "icon_diban05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_diban05",
+  "guid": "4f3eb884-7557-4ed2-bbcf-fc47163b4e5e",
+  "hash": "7952a"
+ },
+ "icon_skin_board_10": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_board_10",
+  "guid": "52c7e3c2-8188-45c8-8459-7f0e8582e999",
+  "hash": "99823"
+ },
+ "icon_men01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_men01",
+  "guid": "54d67e99-1f17-4afb-984a-48b3a20e09a8",
+  "hash": "6e838"
+ },
+ "icon_skin_barrier_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_barrier_11",
+  "guid": "55ad6da0-8349-4f94-b167-7b045650cf27",
+  "hash": "b69d7"
+ },
+ "icon_diban03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_diban03",
+  "guid": "728f049b-47ec-4686-95cd-2914f62eae04",
+  "hash": "fbc99"
+ },
+ "icon_qiangmian03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_qiangmian03",
+  "guid": "72a107a6-12c3-4e94-baa2-315e6a6bec81",
+  "hash": "48f42"
+ },
+ "icon_men05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_men05",
+  "guid": "738aee64-25ba-40f5-92ba-8e274c219373",
+  "hash": "0224b"
+ },
+ "icon_qiangmian02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_qiangmian02",
+  "guid": "747fe149-029b-4bd2-9b91-7bb11893eb88",
+  "hash": "3af06"
+ },
+ "icon_skin_fence_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_fence_11",
+  "guid": "7933d5cc-124f-4d40-8822-90d9888bd4a7",
+  "hash": "4d269"
+ },
+ "icon_men02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_men02",
+  "guid": "7c58a38a-023f-429f-96cc-d0a27e327391",
+  "hash": "1dae1"
+ },
+ "icon_skin_house_11": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_house_11",
+  "guid": "81f9220e-5c18-4df8-b558-925a74bd79bc",
+  "hash": "f78cf"
+ },
+ "icon_men04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_men04",
+  "guid": "a12cdb4a-c305-4eb3-856e-c0a8311a70cd",
+  "hash": "123f6"
+ },
+ "icon_zhuangshi04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuangshi04",
+  "guid": "a24bff4d-8fc2-4034-900e-5f387dcc0c53",
+  "hash": "00555"
+ },
+ "icon_chuang01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_chuang01",
+  "guid": "a2ac3d06-5d6c-43f2-ba8e-01bcac0cb1c7",
+  "hash": "b4cca"
+ },
+ "icon_wuding04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_wuding04",
+  "guid": "aa1c5cf1-5b5a-433d-b2c5-19bdd12c3b8b",
+  "hash": "c3e3c"
+ },
+ "icon_chuang03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_chuang03",
+  "guid": "ab9dce50-f838-4bef-a1d7-cd7951c508ee",
+  "hash": "5b073"
+ },
+ "icon_zhuoyi02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuoyi02",
+  "guid": "b15b4a06-3303-47c4-9e1f-560e6b69cd57",
+  "hash": "c65be"
+ },
+ "icon_qiangmian05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_qiangmian05",
+  "guid": "b86456c5-5391-4e26-b4fe-69e9387fcaea",
+  "hash": "fa9c7"
+ },
+ "icon_wuding02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_wuding02",
+  "guid": "bb311201-b8f9-4a63-b555-e89cefaead43",
+  "hash": "c4f46"
+ },
+ "icon_s4_boost": {
+  "bundle": "extraRes",
+  "path": "gui/texture/icon/icon_s4_boost",
+  "guid": "bc1d8825-0dd0-4bdd-b069-86236c684cf8",
+  "hash": "b2794"
+ },
+ "icon_qiangmian01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_qiangmian01",
+  "guid": "bf360069-aa6e-4f9b-a730-2d26bff14ae0",
+  "hash": "c5347"
+ },
+ "icon_men03": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_men03",
+  "guid": "bf988ecf-2d46-4d56-beda-932a78435fa4",
+  "hash": "89c40"
+ },
+ "icon_zhuoyi04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuoyi04",
+  "guid": "c1aa2e31-7263-45e5-b5c3-da658f640d9c",
+  "hash": "f90c8"
+ },
+ "icon_diban01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_diban01",
+  "guid": "c5ab1477-e88f-4897-a506-f95087564c9d",
+  "hash": "8d443"
+ },
+ "icon_skin_tower_6_1": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_tower_6_1",
+  "guid": "ccbd80fc-c1e3-4788-bddc-b0e515e690d1",
+  "hash": "d2315"
+ },
+ "icon_skin_doghouse_10": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinIcon/icon_skin_doghouse_10",
+  "guid": "cdd4b018-8507-4c3c-bfa7-5cead0f7cb05",
+  "hash": "f9602"
+ },
+ "icon_zhuangshi05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuangshi05",
+  "guid": "d0356ab2-23f3-4d3c-9890-7320080b5b53",
+  "hash": "1a320"
+ },
+ "icon_qiangmian04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_qiangmian04",
+  "guid": "d14725d0-797b-42e7-ad47-63047a66f0a2",
+  "hash": "9a537"
+ },
+ "icon_diban04": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_diban04",
+  "guid": "e1e7082e-b399-48ae-bf0e-aec964a52551",
+  "hash": "c7c15"
+ },
+ "icon_zhuoyi01": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuoyi01",
+  "guid": "e422aed6-f6a1-4635-8887-db8a184fbd4d",
+  "hash": "74b44"
+ },
+ "icon_chuang05": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_chuang05",
+  "guid": "e57dc433-8114-4c09-8cdc-03a1875d3808",
+  "hash": "3de00"
+ },
+ "icon_diban02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_diban02",
+  "guid": "e5f7fda3-ccc3-4f15-b87d-608ba005060b",
+  "hash": "07f9f"
+ },
+ "icon_zhuangshi02": {
+  "bundle": "extraRes",
+  "path": "gui/texture/skinDecorationIcon/icon_zhuangshi02",
+  "guid": "f427d18c-9034-4b60-a0b1-77ab1c1e727c",
+  "hash": "1ca53"
+ }
+}

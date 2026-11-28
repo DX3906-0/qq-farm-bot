@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package gamepb.dogpb;
+import "corepb.proto";
+
+// 来源：QQ 官方缓存 1112386029_3_c68e1129c7348c5696b0086bdb79caf7/game.js，
+// 模块 assets/main/index.a58bb.js；未独立核验客户端语义版本号。
+// 字段 6 是持有卡，字段 7 是已激活宠物，二者独立。
+message DogInfo {
+    int64 id = 1;
+    string name = 2;
+    int64 protect_probability = 3;
+    int64 lost_gold_range_min = 4;
+    int64 lost_gold_range_max = 5;
+    bool owned = 6;
+    bool activated = 7;
+    int64 price = 8;
+    int64 expire_time = 9;
+    bool is_reddot = 10;
+}
+
+message GetDogInfoRequest {}
+
+message GetDogInfoReply {
+    repeated DogInfo dog_list = 1;
+    int64 current_deployed_dog_id = 2;
+    int64 food_last_sec = 3;
+    int64 max_food_last_sec = 4;
+    repeated FoodInfo food_list = 5;
+    bool is_exist_new_log = 6;
+    int64 pending_gift_count = 7;
+    repeated DogSkillUsage skill_use_infos = 8;
+}
+
+message FoodInfo {
+    int64 id = 1;
+    int64 time = 2;
+    int64 own_count = 3;
+}
+
+// ============ 上游新增（2026-11-02 同步）============
+// 以下 message 由上游 activity 体系重构时新增。本文件保留原有定义（本地业务仍在用），
+// 同时补齐上游新协议，二者并存互不冲突（message 名不重复）。
+
+message DogItem {
+    int64 id = 1;
+    int64 duration = 2;
+    // 抓包中三种狗粮均固定返回 1，而同一时刻背包只持有其中一种，
+    // 因此这是状态位，不是库存；库存必须读取 ItemService.Bag。
+    int64 status = 3;
+}
+
+message DogSkillUsage {
+    int64 skill_id = 1;
+    int64 daily_trigger_count = 2;
+    int64 max_trigger_daily = 3;
+    int64 dog_id = 4;
+}
+
+message ActivateDogRequest {
+    int64 dog_id = 1;
+}
+
+message ActivateDogReply {
+    DogInfo dog = 1;
+}
+
+message DeployDogRequest {
+    int64 dog_id = 1;
+}
+
+message DeployDogReply {
+    int64 dog_id = 1;
+}
+
+message WithdrawDogRequest {}
+
+message WithdrawDogReply {
+    int64 dog_id = 1;
+}
+
+message AddFoodRequest {
+    int64 item_id = 1;
+    int64 count = 2;
+}
+
+message AddFoodReply {
+    // 使用后的狗粮剩余秒数。
+    int64 food_last_sec = 1;
+}
+
+message ClaimSkillGiftsRequest {}
+
+message ClaimSkillGiftsReply {
+    repeated corepb.Item rewards = 1;
+    repeated corepb.Item compensated_items = 2;
+    int64 claimed_gift_count = 3;
+    int64 pending_gift_count = 4;
+}
+
+message PendingGiftCountNotify {
+    int64 count = 1;
+}
+
+message GetProtectLogsRequest {
+    // 字段 1/3 的业务语义尚未证明；仅按真实点击的 0/100/0 发送。
+    int64 field_1 = 1;
+    int64 count = 2;
+    int64 field_3 = 3;
+}
+
+message ProtectLogDisplayItem {
+    int64 item_id = 1;
+    int64 count = 2;
+    int64 field_4 = 4;
+}
+
+message ProtectLogExtra {
+    bytes value = 1;
+}
+
+message ProtectLogEntry {
+    int64 friend_gid = 1;
+    string friend_name = 2;
+    string friend_avatar = 3;
+    // Unix 秒级时间戳。
+    int64 timestamp = 5;
+    // 实际记录中分别对应被扣数量和守护所得金币。
+    int64 stolen_count = 6;
+    int64 protected_gold = 7;
+    int64 dog_id = 8;
+    string dog_name = 9;
+    int64 friend_role_id = 10;
+    int64 field_12 = 12;
+    int64 field_13 = 13;
+    repeated ProtectLogDisplayItem display_items = 14;
+    ProtectLogExtra extra = 20;
+}
+
+message GetProtectLogsReply {
+    repeated ProtectLogEntry logs = 1;
+    int64 total = 2;
+}
+
+message NewProtectLogNotify {}

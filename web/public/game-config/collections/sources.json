@@ -1,0 +1,56 @@
+{
+  "repository": "liyangpengs/qq-farm-bot",
+  "commit": "a459b0ab787c75ab7cfe8cd16899dbd1f6d7fca7",
+  "files": {
+    "CollectionSeries": {
+      "path": "core/src/gameConfig/collections/CollectionSeries.json",
+      "gitBlob": "cb4deca94be9934a7b0e816095b742e5cf419424",
+      "sha256": "ea2463688223b80ccd2868ab97131d833825db559319c0d427653b716118aaec"
+    },
+    "CollectionItem": {
+      "path": "core/src/gameConfig/collections/CollectionItem.json",
+      "gitBlob": "e52954df5ee799f9bca01bf03280f61fcc6beffd",
+      "sha256": "55520e290d7de41a17b59a7e38f75f3cd8d5f806367d3f32a974163beb46509f"
+    },
+    "CollectionStarLevelNeed": {
+      "path": "core/src/gameConfig/collections/CollectionStarLevelNeed.json",
+      "gitBlob": "3027acb9d973ffd96171e2ee9324ed9146074d0b",
+      "sha256": "17bafcb34baf0ee803ccec268c958a91935bd9cc6f93d4737e90fa643a750ee0"
+    },
+    "CollectionScore": {
+      "path": "core/src/gameConfig/collections/CollectionScore.json",
+      "gitBlob": "734c6972806f6824d94abb5cb3a7332262173e97",
+      "sha256": "237d4401f31f0f292272c09413a6265dd933ef93d08b707731f995377f72218a"
+    },
+    "CollectionScoreReward": {
+      "path": "core/src/gameConfig/collections/CollectionScoreReward.json",
+      "gitBlob": "f7b0937f22c9996df7cd92370832172232e010d4",
+      "sha256": "9548a222d24d6aca84c90b6d0270f287468b7766fd224f636d92c89c99b6223a"
+    },
+    "CollectionCondition": {
+      "path": "core/src/gameConfig/collections/CollectionCondition.json",
+      "gitBlob": "bde77cdf84782df693d869941d5d942e841f4fea",
+      "sha256": "00de361b9eeb3fc1691c854c7ef7cc3131e4c35a0b39677f7fc74dda887f5ea3"
+    },
+    "CollectionGroup": {
+      "path": "core/src/gameConfig/collections/CollectionGroup.json",
+      "gitBlob": "182e307f76d315743f053291b752a1c02e3896e3",
+      "sha256": "7ef2b8396460c6522e16bedfde3d655bf94417245da5af8839928499f73d9b1f"
+    },
+    "CollectionPedestal": {
+      "path": "core/src/gameConfig/collections/CollectionPedestal.json",
+      "gitBlob": "db5c6e978608b266a3a83a7099ea554c6aa02ceb",
+      "sha256": "7da3e53ddb721aaf70c86e85a41bcb0ee338b7f52cd74f4944a9c1349a5b9c13"
+    },
+    "CollectionParams": {
+      "path": "core/src/gameConfig/collections/CollectionParams.json",
+      "gitBlob": "a8fa68c345a67b929ab80ad48959c94679ec1dbc",
+      "sha256": "f2a2b80087fb3271403c07bf1dc2e7b932677088a2676008b466d2be37bc9650"
+    },
+    "MutantPublicity": {
+      "path": "core/src/gameConfig/collections/MutantPublicity.json",
+      "gitBlob": "895e7f2e7ffe57799df6289498b1270b16b1fa2e",
+      "sha256": "7b71ae95fd7b344b02c2b36e769f82db31bbf0a4dc37247d9c5e6bd70951f279"
+    }
+  }
+}

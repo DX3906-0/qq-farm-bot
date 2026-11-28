@@ -1,0 +1,25 @@
+{
+  "source": "QQ official miniapp delayRes/config.943e2.json",
+  "resources": {
+    "2026winter.png": {
+      "path": "gui/texture/activity/jieling/jielingItemBg/2026winter",
+      "bundle": "delayRes",
+      "guid": "c43502be-0682-42c6-ad42-6724676d7b39",
+      "hash": "bfc93",
+      "url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/native/c4/c43502be-0682-42c6-ad42-6724676d7b39.bfc93.png",
+      "width": 337,
+      "height": 239,
+      "usage": "Official winter seasonal illustration; not a dedicated Lidong illustration."
+    },
+    "img_jieling_draw_bg.png": {
+      "path": "gui/texture/activity/jieling/jielingBigBg/img_jieling_draw_bg",
+      "bundle": "delayRes",
+      "guid": "bb05ddc5-6f91-4fa7-9e05-59a51a9a972e",
+      "hash": "22d63",
+      "url": "https://cdn-resource.nqf.qq.com/release/remote/delayRes/native/bb/bb05ddc5-6f91-4fa7-9e05-59a51a9a972e.22d63.png",
+      "width": 720,
+      "height": 1020,
+      "usage": "Official seasonal parchment background."
+    }
+  }
+}

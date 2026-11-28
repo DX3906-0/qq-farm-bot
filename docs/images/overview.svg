@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 580" width="1200" height="580" role="img" aria-label="QQ Farm Bot 运行示意：浏览器面板连接常驻服务，服务保持与游戏的连接，本机守护仅在需要补码时唤醒">
+  <rect x="0" y="0" width="1200" height="580" rx="16" fill="#F6F9F7"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif">
+    <text x="36" y="44" font-size="13" fill="#8A9A92">一张图看懂 · QQ Farm Bot</text>
+
+    <!-- 浏览器面板 -->
+    <rect x="36" y="70" width="300" height="300" rx="14" fill="#FFFFFF" stroke="#DCE5E0" stroke-width="1.5"/>
+    <rect x="36" y="70" width="300" height="40" rx="14" fill="#EEF3EF"/>
+    <rect x="36" y="96" width="300" height="14" fill="#EEF3EF"/>
+    <circle cx="58" cy="90" r="5" fill="#C3D2C8"/>
+    <circle cx="74" cy="90" r="5" fill="#C3D2C8"/>
+    <circle cx="90" cy="90" r="5" fill="#C3D2C8"/>
+    <text x="112" y="95" font-size="15" font-weight="600" fill="#2E4438">QQ Farm Bot 面板</text>
+
+    <rect x="56" y="130" width="260" height="58" rx="10" fill="#F4F9F5" stroke="#E1EBE4"/>
+    <rect x="56" y="130" width="6" height="58" rx="3" fill="#2E6B52"/>
+    <text x="76" y="156" font-size="15" font-weight="600" fill="#1B2B26">农场经营</text>
+    <text x="76" y="176" font-size="12" fill="#5B6B64">种植 · 收获 · 土地</text>
+
+    <rect x="56" y="200" width="260" height="58" rx="10" fill="#FDF8F0" stroke="#EFE4D2"/>
+    <rect x="56" y="200" width="6" height="58" rx="3" fill="#C8872E"/>
+    <text x="76" y="226" font-size="15" font-weight="600" fill="#1B2B26">活动与好友</text>
+    <text x="76" y="246" font-size="12" fill="#5B6B64">拜访 · 兑换 · 小礼</text>
+
+    <rect x="56" y="270" width="260" height="58" rx="10" fill="#F2F6FB" stroke="#DDE7F2"/>
+    <rect x="56" y="270" width="6" height="58" rx="3" fill="#3A6EA5"/>
+    <text x="76" y="296" font-size="15" font-weight="600" fill="#1B2B26">资源图鉴</text>
+    <text x="76" y="316" font-size="12" fill="#5B6B64">作物 · 装扮 · 藏品</text>
+
+    <!-- 面板到服务端 -->
+    <line x1="336" y1="220" x2="376" y2="220" stroke="#9AAFA5" stroke-width="2"/>
+    <polygon points="376,220 368,215 368,225" fill="#9AAFA5"/>
+
+    <!-- 常驻服务 -->
+    <rect x="376" y="70" width="420" height="300" rx="14" fill="#FFFFFF" stroke="#DCE5E0" stroke-width="1.5"/>
+    <text x="400" y="102" font-size="16" font-weight="600" fill="#1B2B26">服务端 · 常驻运行</text>
+    <text x="400" y="122" font-size="12" fill="#7A8C82">任务与连接各司其职</text>
+
+    <rect x="400" y="140" width="372" height="64" rx="10" fill="#F4F9F5" stroke="#E1EBE4"/>
+    <text x="420" y="168" font-size="15" font-weight="600" fill="#1B2B26">面板与账号任务</text>
+    <text x="420" y="188" font-size="12" fill="#5B6B64">每个账号一套策略，随时可更新</text>
+
+    <rect x="400" y="216" width="372" height="64" rx="10" fill="#E9F3EC" stroke="#BFDCC8"/>
+    <text x="420" y="244" font-size="15" font-weight="600" fill="#2E6B52">连接网关 · 保持登录</text>
+    <text x="420" y="264" font-size="12" fill="#4B6B58">连接留在这里，不随任务重启</text>
+
+    <line x1="470" y1="280" x2="470" y2="298" stroke="#DCE5E0" stroke-width="1.5"/>
+    <line x1="586" y1="280" x2="586" y2="298" stroke="#DCE5E0" stroke-width="1.5"/>
+    <line x1="702" y1="280" x2="702" y2="298" stroke="#DCE5E0" stroke-width="1.5"/>
+    <circle cx="470" cy="316" r="18" fill="#FFFFFF" stroke="#2E6B52" stroke-width="2"/>
+    <circle cx="586" cy="316" r="18" fill="#FFFFFF" stroke="#C8872E" stroke-width="2"/>
+    <circle cx="702" cy="316" r="18" fill="#FFFFFF" stroke="#3A6EA5" stroke-width="2"/>
+    <text x="470" y="321" font-size="13" font-weight="600" text-anchor="middle" fill="#2E6B52">A</text>
+    <text x="586" y="321" font-size="13" font-weight="600" text-anchor="middle" fill="#C8872E">B</text>
+    <text x="702" y="321" font-size="13" font-weight="600" text-anchor="middle" fill="#3A6EA5">C</text>
+    <text x="586" y="354" font-size="12" text-anchor="middle" fill="#7A8C82">三个账号，三种经营节奏</text>
+
+    <!-- 服务端到游戏 -->
+    <line x1="796" y1="240" x2="922" y2="240" stroke="#2E6B52" stroke-width="2.5"/>
+    <polygon points="922,240 914,235 914,245" fill="#2E6B52"/>
+    <text x="859" y="228" font-size="12" text-anchor="middle" fill="#2E6B52">持续连接</text>
+
+    <circle cx="1010" cy="240" r="88" fill="#FFF6E6" stroke="#E8CFA0" stroke-width="1.5"/>
+    <text x="1010" y="234" font-size="20" font-weight="600" text-anchor="middle" fill="#8A5A18">QQ 农场</text>
+    <text x="1010" y="258" font-size="13" text-anchor="middle" fill="#A07A45">游戏服务器</text>
+    <text x="1010" y="360" font-size="12" text-anchor="middle" fill="#8A9A92">农场一直有人照看</text>
+
+    <!-- 本机守护 -->
+    <rect x="376" y="410" width="420" height="110" rx="14" fill="#FFFFFF" stroke="#9AAFA5" stroke-width="1.5" stroke-dasharray="6 5"/>
+    <text x="400" y="442" font-size="15" font-weight="600" fill="#1B2B26">Windows 本机守护 · NapCat</text>
+    <text x="400" y="464" font-size="12" fill="#5B6B64">平时轻量检查，需要补码时才唤醒，用完可休眠</text>
+    <rect x="400" y="480" width="104" height="26" rx="13" fill="#EEF3EF"/>
+    <text x="452" y="498" font-size="12" text-anchor="middle" fill="#2E6B52">按需唤醒</text>
+    <rect x="514" y="480" width="104" height="26" rx="13" fill="#EEF3EF"/>
+    <text x="566" y="498" font-size="12" text-anchor="middle" fill="#2E6B52">用完休眠</text>
+    <rect x="628" y="480" width="104" height="26" rx="13" fill="#EEF3EF"/>
+    <text x="680" y="498" font-size="12" text-anchor="middle" fill="#2E6B52">电池节能</text>
+
+    <line x1="586" y1="410" x2="586" y2="370" stroke="#C8872E" stroke-width="2" stroke-dasharray="5 4"/>
+    <polygon points="586,370 581,379 591,379" fill="#C8872E"/>
+    <text x="600" y="394" font-size="12" fill="#8A6A32">仅补码时介入</text>
+
+    <!-- 底部要点 -->
+    <circle cx="40" cy="552" r="4" fill="#2E6B52"/>
+    <text x="54" y="557" font-size="13" fill="#5B6B64">一个网页管多个账号</text>
+    <circle cx="420" cy="552" r="4" fill="#2E6B52"/>
+    <text x="434" y="557" font-size="13" fill="#5B6B64">更新面板不影响连接</text>
+    <circle cx="770" cy="552" r="4" fill="#2E6B52"/>
+    <text x="784" y="557" font-size="13" fill="#5B6B64">登录码按需补齐</text>
+  </g>
+</svg>

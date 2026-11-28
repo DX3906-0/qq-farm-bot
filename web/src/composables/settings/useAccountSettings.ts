@@ -1,0 +1,234 @@
+import { useIntervalFn } from '@vueuse/core'
+import { storeToRefs } from 'pinia'
+import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAccountStore } from '@/stores/account'
+import { useUserStore } from '@/stores/user'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { operationFailure } from '@/utils/operation-result'
+
+type AlertType = 'primary' | 'danger'
+
+export function useAccountSettings(showAlert: (message: string, type?: AlertType) => void) {
+  const router = useRouter()
+  const accountStore = useAccountStore()
+  const userStore = useUserStore()
+  const { accounts, loading: accountsLoading, currentAccountId } = storeToRefs(accountStore)
+
+  const showModal = ref(false)
+  const showDeleteConfirm = ref(false)
+  const deleteLoading = ref(false)
+  const editingAccount = ref<any>(null)
+  const accountToDelete = ref<any>(null)
+  const showClearStoppedConfirm = ref(false)
+  const clearStoppedLoading = ref(false)
+  const refreshWxCodesLoading = ref(false)
+  const accountTogglePending = computed<Record<string, boolean>>(() => Object.fromEntries(Object.entries(accountStore.operationStates).map(([id, state]) => [id, state === 'pending'])))
+  const accountToggleUnknown = computed<Record<string, string>>(() => Object.fromEntries(Object.entries(accountStore.operationStates).filter(([, state]) => state === 'unknown').map(([id]) => [id, accountStore.operationErrors[id] || '账号操作结果未确认，仅读取核对'])))
+
+  const userIsAdmin = computed(() => userStore.isAdmin)
+  const isAccountOpsDisabled = computed(() => LOCAL_UI_READONLY)
+  const quotaLimit = computed(() => {
+    const limit = userStore.accountLimit
+    if (limit === undefined || limit === null)
+      return 3
+    return limit
+  })
+  const isOverQuota = computed(() => {
+    if (userStore.isAdmin)
+      return false
+    const limit = quotaLimit.value
+    if (limit === -1)
+      return false
+    return accounts.value.length >= limit
+  })
+  const isAddAccountDisabled = computed(() => isAccountOpsDisabled.value || isOverQuota.value)
+  const addAccountDisabledReason = computed(() => {
+    if (LOCAL_UI_READONLY)
+      return '本地只读浏览不允许添加或登录账号'
+    if (isAccountOpsDisabled.value)
+      return '账号已到期，无法添加账号'
+    if (isOverQuota.value)
+      return '已超过配额，无法添加账号'
+    return ''
+  })
+
+  const stoppedAccounts = computed(() => accounts.value.filter((acc: any) => acc.running === false))
+  const stoppedAccountsCount = computed(() => stoppedAccounts.value.length)
+  const currentAccountName = computed(() => {
+    const acc = accounts.value.find((item: any) => String(item.id) === String(currentAccountId.value))
+    return acc ? (acc.name || acc.nick || acc.id) : null
+  })
+
+  useIntervalFn(() => {
+    accountStore.fetchAccounts()
+  }, 3000)
+
+  async function fetchAccounts() {
+    await accountStore.fetchAccounts()
+  }
+
+  function selectFirstAccountIfNeeded() {
+    if (!currentAccountId.value && accounts.value.length > 0 && accounts.value[0]) {
+      accountStore.selectAccount(String(accounts.value[0].id))
+    }
+  }
+
+  async function openSettings(account: any) {
+    const allowed = await accountStore.selectAccount(String(account.id))
+    if (allowed === false) return
+    await router.push({ path: '/settings', query: { tab: 'strategy' } })
+  }
+
+  function openAddModal() {
+    if (LOCAL_UI_READONLY) return
+    editingAccount.value = null
+    showModal.value = true
+  }
+
+  function openEditModal(account: any) {
+    editingAccount.value = { ...account }
+    showModal.value = true
+  }
+
+  function handleDelete(account: any) {
+    accountToDelete.value = account
+    showDeleteConfirm.value = true
+  }
+
+  async function confirmDelete() {
+    if (LOCAL_UI_READONLY || deleteLoading.value) return
+    if (accountToDelete.value) {
+      try {
+        deleteLoading.value = true
+        await accountStore.deleteAccount(accountToDelete.value.id)
+        accountToDelete.value = null
+        showDeleteConfirm.value = false
+      }
+      catch (error: any) { showAlert(error?.error || error?.message || '删除结果未确认，请核对', 'danger') }
+      finally {
+        deleteLoading.value = false
+      }
+    }
+  }
+
+  async function toggleAccount(account: any) {
+    const id = String(account?.id || '')
+    if (LOCAL_UI_READONLY || !id || accountTogglePending.value[id] || accountToggleUnknown.value[id] || accountStore.readError
+      || account.running !== true && (isAccountOpsDisabled.value || account.running !== false)) return
+    try {
+      if (account.running) await accountStore.stopAccount(id)
+      else await accountStore.startAccount(id)
+    }
+    catch (error: any) {
+      const result = operationFailure(error, '账号操作结果未确认')
+      showAlert(result.error, 'danger')
+    }
+  }
+
+  async function refreshWxCodesNow() {
+    if (LOCAL_UI_READONLY || refreshWxCodesLoading.value)
+      return
+
+    refreshWxCodesLoading.value = true
+    try {
+      const result = await accountStore.refreshWxCodes()
+      const data = result.data
+      if (!result.ok) {
+        if (data && data.total > 0) {
+          showAlert(`微信 Code 刷新完成：成功 ${data.success} 个，失败 ${data.failed} 个`, 'danger')
+        }
+        else {
+          showAlert(result.error || '没有可刷新的微信账号', 'danger')
+        }
+        return
+      }
+
+      const skippedText = data && data.skipped > 0 ? `，跳过 ${data.skipped} 个非微信账号` : ''
+      showAlert(`微信 Code 刷新完成：成功 ${data?.success || 0} 个${skippedText}`, 'primary')
+    }
+    catch (error: any) {
+      showAlert(error.response?.data?.error || error.message || '刷新微信 Code 失败', 'danger')
+    }
+    finally {
+      refreshWxCodesLoading.value = false
+    }
+  }
+
+  function handleSaved() {
+    accountStore.fetchAccounts()
+  }
+
+  function selectAccount(account: any) {
+    if (!account || !account.id)
+      return
+    accountStore.selectAccount(String(account.id))
+  }
+
+  function openClearStoppedConfirm() {
+    if (stoppedAccountsCount.value === 0) {
+      showAlert('没有已停止的账号需要清理', 'primary')
+      return
+    }
+    showClearStoppedConfirm.value = true
+  }
+
+  async function confirmClearStopped() {
+    if (LOCAL_UI_READONLY || clearStoppedLoading.value) return
+    clearStoppedLoading.value = true
+    try {
+      const stoppedIds = stoppedAccounts.value.map((acc: any) => acc.id)
+      let deletedCount = 0
+      for (const id of stoppedIds) {
+        try {
+          await accountStore.deleteAccount(id)
+          deletedCount++
+        }
+        catch (e) {
+          console.error(`删除账号 ${id} 失败:`, e)
+        }
+      }
+      showClearStoppedConfirm.value = false
+      showAlert(`成功清理 ${deletedCount} 个已停止的账号`, 'primary')
+      await accountStore.fetchAccounts()
+    }
+    finally {
+      clearStoppedLoading.value = false
+    }
+  }
+
+  return {
+    accounts,
+    accountsLoading,
+    currentAccountId,
+    currentAccountName,
+    userIsAdmin,
+    showModal,
+    showDeleteConfirm,
+    deleteLoading,
+    editingAccount,
+    accountToDelete,
+    showClearStoppedConfirm,
+    clearStoppedLoading,
+    refreshWxCodesLoading,
+    accountTogglePending,
+    accountToggleUnknown,
+    stoppedAccountsCount,
+    isAddAccountDisabled,
+    addAccountDisabledReason,
+    isAccountOpsDisabled,
+    fetchAccounts,
+    selectFirstAccountIfNeeded,
+    openSettings,
+    openAddModal,
+    openEditModal,
+    handleDelete,
+    confirmDelete,
+    toggleAccount,
+    refreshWxCodesNow,
+    handleSaved,
+    selectAccount,
+    openClearStoppedConfirm,
+    confirmClearStopped,
+  }
+}

@@ -1,0 +1,934 @@
+<script setup lang="ts">
+import { useDateFormat, useIntervalFn, useNow } from '@vueuse/core'
+import { storeToRefs } from 'pinia'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import api from '@/api'
+import ConfirmModal from '@/components/ConfirmModal.vue'
+
+import { createNavigationIndicatorMotion, createNavigationSelection } from '@/composables/useContentMotion'
+import { workspaceForRoute, workspaceMenuRoutes, warmMenuCode } from '@/router/menu'
+import { LOCAL_UI_READONLY } from '@/config/localReadonly'
+import { useAccountStore } from '@/stores/account'
+import { useAppStore } from '@/stores/app'
+import { useShopStore } from '@/stores/shop'
+import { useStatusStore } from '@/stores/status'
+import { useToastStore } from '@/stores/toast'
+import { useUserStore } from '@/stores/user'
+import { deriveAccountPresentation } from '@/utils/operation-result'
+
+const accountStore = useAccountStore()
+const statusStore = useStatusStore()
+const appStore = useAppStore()
+const userStore = useUserStore()
+const shopStore = useShopStore()
+const toast = useToastStore()
+const route = useRoute()
+const router = useRouter()
+const workspace = computed(() => workspaceForRoute(route))
+const workspaceLabel = computed(() => workspace.value === 'ranch' ? '牧场工作区' : '农场工作区')
+const workspaceIcon = computed(() => workspace.value === 'ranch' ? 'i-carbon-sprout' : 'i-carbon-growth')
+const { currentAccount, currentAccountId } = storeToRefs(accountStore)
+const { status, realtimeConnected } = storeToRefs(statusStore)
+const { mysteryOffer, mysteryOfferAccountId } = storeToRefs(shopStore)
+const { loginPageConfig, sidebarOpen } = storeToRefs(appStore)
+
+const wsErrorNotifiedAt = ref<Record<string, number>>({})
+const hasUnadaptedActivities = ref(false)
+const unadaptedActivityIds = ref<number[]>([])
+const notifiedActivitySignature = ref('')
+const brandLogoFailed = ref(false)
+
+const systemConnected = ref<boolean | null>(null)
+const serverUptimeBase = ref(0)
+const serverVersion = ref('')
+const lastPingTime = ref(Date.now())
+const now = useNow()
+const formattedTime = useDateFormat(now, 'YYYY-MM-DD HH:mm:ss')
+
+async function checkConnection() {
+  if (LOCAL_UI_READONLY) {
+    systemConnected.value = false
+    return
+  }
+  try {
+    const res = await api.get('/api/ping')
+    systemConnected.value = res.data?.ok === true ? true : res.data?.ok === false ? false : null
+    if (res.data.ok && res.data.data) {
+      if (res.data.data.uptime) {
+        serverUptimeBase.value = res.data.data.uptime
+        lastPingTime.value = Date.now()
+      }
+      if (res.data.data.version) {
+        serverVersion.value = res.data.data.version
+      }
+    }
+    const accountRef = currentAccount.value?.id || currentAccount.value?.uin
+    if (accountRef) {
+      statusStore.connectRealtime(String(accountRef))
+    }
+  }
+  catch {
+    systemConnected.value = false
+  }
+}
+
+async function refreshStatusFallback() {
+  if (realtimeConnected.value)
+    return
+
+  const accountRef = currentAccount.value?.id || currentAccount.value?.uin
+  if (accountRef) {
+    await statusStore.fetchStatus(String(accountRef))
+  }
+}
+
+async function refreshActivityUpdateReminder() {
+  if (!userStore.isAdmin) {
+    hasUnadaptedActivities.value = false
+    return
+  }
+  try {
+    const { data } = await api.get('/api/activity/update/status')
+    const ids = Array.isArray(data?.report?.unknownActivityIds)
+      ? data.report.unknownActivityIds.map(Number).filter((id: number) => id > 0).sort((a: number, b: number) => a - b)
+      : []
+    unadaptedActivityIds.value = ids
+    hasUnadaptedActivities.value = ids.length > 0
+    const signature = ids.join(',')
+    if (signature && signature !== notifiedActivitySignature.value) {
+      notifiedActivitySignature.value = signature
+      const groups = Array.isArray(data?.report?.online?.groups) ? data.report.online.groups : []
+      const titles = [...new Set(groups.map((item: any) => String(item?.title || '').trim()).filter(Boolean))]
+      toast.warning(`发现未适配活动：${titles.join('、') || `${ids.length} 个活动组`}`, 8000)
+    }
+  }
+  catch {
+    // 提醒查询失败不影响侧边栏及其他后台功能。
+  }
+}
+
+onMounted(() => {
+  if (LOCAL_UI_READONLY)
+    return
+  appStore.fetchLoginPageConfig()
+  accountStore.fetchAccounts()
+  checkConnection()
+  // 获取当前用户信息
+  userStore.fetchUserInfo()
+  // 获取公告（普通用户）
+  fetchAnnouncement()
+  refreshActivityUpdateReminder()
+})
+
+watch(() => loginPageConfig.value.logoUrl, () => {
+  brandLogoFailed.value = false
+})
+
+onBeforeUnmount(() => {
+  statusStore.disconnectRealtime()
+})
+
+useIntervalFn(checkConnection, 30000)
+useIntervalFn(refreshActivityUpdateReminder, 60000)
+useIntervalFn(() => {
+  refreshStatusFallback()
+  accountStore.fetchAccounts()
+}, 10000)
+
+watch(() => currentAccount.value?.id || currentAccount.value?.uin || '', () => {
+  const accountRef = currentAccount.value?.id || currentAccount.value?.uin
+  statusStore.connectRealtime(String(accountRef || ''))
+  refreshStatusFallback()
+}, { immediate: true })
+
+watch(() => status.value?.wsError, (wsError: any) => {
+  if (!wsError || Number(wsError.code) !== 400 || !currentAccount.value)
+    return
+
+  const errAt = Number(wsError.at) || 0
+  const accId = String(currentAccount.value.id || currentAccount.value.uin || '')
+  const lastNotified = wsErrorNotifiedAt.value[accId] || 0
+  if (errAt <= lastNotified)
+    return
+
+  wsErrorNotifiedAt.value[accId] = errAt
+  router.push(workspace.value === 'ranch' ? '/ranch/settings' : '/settings')
+}, { deep: true })
+
+const uptime = computed(() => {
+  const diff = Math.floor(serverUptimeBase.value + (now.value.getTime() - lastPingTime.value) / 1000)
+  const h = Math.floor(diff / 3600)
+  const m = Math.floor((diff % 3600) / 60)
+  const s = diff % 60
+  return `${h}h ${m}m ${s}s`
+})
+
+const connectionStatus = computed(() => {
+  const presentation = deriveAccountPresentation({
+    accountId: currentAccountId.value,
+    account: currentAccount.value,
+    running: currentAccount.value?.running,
+    snapshot: status.value ? { ...status.value, accountId: statusStore.statusAccountId, metadata: statusStore.currentStatusMetadata } : null,
+    snapshotReady: statusStore.currentStatusReady,
+    loading: statusStore.loading,
+    error: statusStore.error,
+    readonly: LOCAL_UI_READONLY,
+    stale: statusStore.currentStatusStale,
+  })
+  if (presentation.kind !== 'readonly' && systemConnected.value === false) {
+    return { text: '系统离线', detail: '系统连接检查失败，不能确认当前账号实时状态。', color: 'bg-red-500', pulse: false }
+  }
+  const colors = { neutral: 'bg-gray-400', info: 'bg-blue-500', success: 'bg-green-500', warning: 'bg-amber-500', error: 'bg-red-500' }
+  return { ...presentation, text: presentation.label, color: colors[presentation.tone] }
+})
+
+// 根据用户角色过滤导航菜单
+const navItems = computed(() => {
+  const isAdmin = userStore.isAdmin
+  return workspaceMenuRoutes(workspace.value)
+    .filter(item => item.showInNav !== false && (!item.adminOnly || isAdmin))
+    .map(item => ({
+      path: item.path ? `/${item.path}` : '/',
+      label: item.label,
+      icon: item.icon,
+    }))
+})
+
+const navigationList = ref<HTMLElement | null>(null)
+const navigationIndicator = ref<HTMLElement | null>(null)
+const indicatorReady = ref(false)
+const indicatorMotion = createNavigationIndicatorMotion(() => navigationIndicator.value)
+const navigationSelection = createNavigationSelection(() => route.path, path => router.push(path), () => placeNavigationIndicator())
+const selectedNavPath = navigationSelection.selected
+let indicatorFrame = 0
+let navigationObserver: ResizeObserver | null = null
+
+function placeNavigationIndicator(immediate = false) {
+  const list = navigationList.value
+  const link = list && [...list.querySelectorAll<HTMLElement>('[data-nav-path]')]
+    .find(element => element.dataset.navPath === selectedNavPath.value)
+  if (!link || !link.offsetHeight) { indicatorReady.value = false; return }
+  indicatorReady.value = indicatorMotion.move(link.offsetTop, link.offsetHeight, immediate)
+}
+function queueNavigationIndicator() {
+  if (indicatorFrame) return
+  indicatorFrame = window.requestAnimationFrame(() => {
+    indicatorFrame = 0
+    placeNavigationIndicator(true)
+  })
+}
+function selectNavigation(event: MouseEvent, path: string) {
+  const link = event.currentTarget as HTMLAnchorElement | null
+  // Preserve genuine anchors: new-tab modifiers and external targets must not
+  // change this tab's selection or duplicate the router's navigation.
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
+    || link?.getAttribute('target') === '_blank') return
+  event.preventDefault()
+  void navigationSelection.select(path)
+  warmMenuCode(path)
+}
+watch(() => route.path, path => navigationSelection.sync(path), { flush: 'post' })
+watch(navItems, () => placeNavigationIndicator(true), { flush: 'post' })
+watch(sidebarOpen, (open) => { if (open) placeNavigationIndicator(true) }, { flush: 'post' })
+onMounted(() => {
+  placeNavigationIndicator(true)
+  if (typeof ResizeObserver !== 'undefined' && navigationList.value) {
+    navigationObserver = new ResizeObserver(queueNavigationIndicator)
+    navigationObserver.observe(navigationList.value)
+  }
+  window.addEventListener('resize', queueNavigationIndicator)
+})
+onBeforeUnmount(() => {
+  navigationSelection.dispose()
+  navigationObserver?.disconnect()
+  if (indicatorFrame) window.cancelAnimationFrame(indicatorFrame)
+  window.removeEventListener('resize', queueNavigationIndicator)
+  indicatorMotion.dispose()
+})
+
+const hasActiveMysteryOffer = computed(() => {
+  const offer = mysteryOffer.value
+  if (!currentAccountId.value || mysteryOfferAccountId.value !== String(currentAccountId.value))
+    return false
+  if (!offer?.active || offer.purchased)
+    return false
+  const endTime = Number(offer.endTime || 0)
+  const endMs = endTime > 10_000_000_000 ? endTime : endTime * 1000
+  return !endMs || endMs > Date.now()
+})
+
+const version = __APP_VERSION__
+
+watch(
+  () => route.path,
+  () => {
+    // Close sidebar on route change (mobile only)
+    if (window.innerWidth < 1024)
+      appStore.closeSidebar()
+  },
+)
+
+// 用户相关
+const showUserDropdown = ref(false)
+
+// 公告相关
+const showAnnouncementModal = ref(false)
+const showAnnouncementViewModal = ref(false)
+const announcementContent = ref('')
+const announcementShowOnce = ref(true)
+const announcementSaving = ref(false)
+const announcementLoading = ref(false)
+const showSaveAnnouncementConfirm = ref(false)
+const currentAnnouncement = ref<{ content: string, showOnce: boolean, updatedAt: number, shouldShow?: boolean } | null>(null)
+const showThemeDropdown = ref(false)
+const showTokenDropdown = ref(false)
+const tokenVisible = ref(false)
+const tokenCopied = ref(false)
+
+async function handleLogout() {
+  await userStore.logout()
+  router.push('/login')
+}
+
+
+// 公告相关函数
+async function openAnnouncementModal() {
+  showUserDropdown.value = false
+  announcementLoading.value = true
+  showAnnouncementModal.value = true
+  try {
+    const res = await api.get('/api/announcement')
+    if (res.data?.ok && res.data?.data) {
+      announcementContent.value = res.data.data.content || ''
+      announcementShowOnce.value = res.data.data.showOnce !== false
+    }
+  }
+  catch (e) {
+    console.error('获取公告失败', e)
+  }
+  finally {
+    announcementLoading.value = false
+  }
+}
+
+function openSaveAnnouncementConfirm() {
+  showSaveAnnouncementConfirm.value = true
+}
+
+async function saveAnnouncement() {
+  showSaveAnnouncementConfirm.value = false
+  announcementSaving.value = true
+  try {
+    const res = await api.post('/api/admin/announcement', {
+      content: announcementContent.value,
+      showOnce: announcementShowOnce.value,
+      confirmed: true,
+    })
+    if (res.data?.ok) {
+      showAnnouncementModal.value = false
+    }
+    else {
+      console.error('保存公告失败', res.data?.error)
+    }
+  }
+  catch (e) {
+    console.error('保存公告失败', e)
+  }
+  finally {
+    announcementSaving.value = false
+  }
+}
+
+async function fetchAnnouncement() {
+  if (userStore.isAdmin)
+    return
+  try {
+    const res = await api.get('/api/announcement')
+    if (res.data?.ok && res.data?.data) {
+      currentAnnouncement.value = res.data.data
+      if (res.data.data.shouldShow && res.data.data.content) {
+        showAnnouncementViewModal.value = true
+      }
+    }
+  }
+  catch (e) {
+    console.error('获取公告失败', e)
+  }
+}
+
+async function markAnnouncementRead() {
+  try {
+    await api.post('/api/announcement/read')
+    showAnnouncementViewModal.value = false
+  }
+  catch (e) {
+    console.error('标记公告已读失败', e)
+  }
+}
+
+async function copyToken() {
+  const tokenValue = userStore.token
+  if (!tokenValue)
+    return
+
+  try {
+    await navigator.clipboard.writeText(tokenValue)
+    tokenCopied.value = true
+    setTimeout(() => {
+      tokenCopied.value = false
+    }, 2000)
+  }
+  catch (e) {
+    console.error('复制失败', e)
+  }
+}
+</script>
+
+<template>
+  <aside
+    :data-sidebar-workspace="workspace"
+    class="fixed inset-y-0 left-0 z-50 h-full w-72 flex flex-col border-r border-gray-200/50 p-3 transition-transform duration-300 lg:static lg:translate-x-0 dark:border-gray-700/50"
+    :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'"
+    :style="{ background: 'color-mix(in srgb, var(--surface-1) 88%, transparent)', color: 'var(--theme-text)' }"
+  >
+    <!-- Brand -->
+    <div class="glass-panel h-16 flex items-center justify-between rounded-lg px-4">
+      <div class="min-w-0 flex items-center gap-3">
+        <div class="h-10 w-10 flex flex-none items-center justify-center overflow-hidden rounded-lg shadow-sm" :style="{ background: 'var(--theme-gradient)' }">
+          <img
+            v-if="loginPageConfig.logoUrl && !brandLogoFailed"
+            :src="loginPageConfig.logoUrl"
+            :alt="`${loginPageConfig.title || 'QQ农场智能助手'}图标`"
+            class="h-full w-full object-cover"
+            @error="brandLogoFailed = true"
+          >
+          <div v-else class="i-carbon-sprout text-xl text-white" />
+        </div>
+        <span class="min-w-0 truncate bg-clip-text text-base text-transparent font-bold" :style="{ backgroundImage: 'var(--theme-gradient)' }">
+          {{ loginPageConfig.title || 'QQ农场智能助手' }}
+        </span>
+      </div>
+      <!-- Mobile Close Button -->
+      <button
+        class="h-8 w-8 flex items-center justify-center rounded-lg text-gray-500 transition lg:hidden hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+        @click="appStore.closeSidebar"
+      >
+        <div class="i-carbon-close text-xl" />
+      </button>
+    </div>
+
+    <div class="px-4 pb-1 pt-3 text-xs font-semibold" :style="{ color: 'var(--muted-text)' }"><span :class="workspaceIcon" class="mr-1.5 inline-block" aria-hidden="true" />{{ workspaceLabel }}</div>
+
+    <!-- User Info -->
+    <div v-if="!LOCAL_UI_READONLY" class="px-1 py-4">
+      <div class="group relative">
+        <button
+          class="ui-card w-full flex items-center justify-between rounded-lg px-3.5 py-3 outline-none transition-all duration-200 hover:border-gray-300 hover:-translate-y-0.5 dark:hover:border-gray-600"
+          style="--focus-ring: var(--theme-primary)"
+          :disabled="LOCAL_UI_READONLY"
+          @click="showUserDropdown = !showUserDropdown"
+        >
+          <div class="flex items-center gap-3 overflow-hidden">
+            <div class="h-9 w-9 flex shrink-0 items-center justify-center overflow-hidden rounded-full bg-gray-200 ring-2 ring-white dark:bg-gray-600 dark:ring-gray-700">
+              <img
+                v-if="!LOCAL_UI_READONLY"
+                :src="userStore.avatar || 'https://free.picui.cn/free/2026/03/10/69affe5755149.jpg'"
+                class="h-full w-full object-cover"
+                @error="(e) => (e.target as HTMLImageElement).src = 'https://free.picui.cn/free/2026/03/10/69affe5755149.jpg'"
+              >
+              <div v-if="LOCAL_UI_READONLY" class="i-carbon-user text-lg text-gray-500" aria-hidden="true" />
+            </div>
+            <div class="min-w-0 flex flex-col items-start">
+              <span class="w-full truncate text-left text-sm font-medium">
+                {{ LOCAL_UI_READONLY ? '本地只读' : userStore.username || '未登录' }}
+              </span>
+              <div class="mt-0.5 flex items-center gap-1.5">
+                <span
+                  class="rounded px-1 py-0.2 text-[10px] font-medium leading-tight"
+                  :class="userStore.isAdmin ? 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200' : 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200'"
+                >
+                  {{ userStore.isAdmin ? '管理员' : '用户' }}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div
+            class="i-carbon-chevron-down text-gray-400 transition-transform duration-200"
+            :class="{ 'rotate-180': showUserDropdown }"
+          />
+        </button>
+
+        <!-- User Dropdown Menu -->
+        <div
+          v-if="showUserDropdown"
+          class="glass-panel absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden rounded-lg py-1"
+        >
+          <div class="border-b border-gray-100 px-4 py-2 dark:border-gray-700">
+            <div class="text-sm text-gray-900 font-medium dark:text-white">
+              {{ userStore.username }}
+            </div>
+            <div class="text-xs text-gray-500 dark:text-gray-400">
+              {{ userStore.isAdmin ? '管理员' : '普通用户' }}
+            </div>
+          </div>
+          <div class="py-1">
+            <button
+              v-if="userStore.isAdmin"
+              class="w-full flex items-center gap-2 px-4 py-2 text-sm transition-colors hover:bg-gray-100/50 dark:hover:bg-gray-700/50"
+              :style="{ color: 'var(--theme-primary)' }"
+              @click="openAnnouncementModal"
+            >
+              <div class="i-carbon-notification" />
+              <span>设置公告</span>
+            </button>
+            <button
+              class="w-full flex items-center gap-2 px-4 py-2 text-sm text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-900/20"
+              @click="handleLogout"
+            >
+              <div class="i-carbon-logout" />
+              <span>退出登录</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-1 py-2" :aria-label="`${workspaceLabel}主导航`">
+      <div ref="navigationList" class="sidebar-nav-list">
+        <div
+          ref="navigationIndicator"
+          class="sidebar-nav-indicator"
+          :data-ready="indicatorReady"
+          aria-hidden="true"
+        />
+        <router-link v-for="item in navItems" :key="item.path" v-slot="{ href }" :to="item.path" custom>
+          <a
+            :href="href"
+            class="sidebar-nav-link"
+            :data-nav-path="item.path"
+            :data-selected="selectedNavPath === item.path"
+            :aria-current="route.path === item.path ? 'page' : undefined"
+            @pointerenter="warmMenuCode(item.path)"
+            @focus="warmMenuCode(item.path)"
+            @pointerdown="warmMenuCode(item.path)"
+            @click="selectNavigation($event, item.path)"
+          >
+            <span class="sidebar-nav-content">
+              <span class="sidebar-nav-icon" :class="item.icon" aria-hidden="true" />
+              <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+              <span
+                v-if="item.path === '/shop' && hasActiveMysteryOffer"
+                class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
+                title="神秘商人已出现"
+              />
+              <span
+                v-if="item.path === '/activity' && hasUnadaptedActivities"
+                class="h-2.5 w-2.5 shrink-0 rounded-full bg-red-500 shadow-[0_0_0_3px_rgba(239,68,68,0.15)]"
+                :title="`发现 ${unadaptedActivityIds.length} 个未适配活动`"
+              />
+            </span>
+          </a>
+        </router-link>
+      </div>
+    </nav>
+
+    <!-- Token Display (All Users) -->
+    <div v-if="userStore.token" class="ui-subtle-panel mb-3 rounded-lg px-2 py-2">
+      <button
+        class="w-full flex items-center justify-between rounded-lg px-3 py-2 transition-colors hover:bg-gray-100/50 dark:hover:bg-gray-700/50"
+        @click="showTokenDropdown = !showTokenDropdown"
+      >
+        <div class="flex items-center gap-2">
+          <div class="i-carbon-key text-sm" :style="{ color: 'var(--theme-primary)' }" />
+          <span class="text-xs text-gray-500 font-medium dark:text-gray-400">我的 Token</span>
+        </div>
+        <div
+          class="i-carbon-chevron-down text-gray-400 transition-transform duration-200"
+          :class="{ 'rotate-180': showTokenDropdown }"
+        />
+      </button>
+      <div
+        v-show="showTokenDropdown"
+        class="px-1 pt-2 transition-all"
+      >
+        <div class="mb-1 flex items-center justify-between">
+          <button
+            class="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors hover:bg-gray-100 dark:hover:bg-gray-700"
+            :class="tokenVisible ? 'text-blue-500' : 'text-gray-500 dark:text-gray-400'"
+            @click="tokenVisible = !tokenVisible"
+          >
+            <div :class="tokenVisible ? 'i-carbon-view-off' : 'i-carbon-view'" />
+            <span>{{ tokenVisible ? '隐藏' : '显示' }}</span>
+          </button>
+          <button
+            class="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors hover:bg-gray-100 dark:hover:bg-gray-700"
+            :class="tokenCopied ? 'text-green-500' : 'text-gray-500 dark:text-gray-400'"
+            @click="copyToken"
+          >
+            <div v-if="tokenCopied" class="i-carbon-checkmark" />
+            <div v-else class="i-carbon-copy" />
+            <span>{{ tokenCopied ? '已复制' : '复制' }}</span>
+          </button>
+        </div>
+        <div class="break-all rounded bg-gray-100/50 px-2 py-1.5 text-[10px] text-gray-600 font-mono dark:bg-gray-700/50 dark:text-gray-400">
+          {{ tokenVisible ? userStore.token : '••••••••••••••••' }}
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer Status -->
+    <div class="ui-subtle-panel relative mt-auto rounded-lg p-4">
+      <div class="mb-2 flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+        <div class="flex items-center gap-1.5">
+          <div
+            class="h-2 w-2 rounded-full"
+            :class="[connectionStatus.color, { 'animate-pulse': connectionStatus.pulse }]"
+          />
+          <span :title="connectionStatus.detail">{{ connectionStatus.text }}</span>
+        </div>
+        <span>{{ uptime }}</span>
+      </div>
+      <div class="mt-1 flex flex-col gap-0.5 text-xs text-gray-400 font-mono">
+        <div class="flex items-center justify-between">
+          <span>{{ formattedTime }}</span>
+          <!-- 主题调色盘按钮 -->
+          <button
+            class="h-8 w-8 flex items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-200/50 hover:text-gray-600 dark:hover:bg-gray-700/50 dark:hover:text-gray-300"
+            title="主题设置"
+            @click="showThemeDropdown = !showThemeDropdown"
+          >
+            <div class="i-carbon-color-palette text-sm" :style="{ color: 'var(--theme-primary)' }" />
+          </button>
+        </div>
+        <div class="flex items-center justify-between opacity-50">
+          <div class="flex items-center gap-2">
+            <span>Web v{{ version }}</span>
+            <a
+              href="https://github.com/XyhTender/qq-farm-automation-bot"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="开源地址"
+              class="inline-flex items-center text-gray-400 transition-colors hover:text-gray-600 dark:hover:text-gray-300"
+            >
+              <div class="i-carbon-logo-github text-base" />
+            </a>
+          </div>
+          <span v-if="serverVersion">Core v{{ serverVersion }}</span>
+        </div>
+      </div>
+
+      <!-- 主题选择弹出面板 -->
+      <div
+        v-show="showThemeDropdown"
+        class="glass-panel absolute bottom-full left-0 right-0 z-50 grid grid-cols-4 mb-14 gap-1.5 rounded-lg p-2"
+      >
+        <button
+          v-for="(t, theme) in appStore.themes"
+          :key="theme"
+          class="group relative flex flex-col items-center justify-center gap-1 rounded-lg p-2 transition-all hover:scale-105"
+          :class="{
+            'ring-2 ring-offset-1': appStore.currentTheme === theme,
+          }"
+          :style="{
+            'background': t.gradient,
+            '--tw-ring-color': t.primary,
+            '--tw-ring-offset-color': 'var(--theme-bg)',
+          }"
+          :title="t.name"
+          @click="appStore.applyTheme(theme as any); showThemeDropdown = false"
+        >
+          <div :class="t.icon" class="text-base text-white" />
+          <span class="text-[10px] text-white font-medium leading-tight">{{ t.name }}</span>
+          <div
+            v-if="appStore.currentTheme === theme"
+            class="absolute right-1 top-1 h-3 w-3 flex items-center justify-center rounded-full bg-white shadow"
+          >
+            <div class="i-carbon-checkmark text-xs" :style="{ color: t.primary }" />
+          </div>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Overlay for mobile when sidebar is open -->
+  <div
+    v-if="showUserDropdown"
+    class="fixed inset-0 z-40 bg-transparent"
+    @click="showUserDropdown = false"
+  />
+
+
+  <!-- 管理员设置公告弹窗 -->
+  <div
+    v-if="showAnnouncementModal"
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+    @click.self="showAnnouncementModal = false"
+  >
+    <div class="w-[500px] rounded-xl bg-white p-5 shadow-2xl dark:bg-gray-800" @click.stop>
+      <h3 class="mb-4 text-lg text-gray-900 font-bold dark:text-gray-100">
+        设置公告
+      </h3>
+
+      <div v-if="announcementLoading" class="flex justify-center py-8">
+        <div class="i-svg-spinners-90-ring-with-bg text-2xl text-blue-500" />
+      </div>
+
+      <template v-else>
+        <div class="mb-4">
+          <label class="mb-1.5 block text-sm text-gray-600 dark:text-gray-400">
+            公告内容
+          </label>
+          <textarea
+            v-model="announcementContent"
+            rows="6"
+            placeholder="请输入公告内容（留空则不显示公告）"
+            class="w-full border border-gray-200 rounded-lg bg-white px-3 py-2 text-sm dark:border-gray-600 focus:border-blue-500 dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+          />
+        </div>
+
+        <div class="mb-4 flex items-center gap-2">
+          <input
+            id="announcementShowOnce"
+            v-model="announcementShowOnce"
+            type="checkbox"
+            class="h-4 w-4 border-gray-300 rounded text-blue-600 focus:ring-blue-500"
+          >
+          <label for="announcementShowOnce" class="text-sm text-gray-600 dark:text-gray-400">
+            只显示一次（公告变动时再显示）
+          </label>
+        </div>
+
+        <div class="flex justify-end gap-2">
+          <button
+            class="border border-gray-200 rounded-lg px-4 py-1.5 text-sm text-gray-600 transition dark:border-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+            @click="showAnnouncementModal = false"
+          >
+            取消
+          </button>
+          <button
+            class="rounded-lg px-4 py-1.5 text-sm text-white font-medium shadow transition disabled:cursor-not-allowed disabled:opacity-50 hover:opacity-90"
+            :style="{ backgroundColor: 'var(--theme-primary)' }"
+            :disabled="announcementSaving"
+            @click="openSaveAnnouncementConfirm"
+          >
+            <div v-if="announcementSaving" class="i-svg-spinners-90-ring-with-bg mr-1 inline-block align-text-bottom" />
+            保存
+          </button>
+        </div>
+      </template>
+    </div>
+  </div>
+
+  <ConfirmModal
+    :show="showSaveAnnouncementConfirm"
+    title="确认保存系统公告"
+    message="确定要保存当前系统公告吗？保存后会立刻影响普通用户看到的公告内容与展示策略。"
+    type="danger"
+    :loading="announcementSaving"
+    confirm-text="确认保存"
+    cancel-text="取消"
+    @confirm="saveAnnouncement"
+    @close="!announcementSaving && (showSaveAnnouncementConfirm = false)"
+    @cancel="!announcementSaving && (showSaveAnnouncementConfirm = false)"
+  />
+
+  <!-- 普通用户查看公告弹窗 -->
+  <div
+    v-if="showAnnouncementViewModal && currentAnnouncement?.content"
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+  >
+    <div
+      class="announcement-view-modal rounded-xl bg-white shadow-2xl dark:bg-gray-800"
+      @click.stop
+    >
+      <div class="p-5">
+        <div class="mb-4 flex items-center gap-2">
+          <div class="i-carbon-notification text-xl" :style="{ color: 'var(--theme-primary)' }" />
+          <h3 class="text-lg text-gray-900 font-bold dark:text-gray-100">
+            系统公告
+          </h3>
+        </div>
+
+        <div class="announcement-content mb-4 overflow-y-auto whitespace-pre-wrap rounded-lg bg-gray-50 p-4 text-sm text-gray-700 dark:bg-gray-700/50 dark:text-gray-300">
+          {{ currentAnnouncement.content }}
+        </div>
+
+        <div class="flex justify-end">
+          <button
+            class="rounded-lg px-4 py-1.5 text-sm text-white font-medium shadow transition hover:opacity-90"
+            :style="{ backgroundColor: 'var(--theme-primary)' }"
+            @click="markAnnouncementRead"
+          >
+            我知道了
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.3);
+  border-radius: 2px;
+}
+.custom-scrollbar:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.5);
+}
+
+.sidebar-nav-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  isolation: isolate;
+  --nav-easing: cubic-bezier(.2, .65, .25, 1);
+}
+.sidebar-nav-indicator {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 0;
+  height: 44px;
+  border-radius: var(--radius-control);
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(115deg,
+    color-mix(in srgb, var(--theme-primary) 16%, transparent),
+    color-mix(in srgb, var(--theme-primary) 7%, transparent));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-primary) 13%, transparent);
+  will-change: transform;
+  transition: opacity 160ms var(--nav-easing);
+}
+.sidebar-nav-indicator[data-ready='true'] { opacity: 1; }
+.sidebar-nav-indicator::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--theme-primary);
+}
+.sidebar-nav-link {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  border-radius: var(--radius-control);
+  color: var(--theme-text);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  text-decoration: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.sidebar-nav-link::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: color-mix(in srgb, var(--theme-primary) 8%, transparent);
+  transition: opacity 180ms var(--nav-easing);
+}
+.sidebar-nav-content {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  transform-origin: 18px 50%;
+  transition: transform 280ms var(--nav-easing);
+}
+.sidebar-nav-icon {
+  flex-shrink: 0;
+  font-size: 18px;
+  transition: transform 280ms var(--nav-easing), color 180ms var(--nav-easing);
+}
+/* Labels keep opaque, readable theme text; selection is shape + icon color,
+   not a low-contrast translucent font or a layout-changing weight jump. */
+.sidebar-nav-link[data-selected='true'] .sidebar-nav-icon { color: var(--theme-primary); }
+.sidebar-nav-link:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 2px; }
+.sidebar-nav-link:focus-visible::before { opacity: 1; }
+@media (hover: hover) and (pointer: fine) {
+  .sidebar-nav-link:hover::before { opacity: 1; }
+  .sidebar-nav-link:hover .sidebar-nav-content { transform: translate3d(2px, 0, 0); }
+  .sidebar-nav-link:hover .sidebar-nav-icon { transform: scale(1.045); }
+}
+.sidebar-nav-link:active::before { opacity: 1; }
+.sidebar-nav-link:active .sidebar-nav-content {
+  transform: translate3d(1px, 0, 0) scale(.985);
+  transition-duration: 90ms;
+}
+.sidebar-nav-link:active .sidebar-nav-icon { transform: scale(.98); transition-duration: 90ms; }
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-nav-indicator, .sidebar-nav-link::before, .sidebar-nav-content, .sidebar-nav-icon { transition: none; }
+  .sidebar-nav-link:hover .sidebar-nav-content, .sidebar-nav-link:active .sidebar-nav-content,
+  .sidebar-nav-link:hover .sidebar-nav-icon, .sidebar-nav-link:active .sidebar-nav-icon { transform: none; }
+}
+
+/* Dropdown active item */
+.bg-green-50 {
+  background-color: color-mix(in srgb, var(--theme-primary) 10%, transparent) !important;
+}
+
+.dark\:bg-green-900\/10 {
+  background-color: color-mix(in srgb, var(--theme-primary) 15%, transparent) !important;
+}
+
+/* 公告查看弹窗可调整大小 */
+.announcement-view-modal {
+  min-width: 320px;
+  min-height: 200px;
+  width: 500px;
+  height: auto;
+  max-width: 90vw;
+  max-height: 90vh;
+  resize: both;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.announcement-view-modal > div {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.announcement-content {
+  flex: 1;
+  min-height: 80px;
+}
+
+/* 自定义调整大小手柄样式 */
+.announcement-view-modal::-webkit-resizer {
+  background: linear-gradient(
+    -45deg,
+    transparent 50%,
+    var(--theme-primary) 50%,
+    var(--theme-primary) 60%,
+    transparent 60%,
+    transparent 70%,
+    var(--theme-primary) 70%,
+    var(--theme-primary) 80%,
+    transparent 80%
+  );
+  border-radius: 0 0 12px 0;
+}
+</style>
